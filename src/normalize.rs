@@ -95,6 +95,7 @@ const NOISE_CALLS: &[&str] = &[
     "iter",
     "iter_mut",
     "into_iter",
+    "guard",
 ];
 
 /// Normalizes the name of a called function, method or macro. Returns `None`
@@ -103,11 +104,35 @@ pub fn call(name: &str) -> Option<String> {
     let name = name.trim().trim_end_matches('!');
     // Drop template arguments and take the last path or member segment.
     let name = strip_generics(name);
-    let last = name
+    let mut segs = name
         .rsplit([':', '.', '>', '-'])
-        .find(|s| !s.is_empty())
-        .unwrap_or(&name);
-    let n = ident(last);
+        .filter(|s| !s.trim().is_empty());
+    let last = segs.next().unwrap_or(&name);
+    let mut n = ident(last);
+    // `Foo::new(...)` constructs a Foo, like C++ `Foo foo{...}`.
+    if matches!(
+        n.as_str(),
+        "new" | "default" | "init" | "create_in_place" | "try_new"
+    ) {
+        if let Some(ty) = segs
+            .next()
+            .filter(|s| s.trim().starts_with(|c: char| c.is_ascii_uppercase()))
+        {
+            n = ident(ty);
+        }
+    }
+    if NOISE_CALLS.contains(&n.as_str()) || n.starts_with("wrapping_") {
+        // Rust's wrapping arithmetic is C++'s unsigned arithmetic.
+        return None;
+    }
+    // Rust spells variants of the same operation with suffixes.
+    for suffix in ["_mut", "_raw", "_unchecked"] {
+        if let Some(stripped) = n.strip_suffix(suffix) {
+            if !stripped.is_empty() {
+                n = stripped.to_string();
+            }
+        }
+    }
     if n.is_empty() || NOISE_CALLS.contains(&n.as_str()) {
         return None;
     }
@@ -133,7 +158,7 @@ fn alias(n: &str) -> &str {
         | "const_assert" => "assert",
         "printf" | "dprintf" | "println" | "print" | "kprintf" | "kprintln" | "eprintln" => "print",
         "panic" | "zx_panic" | "platform_panic_start" => "panic",
-        "size" | "len" | "count" => "len",
+        "size" | "len" => "len",
         "empty" | "is_empty" => "is_empty",
         "min" | "ktl_min" => "min",
         "max" | "ktl_max" => "max",
@@ -166,7 +191,8 @@ fn strip_generics(s: &str) -> String {
 /// Identifiers that do not help match C++ against Rust.
 const NOISE_IDENTS: &[&str] = &[
     "self", "this", "auto", "let", "mut", "const", "unsafe", "ok", "err", "some", "none",
-    "nullptr", "null", "true", "false", "status", "result", "zx_ok", "ret", "rc", "res",
+    "nullptr", "null", "true", "false", "status", "result", "zx_ok", "ret", "rc", "res", "guard",
+    "usize", "u32", "u64", "size_t", "uint32_t", "uint64_t",
 ];
 
 /// Normalizes an identifier for similarity purposes; `None` for noise.
@@ -362,6 +388,12 @@ mod tests {
             call("fbl::AdoptRef<VmObject>").as_deref(),
             Some("adopt_ref")
         );
+        assert_eq!(
+            call("AutoExpiringPreemptDisabler::new").as_deref(),
+            Some("auto_expiring_preempt_disabler")
+        );
+        assert_eq!(call("list.push_front_raw").as_deref(), Some("push_front"));
+        assert_eq!(call("guard.as_mut"), None);
     }
 
     #[test]

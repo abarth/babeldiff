@@ -267,6 +267,15 @@ fn only_in(u: &Unit, here: &str, there: &str, moved: Option<usize>) -> (Severity
 fn compare(a: &Unit, b: &Unit, notes: &mut Vec<(Severity, String)>) {
     let fa = &a.features;
     let fb = &b.features;
+    if crate::align::is_handled_vs_propagated(a, b) {
+        let msg = if a.features.propagates {
+            "C++ propagates this call's error, but Rust handles it in its own branch"
+        } else {
+            "C++ handles this call's error in its own branch, but Rust propagates it"
+        };
+        notes.push((Severity::Issue, msg.to_string()));
+        return;
+    }
     if a.kind != b.kind {
         notes.push((
             Severity::Note,

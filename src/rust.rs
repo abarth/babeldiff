@@ -176,7 +176,10 @@ impl<'a> Ctx<'a> {
                     for c in MACRO_CALL.captures_iter(&t) {
                         acc.call(&c[1]);
                     }
+                    self.collect(tt, acc, skip);
                 }
+                // The macro's own path is not an identifier of interest.
+                return;
             }
             "try_expression" => acc.propagates = true,
             "identifier" | "field_identifier" => acc.ident(self.text(n)),
@@ -302,6 +305,27 @@ impl<'a> Ctx<'a> {
         depth: usize,
         b: &mut UnitBuilder,
     ) {
+        // `return Err(if c { A } else { B })` reads as
+        // `if c { return Err(A) } else { return Err(B) }`, which is how C++
+        // spells `return c ? A : B;`.
+        if let Some(inner) = expr.and_then(|e| self.wrapped_if(e)) {
+            if let (Some(c), Some(t), Some(a)) = (
+                inner.child_by_field_name("condition"),
+                inner.child_by_field_name("consequence"),
+                inner.child_by_field_name("alternative"),
+            ) {
+                let alt_block = ts::named_children(a)
+                    .into_iter()
+                    .find(|x| x.kind() == "block");
+                if let Some(e) = alt_block {
+                    b.push(UnitKind::If, line, end, depth, self.features(c, &[]));
+                    self.return_unit(Some(t), line, end, depth + 1, b);
+                    b.push(UnitKind::Else, line, end, depth, Features::default());
+                    self.return_unit(Some(e), line, end, depth + 1, b);
+                    return;
+                }
+            }
+        }
         let mut f = match expr {
             Some(e) => self.features(e, &[]),
             None => Features::default(),
@@ -340,21 +364,16 @@ impl<'a> Ctx<'a> {
         let line = ts::line(n);
         let value = n.child_by_field_name("value");
         if let Some(alt) = n.child_by_field_name("alternative") {
-            // `let Some(x) = foo() else { return ... };` is a statement plus
-            // a failure check, like the C++ it replaces.
+            // `let Some(x) = foo() else { return ... };` is a failure check,
+            // like the C++ `if (!x) { return ...; }` it replaces.
             let skip = [alt];
             b.push(
-                UnitKind::Stmt,
+                UnitKind::If,
                 line,
                 ts::line(alt),
                 depth,
                 self.features(n, &skip),
             );
-            let mut f = Features::default();
-            if let Some(p) = n.child_by_field_name("pattern") {
-                f = self.features(p, &[]);
-            }
-            b.push(UnitKind::If, ts::line(alt), ts::line(alt), depth, f);
             self.block(alt, depth + 1, false, fcx, b);
             return;
         }
@@ -420,10 +439,14 @@ impl<'a> Ctx<'a> {
         }
 
         let header_end = cons.map_or(line, |c| ts::line(c));
-        let f = match cond {
+        let mut f = match cond {
             Some(c) => self.features(c, &[]),
             None => Features::default(),
         };
+        if let Some(c) = cond {
+            let t = self.text(c);
+            f.checks_error = t.contains(".is_err()") || t.trim_start().starts_with("let Err");
+        }
         let kind = if is_else_if {
             UnitKind::ElseIf
         } else {
@@ -454,6 +477,25 @@ impl<'a> Ctx<'a> {
                 }
                 None => {}
             }
+        }
+    }
+
+    /// The `if` in `if ...`, `Err(if ...)` or `Ok(if ...)`.
+    fn wrapped_if<'t>(&self, e: Node<'t>) -> Option<Node<'t>> {
+        match e.kind() {
+            "if_expression" => Some(e),
+            "call_expression" => {
+                let f = self.text(e.child_by_field_name("function")?);
+                if !matches!(f, "Err" | "Ok") {
+                    return None;
+                }
+                let args = ts::named_children(e.child_by_field_name("arguments")?);
+                match args.as_slice() {
+                    [a] if a.kind() == "if_expression" => Some(*a),
+                    _ => None,
+                }
+            }
+            _ => None,
         }
     }
 

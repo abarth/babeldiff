@@ -234,6 +234,21 @@ impl<'a> Ctx<'a> {
                 }
             }
             "identifier" | "field_identifier" => acc.ident(self.text(n)),
+            "declaration" => {
+                // `Foo foo{args};` constructs a Foo, like Rust `Foo::new(args)`.
+                let ty = n.child_by_field_name("type");
+                let ctor = n.child_by_field_name("declarator").is_some_and(|d| {
+                    d.kind() == "init_declarator"
+                        && d.child_by_field_name("value").is_some_and(|v| {
+                            matches!(v.kind(), "initializer_list" | "argument_list")
+                        })
+                });
+                if let Some(ty) = ty.filter(|t| {
+                    ctor && matches!(t.kind(), "type_identifier" | "qualified_identifier")
+                }) {
+                    acc.call(self.text(ty));
+                }
+            }
             _ => {}
         }
         for c in ts::named_children(n) {
@@ -457,6 +472,27 @@ impl<'a> Ctx<'a> {
             Some(e) => ts::classify_return(self.text(e)),
             None => Ret::Value,
         });
+        // `*actual = n; return ZX_OK;` is how C++ returns a value with a
+        // status; Rust returns `Ok(n)`.
+        static OUT_PARAM: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"^\*\s*\w+\s*=[^=]").unwrap());
+        let mut line = line;
+        if f.ret == Some(Ret::Ok) {
+            if let Some(prev) = b.units.last() {
+                let text = self.lines.get(prev.start_line - 1).map_or("", |l| l.trim());
+                if prev.kind == UnitKind::Stmt
+                    && prev.depth == depth
+                    && prev.file.is_none()
+                    && OUT_PARAM.is_match(text)
+                {
+                    let prev = b.units.pop().unwrap();
+                    line = prev.start_line;
+                    f.calls.extend(prev.features.calls);
+                    f.idents.extend(prev.features.idents);
+                    f.names.extend(prev.features.names);
+                }
+            }
+        }
         b.push(UnitKind::Return, line, end, depth, f);
     }
 
@@ -482,7 +518,7 @@ impl<'a> Ctx<'a> {
                         if prev.kind == UnitKind::Stmt
                             && prev.depth == depth
                             && !prev.features.propagates
-                            && var.is_some_and(|v| prev.features.idents.contains(&v))
+                            && var.is_some_and(|v| self.mentions(prev, &v))
                         {
                             prev.features.propagates = true;
                             prev.end_line = end;
@@ -510,7 +546,7 @@ impl<'a> Ctx<'a> {
                 ts::line(c).saturating_sub(1).max(line)
             }
         });
-        let f = match cond {
+        let mut f = match cond {
             Some(c) => self.features(c, &[]),
             None => Features::default(),
         };
@@ -520,6 +556,30 @@ impl<'a> Ctx<'a> {
             UnitKind::If
         };
         let d = if is_else_if { depth - 1 } else { depth };
+        let mut line = line;
+        // `zx_status_t status = Foo(); if (status != ZX_OK) { ... }` checks
+        // the call itself, as Rust's `if foo().is_err() { ... }` does.
+        if let Some(var) = cond.and_then(|c| propagation_var(self.text(c))) {
+            if let Some(prev) = b.units.last() {
+                if !is_else_if
+                    && prev.kind == UnitKind::Stmt
+                    && prev.depth == d
+                    && prev.file.is_none()
+                    && !prev.features.propagates
+                    && self.mentions(prev, &var)
+                    && !prev.features.calls.is_empty()
+                {
+                    let prev = b.units.pop().unwrap();
+                    line = prev.start_line;
+                    f.checks_error = true;
+                    f.calls.splice(0..0, prev.features.calls);
+                    f.names.extend(prev.features.names);
+                    f.idents.extend(prev.features.idents);
+                    f.errors.extend(prev.features.errors);
+                    f.locks.extend(prev.features.locks);
+                }
+            }
+        }
         b.push(kind, line, header_end, d, f);
         if let Some(c) = cons {
             self.body(c, d + 1, b);
@@ -549,6 +609,20 @@ impl<'a> Ctx<'a> {
                 None => {}
             }
         }
+    }
+
+    /// Whether a unit's source mentions `name` as a whole word.
+    fn mentions(&self, u: &crate::model::Unit, name: &str) -> bool {
+        (u.start_line..=u.end_line).any(|l| {
+            self.lines.get(l - 1).is_some_and(|t| {
+                t.match_indices(name).any(|(i, _)| {
+                    let before = t[..i].chars().next_back();
+                    let after = t[i + name.len()..].chars().next();
+                    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+                    !word(before) && !word(after)
+                })
+            })
+        })
     }
 
     fn is_propagation(&self, cond: Node, cons: Node) -> bool {
@@ -589,8 +663,7 @@ fn propagation_var(cond: &str) -> Option<String> {
     });
     let c = VAR.captures(cond)?;
     let v = (1..=5).find_map(|i| c.get(i))?;
-    crate::normalize::ident_feature(v.as_str())
-        .or_else(|| Some(crate::normalize::ident(v.as_str())))
+    Some(v.as_str().to_string())
 }
 
 fn strip_parens(mut n: Node) -> Node {

@@ -181,13 +181,19 @@ fn render_pair(out: &mut String, p: &PairReport, opts: &RenderOptions) {
             }
         })
         .collect();
+    let differs = s.flow.iter().any(|(_, a, b)| a != b);
     let _ = writeln!(
         out,
-        "  flow     {}  (C++/Rust where counts differ)",
+        "  flow     {}{}",
         if flow.is_empty() {
             "none".into()
         } else {
             flow.join(", ")
+        },
+        if differs {
+            "  (C++/Rust counts where they differ)"
+        } else {
+            ""
         }
     );
     let _ = writeln!(
