@@ -161,6 +161,7 @@ impl FeatureAcc {
             checks_error: false,
             ret: None,
             comment: Vec::new(),
+            safety: false,
         }
     }
 }
@@ -307,12 +308,31 @@ impl UnitBuilder {
     pub fn comment(&mut self, raw: &str, start: usize, end: usize, depth: usize) {
         let words = normalize::comment_words(raw);
         if words.is_empty() || words == ["static"] {
-            // Empty comments and Zircon's `// static` marker carry no meaning.
+            // Empty comments and Zircon's `// static` marker carry no meaning,
+            // but a blank `///` line doesn't end a `# Safety` section.
+            if let Some(last) = self.units.last_mut() {
+                if words.is_empty()
+                    && last.kind == UnitKind::Comment
+                    && last.features.safety
+                    && last.depth == depth
+                    && last.end_line + 1 == start
+                    && last.file.is_none()
+                {
+                    last.end_line = end;
+                }
+            }
             return;
         }
         let is_line = raw.trim_start().starts_with("//");
+        let body = raw
+            .trim_start()
+            .trim_start_matches(['/', '!', '*'])
+            .trim_start();
+        // Safety comments start their own unit; lines that follow join it.
+        let starts_safety = body.starts_with("SAFETY:") || body.starts_with("# Safety");
         if let Some(last) = self.units.last_mut() {
             if is_line
+                && (!starts_safety || last.features.safety)
                 && last.kind == UnitKind::Comment
                 && last.depth == depth
                 && last.end_line + 1 == start
@@ -325,6 +345,7 @@ impl UnitBuilder {
         }
         let features = Features {
             comment: words,
+            safety: starts_safety,
             ..Features::default()
         };
         self.push(UnitKind::Comment, start, end, depth, features);

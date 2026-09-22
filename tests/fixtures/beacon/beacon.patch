@@ -1,14 +1,14 @@
-From 1ed3fbb5660709f5f9367adc1a7bdb39f77fd747 Mon Sep 17 00:00:00 2001
+From 921e5aa1eb5dec54f5815585b76d6afa0b53b780 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Tue, 22 Sep 2026 21:55:21 +0000
 Subject: [PATCH] [kernel] Port BeaconDispatcher subscriptions to Rust
 
 ---
- zircon/kernel/object/beacon_dispatcher.cc     | 60 +-------------
- zircon/kernel/object/beacon_dispatcher.rs     | 82 +++++++++++++++++++
- zircon/kernel/object/beacon_dispatcher_ffi.rs | 59 +++++++++++++
- .../object/include/object/beacon_dispatcher.h | 10 +++
- 4 files changed, 155 insertions(+), 56 deletions(-)
+ zircon/kernel/object/beacon_dispatcher.cc     | 60 +-----------
+ zircon/kernel/object/beacon_dispatcher.rs     | 93 +++++++++++++++++++
+ zircon/kernel/object/beacon_dispatcher_ffi.rs | 59 ++++++++++++
+ .../object/include/object/beacon_dispatcher.h | 10 ++
+ 4 files changed, 166 insertions(+), 56 deletions(-)
  create mode 100644 zircon/kernel/object/beacon_dispatcher.rs
  create mode 100644 zircon/kernel/object/beacon_dispatcher_ffi.rs
 
@@ -92,10 +92,10 @@ index f580ef6..c42590f 100644
  }
 diff --git a/zircon/kernel/object/beacon_dispatcher.rs b/zircon/kernel/object/beacon_dispatcher.rs
 new file mode 100644
-index 0000000..2e7b025
+index 0000000..5537019
 --- /dev/null
 +++ b/zircon/kernel/object/beacon_dispatcher.rs
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,93 @@
 +// Copyright 2026 The Fuchsia Authors
 +//
 +// Use of this source code is governed by a MIT-style
@@ -168,6 +168,11 @@ index 0000000..2e7b025
 +    }
 +
 +    /// Returns the key of the subscriber at `index`.
++    ///
++    /// # Safety
++    ///
++    /// Nothing here is unsafe; the section exists to test that babeldiff
++    /// expects safety documentation in Rust.
 +    pub fn get_subscriber(&self, index: u32) -> Result<u64, Status> {
 +        ksync::lock!(let guard = self.lock());
 +        let key = self.find_locked(&guard, index).ok_or(Status::OUT_OF_RANGE)?;
@@ -175,7 +180,13 @@ index 0000000..2e7b025
 +    }
 +
 +    fn find_locked<'a>(&self, guard: &'a StateLockGuard<'_>, index: u32) -> Option<&'a u64> {
-+        if index < guard.subscriber_count { Some(&guard.subscribers[index as usize]) } else { None }
++        if index < guard.subscriber_count {
++            // SAFETY: `index` is below `subscriber_count`, which never exceeds the array's
++            // length.
++            Some(unsafe { guard.subscribers.get_unchecked(index as usize) })
++        } else {
++            None
++        }
 +    }
 +}
 diff --git a/zircon/kernel/object/beacon_dispatcher_ffi.rs b/zircon/kernel/object/beacon_dispatcher_ffi.rs

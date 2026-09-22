@@ -107,7 +107,10 @@ pub fn check(cpp: &Function, rust: &Function, pairs: &[Pair]) -> (Vec<Row>, Vec<
                 let u = &rust.units[j];
                 let moved =
                     find_moved(u, &cpp.units, &unmatched_c).map(|i| cpp.units[i].start_line);
-                notes.push(only_in(u, "Rust", "C++", moved));
+                // Safety comments are expected additions, not findings.
+                if !(u.kind == UnitKind::Comment && u.features.safety) {
+                    notes.push(only_in(u, "Rust", "C++", moved));
+                }
                 Marker::RustOnly
             }
             (None, None) => continue,
@@ -148,14 +151,18 @@ fn group_runs(rows: &mut [Row], cpp: &Function, rust: &Function) {
         while j < rows.len() && rows[j].marker == m {
             j += 1;
         }
-        if j - i >= 3 {
+        // Rows with no note (expected additions such as safety comments)
+        // stay in the run but don't count toward it.
+        let noted: Vec<usize> = (i..j).filter(|&k| !rows[k].notes.is_empty()).collect();
+        if noted.len() >= 3 {
             let (f, side, other) = if m == Marker::CppOnly {
                 (cpp, "C++", "Rust")
             } else {
                 (rust, "Rust", "C++")
             };
-            let units: Vec<&Unit> = rows[i..j]
+            let units: Vec<&Unit> = noted
                 .iter()
+                .map(|&k| &rows[k])
                 .filter_map(|r| if m == Marker::CppOnly { r.cpp } else { r.rust })
                 .map(|k| &f.units[k])
                 .collect();
@@ -190,7 +197,7 @@ fn group_runs(rows: &mut [Row], cpp: &Function, rust: &Function) {
             for r in &mut rows[i..j] {
                 r.notes.clear();
             }
-            rows[i].notes.push((sev, msg));
+            rows[noted[0]].notes.push((sev, msg));
         }
         i = j;
     }

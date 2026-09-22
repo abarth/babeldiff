@@ -109,6 +109,10 @@ with `file:line` references on both sides. The marker column is:
 | `<` | Only in C++. |
 | `>` | Only in Rust. |
 
+Rust safety comments (`// SAFETY: ...` and `# Safety` doc sections) are
+expected additions: they are shown, marked `>`, with no finding, and never
+aligned with a C++ comment.
+
 Findings start with `!` (issue) or `~` (note), so `grep '^    !'` lists the
 issues. At the end the report lists functions it could not pair and the FFI
 shims it recognized.
