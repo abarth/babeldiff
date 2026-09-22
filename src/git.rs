@@ -191,6 +191,10 @@ fn stem(path: &str) -> String {
 
 impl CppFinder for RepoFinder {
     fn find(&mut self, rust: &Function) -> Vec<Function> {
+        if rust.base.starts_with("test_") || rust.base == "drop" || rust.base == "fmt" {
+            // Tests and trait plumbing have no C++ counterpart to find.
+            return Vec::new();
+        }
         let want = stem(&rust.path);
         let mut paths: Vec<String> = self
             .cpp_files()
@@ -209,8 +213,15 @@ impl CppFinder for RepoFinder {
         if args.len() > 4 {
             args.push(self.rev.clone());
             args.push("--".into());
-            for ext in ["*.cc", "*.cpp", "*.h", "*.hpp"] {
-                args.push(ext.into());
+            // Search the Rust file's top-level directory (e.g. `zircon/`),
+            // which keeps grep fast in a tree the size of Fuchsia's.
+            let top = rust
+                .path
+                .split_once('/')
+                .map(|(t, _)| format!("{t}/"))
+                .unwrap_or_default();
+            for ext in ["cc", "cpp", "h", "hpp"] {
+                args.push(format!(":(glob){top}**/*.{ext}"));
             }
             let argv: Vec<&str> = args.iter().map(String::as_str).collect();
             if let Ok(out) = self.git.run(&argv) {
