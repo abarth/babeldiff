@@ -1,5 +1,6 @@
 use babeldiff::analyze::{self, CppFinder, NoFinder};
 use babeldiff::git::{Git, RepoFinder};
+use babeldiff::html;
 use babeldiff::input::ChangeSet;
 use babeldiff::render::{self, Layout, RenderOptions};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -18,7 +19,15 @@ struct Cli {
     #[command(subcommand)]
     command: Cmd,
 
-    /// Output layout.
+    /// Output format: plain text, or a self-contained HTML page for people.
+    #[arg(long, value_enum, default_value_t = FormatArg::Text, global = true)]
+    format: FormatArg,
+
+    /// Write the report to FILE instead of standard output.
+    #[arg(long, short = 'o', value_name = "FILE", global = true)]
+    output: Option<PathBuf>,
+
+    /// Output layout for the text format.
     #[arg(long, value_enum, default_value_t = LayoutArg::SideBySide, global = true)]
     layout: LayoutArg,
 
@@ -77,6 +86,12 @@ enum Cmd {
     },
 }
 
+#[derive(Clone, Copy, PartialEq, ValueEnum)]
+enum FormatArg {
+    Text,
+    Html,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 enum LayoutArg {
     SideBySide,
@@ -108,17 +123,21 @@ fn run(cli: &Cli) -> Result<usize, String> {
             .ok_or_else(|| format!("--pair expects CPP=RUST, got {p:?}"))?;
         forced.push((c.to_string(), r.to_string()));
     }
-    let (cs, mut finder): (ChangeSet, Box<dyn CppFinder>) = match &cli.command {
+    let (cs, mut finder, title): (ChangeSet, Box<dyn CppFinder>, String) = match &cli.command {
         Cmd::Git { rev, repo } => {
             let git = Git::new(repo);
             let (base, head) = Git::range(rev);
             let cs = git.changeset(&base, &head)?;
+            let title = git
+                .run(&["log", "-1", "--format=%h %s", &head])
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|_| rev.clone());
             let finder: Box<dyn CppFinder> = if cli.no_search {
                 Box::new(NoFinder)
             } else {
                 Box::new(RepoFinder::new(git, base))
             };
-            (cs, finder)
+            (cs, finder, title)
         }
         Cmd::Patch { file, repo, base } => {
             let text = match file.as_deref() {
@@ -129,6 +148,10 @@ fn run(cli: &Cli) -> Result<usize, String> {
                 }
             };
             let files = babeldiff::patch::parse(&text);
+            let title = patch_title(&text).unwrap_or_else(|| match file {
+                Some(p) => p.display().to_string(),
+                None => "patch from standard input".into(),
+            });
             let git = repo.as_ref().map(Git::new).filter(Git::is_repo);
             let cs = match &git {
                 Some(g) => ChangeSet::from_patch(&files, &mut |id| g.blob(id)),
@@ -138,7 +161,7 @@ fn run(cli: &Cli) -> Result<usize, String> {
                 Some(g) if !cli.no_search => Box::new(RepoFinder::new(g, base.clone())),
                 _ => Box::new(NoFinder),
             };
-            (cs, finder)
+            (cs, finder, title)
         }
         Cmd::Files { files } => {
             let mut loaded = Vec::new();
@@ -147,7 +170,12 @@ fn run(cli: &Cli) -> Result<usize, String> {
                     std::fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
                 loaded.push((p.display().to_string(), text));
             }
-            (ChangeSet::from_files(&loaded), Box::new(NoFinder))
+            let title = loaded
+                .iter()
+                .map(|(p, _)| p.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            (ChangeSet::from_files(&loaded), Box::new(NoFinder), title)
         }
     };
     let report = babeldiff::run_with(
@@ -170,8 +198,28 @@ fn run(cli: &Cli) -> Result<usize, String> {
         context: cli.context,
         summary_only: cli.summary,
     };
-    print!("{}", render::render(&report, &opts));
+    let text = match cli.format {
+        FormatArg::Text => render::render(&report, &opts),
+        FormatArg::Html => html::render_html(&report, &html::HtmlOptions { title }),
+    };
+    match &cli.output {
+        Some(path) => {
+            std::fs::write(path, text).map_err(|e| format!("writing {}: {e}", path.display()))?
+        }
+        None => print!("{text}"),
+    }
     Ok(report.issues())
+}
+
+/// The subject of a `git format-patch` file, without its `[PATCH]` tag.
+fn patch_title(text: &str) -> Option<String> {
+    let line = text.lines().take(40).find(|l| l.starts_with("Subject: "))?;
+    let s = line.trim_start_matches("Subject: ");
+    let s = match s.strip_prefix('[') {
+        Some(rest) if s.starts_with("[PATCH") => rest.split_once("] ").map_or(s, |(_, t)| t),
+        _ => s,
+    };
+    Some(s.trim().to_string())
 }
 
 fn read_stdin() -> Result<String, String> {

@@ -12,8 +12,8 @@
 //! 3. [`analyze`] pairs C++ functions with Rust functions, following Zircon's
 //!    FFI shims (`rust_<class>_<method>`) where it can, and [`align`] lines up
 //!    each pair's units.
-//! 4. [`check`] flags differences and [`render`] prints a side-by-side,
-//!    diff-style report.
+//! 4. [`check`] flags differences, [`render`] prints a side-by-side,
+//!    diff-style report, and [`html`] writes a self-contained HTML page.
 //!
 //! ```
 //! use babeldiff::{analyze, input::ChangeSet, render};
@@ -33,6 +33,7 @@ pub mod check;
 pub mod cpp;
 pub mod extract;
 pub mod git;
+pub mod html;
 pub mod input;
 pub mod model;
 pub mod normalize;

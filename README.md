@@ -52,6 +52,7 @@ Useful options:
 
 | Option | Effect |
 | --- | --- |
+| `--format html -o report.html` | Write a self-contained HTML page for reviewing in a browser (see below). |
 | `--layout stacked` | Print each C++ unit above the Rust it aligns with, untruncated. Better for agents and narrow terminals. |
 | `--summary` | Only the per-function summaries and findings. |
 | `-U N`, `--context N` | Only rows within N rows of a difference. |
@@ -116,6 +117,39 @@ shims it recognized.
 four planted mistakes (a different error code, a rollback replaced by `?`, a
 lock moved ahead of the argument checks, and a dropped comment).
 
+## HTML report
+
+`--format html` writes one self-contained HTML file, with no external scripts,
+styles or fonts. You can mail it, attach it to a review, or open it from disk.
+
+```sh
+babeldiff git HEAD --format html -o review.html
+```
+
+The page is laid out so that a reviewer's attention goes to what differs:
+
+- A sidebar lists every function pair with a red, amber or green dot and its
+  issue and note counts, and tracks which pairs you have marked reviewed.
+  That state is kept in your browser's local storage.
+- Each pair opens with cards for the four checks (error returns in order,
+  locks, control flow and comments). The cards that differ come first and are
+  red. After them comes the list of findings, which link to their rows.
+- The aligned code has C++ on the left and Rust on the right. Matching rows
+  stay plain, notes get a faint amber tint, and issues are red with the
+  message spelled out. Code on only one side is set against a hatched blank.
+  Closing braces and other lines the alignment skips are dimmed.
+- Hovering an identifier highlights it on both sides under either spelling
+  (`subscriber_count_`, `subscriber_count`, `kMaxSubscribers` and
+  `MAX_SUBSCRIBERS`), and error codes (`ZX_ERR_NO_MEMORY` and
+  `Status::NO_MEMORY`) highlight together.
+- "Fold matching rows" collapses long runs of equivalent rows, and "Only
+  functions with issues" hides the rest.
+- Keyboard: `j`/`k` next and previous difference, `n`/`p` next and previous
+  function, `x` mark reviewed, `f` fold, `i` issues only, `?` help.
+
+The page follows the system's light or dark setting, stacks the two languages
+on narrow screens, and prints cleanly.
+
 ## How it works
 
 1. **Inputs.** The change is turned into the C++ files as they were before and
@@ -164,6 +198,7 @@ for pair in &report.pairs {
     }
 }
 print!("{}", render::render(&report, &render::RenderOptions::default()));
+let page = babeldiff::html::render_html(&report, &Default::default());
 ```
 
 `babeldiff::git::Git` and `babeldiff::git::RepoFinder` provide the git

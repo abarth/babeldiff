@@ -40,10 +40,18 @@ impl<'a> Ctx<'a> {
         for child in ts::named_children(scope) {
             match child.kind() {
                 "function_item" => {
+                    let gap = child
+                        .child_by_field_name("name")
+                        .is_some_and(|n| self.text(n) == crate::patch::GAP_FN);
+                    if gap {
+                        continue;
+                    }
                     if let Some(f) = self.function(child, class) {
                         out.push(f);
                     }
                 }
+                // Error recovery can wrap items; keep looking inside.
+                "ERROR" => self.walk_scope(child, class, out),
                 "mod_item" | "foreign_mod_item" => {
                     if let Some(body) = child.child_by_field_name("body") {
                         self.walk_scope(body, class, out);
@@ -52,7 +60,8 @@ impl<'a> Ctx<'a> {
                 "impl_item" => {
                     let ty = child
                         .child_by_field_name("type")
-                        .map(|t| type_name(self.text(t)));
+                        .map(|t| type_name(self.text(t)))
+                        .filter(|t| t != crate::patch::GAP_TYPE);
                     if let Some(body) = child.child_by_field_name("body") {
                         self.walk_scope(body, ty.as_deref(), out);
                     }
@@ -608,6 +617,7 @@ fn fold_status_tail(units: &mut Vec<Unit>) {
     if !(is_ok
         && prev.kind == UnitKind::Stmt
         && prev.features.propagates
+        && prev.features.errors.is_empty()
         && prev.depth == last.depth
         && prev.depth == 1)
     {
