@@ -25,7 +25,22 @@ fn kind_group(k: UnitKind) -> u8 {
 }
 
 /// How similar two units are, in `[0, 1]`. Units of incompatible kinds score 0.
+/// A call whose failure one side handles in an `if` and the other side
+/// propagates with `?` (or its C++ spelling).
+pub fn is_handled_vs_propagated(a: &Unit, b: &Unit) -> bool {
+    let handled = |u: &Unit| u.kind == UnitKind::If && u.features.checks_error;
+    let propagated = |u: &Unit| u.kind == UnitKind::Stmt && u.features.propagates;
+    (handled(a) && propagated(b)) || (propagated(a) && handled(b))
+}
+
 pub fn similarity(a: &Unit, b: &Unit) -> f64 {
+    if is_handled_vs_propagated(a, b) {
+        let (fa, fb) = (&a.features, &b.features);
+        if fa.calls.is_empty() || fb.calls.is_empty() {
+            return 0.0;
+        }
+        return 0.2 + 0.8 * jaccard(&fa.calls, &fb.calls);
+    }
     if kind_group(a.kind) != kind_group(b.kind) {
         return 0.0;
     }
@@ -53,26 +68,20 @@ pub fn similarity(a: &Unit, b: &Unit) -> f64 {
             den += w;
         }
     };
-    add(
-        3.0,
-        jaccard(&fa.calls, &fb.calls),
-        !(fa.calls.is_empty() && fb.calls.is_empty()),
-    );
-    add(
-        2.0,
-        jaccard(&fa.idents, &fb.idents),
-        !(fa.idents.is_empty() && fb.idents.is_empty()),
-    );
-    add(
-        2.0,
-        jaccard(&fa.errors, &fb.errors),
-        !(fa.errors.is_empty() && fb.errors.is_empty()),
-    );
-    add(
-        2.0,
-        jaccard(&fa.locks, &fb.locks),
-        !(fa.locks.is_empty() && fb.locks.is_empty()),
-    );
+    let mut add_set = |w: f64, a: &[String], b: &[String]| {
+        add(w, jaccard(a, b), !(a.is_empty() && b.is_empty()));
+    };
+    // Calls and identifiers only count when both sides have some; a field
+    // on one side and an accessor call on the other is judged by `names`.
+    if !fa.calls.is_empty() && !fb.calls.is_empty() {
+        add_set(2.0, &fa.calls, &fb.calls);
+    }
+    if !fa.idents.is_empty() && !fb.idents.is_empty() {
+        add_set(1.0, &fa.idents, &fb.idents);
+    }
+    add_set(2.0, &fa.names, &fb.names);
+    add_set(2.0, &fa.errors, &fb.errors);
+    add_set(2.0, &fa.locks, &fb.locks);
     add(
         1.0,
         (fa.propagates == fb.propagates) as u8 as f64,

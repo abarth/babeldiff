@@ -80,10 +80,16 @@ pub struct FeatureAcc {
     pub idents: Vec<String>,
     pub text: String,
     pub propagates: bool,
+    /// Names of called functions as written, so they are not also counted
+    /// as identifiers.
+    pub callees: Vec<String>,
 }
 
 impl FeatureAcc {
     pub fn call(&mut self, name: &str) {
+        let last = name.rsplit(['.', ':', '>']).next().unwrap_or(name);
+        self.callees
+            .push(normalize::ident(last.trim_end_matches('!')));
         if let Some(c) = normalize::call(name) {
             self.calls.push(c);
         }
@@ -101,25 +107,60 @@ impl FeatureAcc {
         idents.dedup();
         // Called names are compared as calls, not identifiers.
         let calls = &self.calls;
+        let callees = &self.callees;
         idents.retain(|i| {
-            !calls.contains(i) && normalize::call(i).is_none_or(|c| !calls.contains(&c))
+            !calls.contains(i)
+                && !callees.contains(i)
+                && normalize::call(i).is_none_or(|c| !calls.contains(&c))
         });
         let errors = normalize::error_codes(&self.text);
         let locks = match lang {
             Lang::Cpp => cpp_locks(&self.text),
             Lang::Rust => rust_locks(&self.text),
         };
-        let asserts = self.calls.iter().any(|c| c == "assert");
-        let unlocks = self.calls.iter().any(|c| c == "release")
+        let mut calls = self.calls;
+        if !locks.is_empty() {
+            // Acquisitions are compared as locks, not calls.
+            const LOCK_CALLS: &[&str] = &[
+                "lock",
+                "read_lock",
+                "write_lock",
+                "lock_read",
+                "lock_write",
+                "lock_irqsave",
+                "lock_irq",
+                "try_lock",
+                "acquire",
+                "acquire_irq_save",
+                "read_guard",
+                "write_guard",
+            ];
+            calls.retain(|c| !LOCK_CALLS.contains(&c.as_str()) && !c.contains("lock"));
+            idents.retain(|i| !i.contains("lock"));
+        }
+        let mut names: Vec<String> = calls
+            .iter()
+            .chain(idents.iter())
+            .map(|n| {
+                let n = n.strip_prefix("set_").unwrap_or(n);
+                n.strip_prefix("get_").unwrap_or(n).to_string()
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        let asserts = calls.iter().any(|c| c == "assert");
+        let unlocks = calls.iter().any(|c| c == "release")
             && (self.text.contains("guard") || self.text.contains("lock"));
         Features {
-            calls: self.calls,
+            calls,
             idents,
+            names,
             errors,
             locks,
             unlocks,
             propagates: self.propagates,
             asserts,
+            checks_error: false,
             ret: None,
             comment: Vec::new(),
         }

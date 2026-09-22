@@ -132,6 +132,9 @@ pub struct Features {
     pub calls: Vec<String>,
     /// Normalized identifiers mentioned.
     pub idents: Vec<String>,
+    /// Calls and identifiers together, with accessor prefixes removed, so a
+    /// C++ field `head_` matches a Rust accessor `head()` or `set_head()`.
+    pub names: Vec<String>,
     /// Error codes mentioned, normalized (e.g. `NO_MEMORY`).
     pub errors: Vec<String>,
     /// Locks acquired, normalized (e.g. `lock` for `&lock_` and `self.lock`).
@@ -143,6 +146,9 @@ pub struct Features {
     pub propagates: bool,
     /// Whether the unit is an assertion.
     pub asserts: bool,
+    /// For `if` units: whether the condition tests a call for failure
+    /// (`status != ZX_OK`, `.is_err()`, `let Err(..)`).
+    pub checks_error: bool,
     /// For return units: what is returned.
     pub ret: Option<Ret>,
     /// For comment units: normalized words.
