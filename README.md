@@ -113,6 +113,18 @@ Rust safety comments (`// SAFETY: ...` and `# Safety` doc sections) are
 expected additions: they are shown, marked `>`, with no finding, and never
 aligned with a C++ comment.
 
+Locking is compared through ksync's differences from C++. `ksync::lock!(let g
+= self.lock.lock())`, `self.read_lock()`, `self.write_lock()` and a
+`#[guarded]` struct's `self.lock_mu()` count as taking the lock that C++'s
+`Guard<...> guard{&lock_}` takes. Lock tokens are treated as bookkeeping and
+shown with no finding: `let token = guard.token()`, a forged
+`LockToken::new()` in an FFI shim whose C++ caller holds the lock, and binding
+a guarded field with `self.field.get(token)`. A guarded field read through
+its `KCell` (`self.flashes.get(&token)`) matches the C++ member (`flashes_`).
+`guard_<lock>(&token)` and `fields_mut()` are field access, not acquisitions.
+Clang thread-safety annotations (`TA_REQ`, `TA_GUARDED`) are ignored on the
+C++ side, since in Rust they become token parameters.
+
 Findings start with `!` (issue) or `~` (note), so `grep '^    !'` lists the
 issues. At the end the report lists functions it could not pair and the FFI
 shims it recognized.

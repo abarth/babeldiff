@@ -43,6 +43,11 @@ pub fn words(s: &str) -> Vec<String> {
 /// Calls that carry no meaning across the two languages (ownership and
 /// conversion plumbing), dropped from the call lists.
 const NOISE_CALLS: &[&str] = &[
+    // ksync reaches guarded state through the guard or a `KCell`.
+    "fields",
+    "fields_mut",
+    "get_inner",
+    "into_inner",
     // ksync's token guards re-borrow a lock that is already held.
     "guard_read_lock",
     "guard_write_lock",
@@ -126,7 +131,9 @@ pub fn call(name: &str) -> Option<String> {
             n = ident(ty);
         }
     }
-    if NOISE_CALLS.contains(&n.as_str()) || n.starts_with("wrapping_") {
+    // ksync's `guard_<lock>(&token)` gives field access under a lock that
+    // is already held; it acquires nothing.
+    if NOISE_CALLS.contains(&n.as_str()) || n.starts_with("wrapping_") || n.starts_with("guard_") {
         // Rust's wrapping arithmetic is C++'s unsigned arithmetic.
         return None;
     }
@@ -217,6 +224,13 @@ pub fn ident_feature(s: &str) -> Option<String> {
     if n.is_empty() || NOISE_IDENTS.contains(&n.as_str()) || n.len() < 2 {
         return None;
     }
+    // ksync's lock tokens and guards (`token`, `list_token`, `state_guard`,
+    // `LockToken`, `TableWriteTokenGuard`, `FooLockClass`) are
+    // plumbing; the lock itself is compared as a lock.
+    if n == "token" || n.ends_with("_token") || n.ends_with("_guard") || n.ends_with("_lock_class")
+    {
+        return None;
+    }
     Some(n)
 }
 
@@ -262,6 +276,20 @@ pub fn lock_key(receiver: &str, method: Option<&str>) -> String {
     if let Some(m) = method {
         if matches!(m, "read_lock" | "write_lock" | "lock_read" | "lock_write") {
             return "lock".to_string();
+        }
+        // An accessor that locks a named lock: `self.lock_timer_lock()`.
+        // ksync's `#[guarded]` generates `lock_<field>()` and its
+        // `_policy` and `_aliased` variants for a mutex field.
+        if let Some(name) = m.strip_prefix("lock_") {
+            let name = name
+                .trim_end_matches("_policy")
+                .trim_end_matches("_aliased");
+            if !matches!(
+                name,
+                "irqsave" | "irq" | "read" | "write" | "shared" | "policy"
+            ) {
+                return name.to_string();
+            }
         }
     }
     const DROP: &[&str] = &[
@@ -433,6 +461,15 @@ mod tests {
         assert_eq!(lock_key("&self.page_lock", None), "page_lock");
         assert_eq!(lock_key("&handle_table_->lock_", None), "lock");
         assert_eq!(lock_key("up->handle_table().get_lock()", None), "lock");
+        // ksync accessors name the lock field.
+        assert_eq!(lock_key("self", Some("lock_mu")), "mu");
+        assert_eq!(lock_key("self", Some("lock_mu_policy")), "mu");
+        assert_eq!(lock_key("&mu_", None), "mu");
+        assert_eq!(
+            lock_key("self.spare_list_lock", Some("lock")),
+            "spare_list_lock"
+        );
+        assert_eq!(lock_key("&spare_list_lock_", None), "spare_list_lock");
         assert_eq!(lock_key("table", Some("write_lock")), "lock");
     }
 

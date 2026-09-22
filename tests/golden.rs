@@ -80,7 +80,7 @@ fn beacon_follows_ffi_shims_without_false_positives() {
         matches!(&pair.link, Link::Ffi { shim, .. } if shim == "rust_beacon_dispatcher_subscribe")
     );
     // A faithful port: every function pairs and none has an issue.
-    assert_eq!(report.pairs.len(), 6);
+    assert_eq!(report.pairs.len(), 7);
     for p in &report.pairs {
         assert_eq!(p.issues(), 0, "{}: {:#?}", p.cpp.name, p.findings);
         assert_eq!(
@@ -112,6 +112,19 @@ fn beacon_follows_ffi_shims_without_false_positives() {
             );
         }
     }
+    // ksync token plumbing has no C++ counterpart and is not a finding, and
+    // the lock is still compared as a lock.
+    let fc = report
+        .pairs
+        .iter()
+        .find(|p| p.cpp.name == "BeaconDispatcher::FlashCount")
+        .unwrap();
+    assert!(fc.rust.units.iter().any(|u| u.features.lock_plumbing));
+    assert!(fc
+        .findings
+        .iter()
+        .all(|f| f.severity == Severity::Note && f.message == "comment only in Rust"));
+    assert_eq!(fc.summary.cpp_locks, fc.summary.rust_locks);
     // Shims are reported as shims, not as unpaired Rust.
     assert!(report
         .shims
@@ -314,5 +327,5 @@ fn cli_writes_html() {
     assert!(html.contains(
         "<title>babeldiff: [kernel] Port BeaconDispatcher subscriptions to Rust</title>"
     ));
-    assert_eq!(html.matches("<section class=\"pair ").count(), 6);
+    assert_eq!(html.matches("<section class=\"pair ").count(), 7);
 }
