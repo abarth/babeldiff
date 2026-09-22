@@ -124,7 +124,16 @@ impl<'a> Ctx<'a> {
             .is_some_and(|t| self.text(t).trim() != "()");
         let fcx = FnCtx { returns_value };
         self.block(body, 1, true, fcx, &mut b);
-        fold_status_tail(&mut b.units);
+        let ends_ok_unit = b.units.last().is_some_and(|u| {
+            let text: String = (u.start_line..=u.end_line)
+                .filter_map(|l| self.lines.get(l - 1))
+                .map(|l| l.trim())
+                .collect();
+            text.starts_with("Ok(())") || text.starts_with("returnOk(())")
+        });
+        if ends_ok_unit {
+            fold_status_tail(&mut b.units);
+        }
 
         let end = ts::end_line(n);
         let mut calls: Vec<String> = b
@@ -585,7 +594,8 @@ fn type_name(t: &str) -> String {
 }
 
 /// `foo()?; Ok(())` at the end of a function passes on foo's status, which
-/// C++ writes `return Foo();`.
+/// C++ writes `return Foo();`. The caller checks that the last unit is
+/// `Ok(())`.
 fn fold_status_tail(units: &mut Vec<Unit>) {
     let n = units.len();
     if n < 2 {
