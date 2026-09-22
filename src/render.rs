@@ -124,6 +124,14 @@ fn render_pair(out: &mut String, p: &PairReport, opts: &RenderOptions) {
         }
         Link::Similarity => {}
     }
+    if let Some(f) = &p.forwarder {
+        let _ = writeln!(
+            out,
+            "  via   Rust {} forwards here  {}",
+            f.name,
+            f.location()
+        );
+    }
     let ext: Vec<&String> = {
         let mut v: Vec<&String> = p.cpp.units.iter().filter_map(|u| u.file.as_ref()).collect();
         v.dedup();

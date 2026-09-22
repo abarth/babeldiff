@@ -1,6 +1,6 @@
 //! Extracts functions and their units from Rust source.
 
-use crate::model::{Features, Function, Lang, Ret, UnitKind};
+use crate::model::{Features, Function, Lang, Ret, Unit, UnitKind};
 use crate::ts::{self, FeatureAcc, UnitBuilder};
 use regex::Regex;
 use std::sync::LazyLock;
@@ -124,6 +124,7 @@ impl<'a> Ctx<'a> {
             .is_some_and(|t| self.text(t).trim() != "()");
         let fcx = FnCtx { returns_value };
         self.block(body, 1, true, fcx, &mut b);
+        fold_status_tail(&mut b.units);
 
         let end = ts::end_line(n);
         let mut calls: Vec<String> = b
@@ -581,4 +582,31 @@ fn type_name(t: &str) -> String {
     let t = t.trim_start_matches('&').trim_start_matches("mut ").trim();
     let t = t.split('<').next().unwrap_or(t);
     t.rsplit("::").next().unwrap_or(t).trim().to_string()
+}
+
+/// `foo()?; Ok(())` at the end of a function passes on foo's status, which
+/// C++ writes `return Foo();`.
+fn fold_status_tail(units: &mut Vec<Unit>) {
+    let n = units.len();
+    if n < 2 {
+        return;
+    }
+    let (prev, last) = (&units[n - 2], &units[n - 1]);
+    let is_ok = last.kind == UnitKind::Return
+        && last.features.ret == Some(Ret::Ok)
+        && last.features.calls.is_empty();
+    if !(is_ok
+        && prev.kind == UnitKind::Stmt
+        && prev.features.propagates
+        && prev.depth == last.depth
+        && prev.depth == 1)
+    {
+        return;
+    }
+    let last = units.pop().unwrap();
+    let prev = units.last_mut().unwrap();
+    prev.kind = UnitKind::Return;
+    prev.end_line = last.end_line;
+    prev.features.propagates = false;
+    prev.features.ret = Some(Ret::Status);
 }

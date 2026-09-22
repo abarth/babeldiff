@@ -43,6 +43,11 @@ pub fn words(s: &str) -> Vec<String> {
 /// Calls that carry no meaning across the two languages (ownership and
 /// conversion plumbing), dropped from the call lists.
 const NOISE_CALLS: &[&str] = &[
+    // ksync's token guards re-borrow a lock that is already held.
+    "guard_read_lock",
+    "guard_write_lock",
+    "token",
+    "token_mut",
     "move",
     "forward",
     "get",
@@ -157,6 +162,8 @@ fn alias(n: &str) -> &str {
         | "static_assert"
         | "const_assert" => "assert",
         "printf" | "dprintf" | "println" | "print" | "kprintf" | "kprintln" | "eprintln" => "print",
+        "ltracef" | "ltracef_level" | "tracef" | "ltrace_entry" | "ltrace_exit"
+        | "ltrace_entry_obj" | "ltrace_exit_obj" | "trace_duration" | "ktrace" => "trace",
         "panic" | "zx_panic" | "platform_panic_start" => "panic",
         "size" | "len" => "len",
         "empty" | "is_empty" => "is_empty",
@@ -165,6 +172,7 @@ fn alias(n: &str) -> &str {
         "memcpy" | "copy_from_slice" | "copy_nonoverlapping" => "memcpy",
         "memset" | "fill" | "write_bytes" => "memset",
         "push_back" | "push" => "push",
+        "kcounter_add" => "add",
         "pop_back" | "pop" => "pop",
         "push_front" => "push_front",
         "pop_front" => "pop_front",
@@ -250,10 +258,7 @@ pub fn mentions_ok(text: &str) -> bool {
 /// `thread_lock`. `method` is the Rust method that acquired it, if any.
 pub fn lock_key(receiver: &str, method: Option<&str>) -> String {
     if let Some(m) = method {
-        if matches!(
-            m,
-            "read_lock" | "write_lock" | "lock_read" | "lock_write" | "read_guard" | "write_guard"
-        ) {
+        if matches!(m, "read_lock" | "write_lock" | "lock_read" | "lock_write") {
             return "lock".to_string();
         }
     }

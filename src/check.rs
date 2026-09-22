@@ -178,8 +178,13 @@ fn group_runs(rows: &mut [Row], cpp: &Function, rust: &Function) {
             let first = units.first().map_or(0, |u| u.start_line);
             let last = units.last().map_or(0, |u| u.end_line);
             let what: Vec<String> = counts.iter().map(|(n, c)| format!("{c} {n}")).collect();
+            let span = if first == last {
+                format!("line {first}")
+            } else {
+                format!("lines {first}-{last}")
+            };
             let msg = format!(
-                "lines {first}-{last} only in {side}, with no {other} counterpart: {}",
+                "{span} only in {side}, with no {other} counterpart: {}",
                 what.join(", ")
             );
             for r in &mut rows[i..j] {
@@ -205,6 +210,17 @@ fn find_moved(u: &Unit, others: &[Unit], candidates: &[usize]) -> Option<usize> 
         .filter(|(_, s)| *s >= 0.7)
         .max_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(j, _)| j)
+}
+
+/// A statement that only traces, prints or asserts.
+fn diagnostic_only(f: &crate::model::Features) -> bool {
+    f.calls
+        .iter()
+        .any(|c| matches!(c.as_str(), "trace" | "print" | "assert"))
+        && f.locks.is_empty()
+        && f.errors.is_empty()
+        && !f.propagates
+        && !f.unlocks
 }
 
 fn only_in(u: &Unit, here: &str, there: &str, moved: Option<usize>) -> (Severity, String) {
@@ -240,6 +256,14 @@ fn only_in(u: &Unit, here: &str, there: &str, moved: Option<usize>) -> (Severity
     let significant = match u.kind {
         // A comment lost in translation matters; an added one is worth a look.
         UnitKind::Comment => here == "C++",
+        // Returning a plain value (often a tail expression) is how Rust ends
+        // constructors and accessors; success and error returns still count.
+        UnitKind::Return => !matches!(f.ret, Some(Ret::Value) | None),
+        UnitKind::Stmt if diagnostic_only(f) => {
+            // Tracing differs freely between the two; a check the Rust adds
+            // is worth a look, but a check the Rust drops is an issue.
+            here == "C++" && f.calls.iter().any(|c| c == "assert")
+        }
         UnitKind::Stmt => {
             !f.calls.is_empty()
                 || !f.locks.is_empty()
@@ -295,19 +319,22 @@ fn compare(a: &Unit, b: &Unit, notes: &mut Vec<(Severity, String)>) {
                 format!("error code differs: C++ returns {x}, Rust returns {y}"),
             ));
         }
-        (Some(ra @ (Ret::Error(_) | Ret::Ok)), Some(rb))
-        | (Some(rb), Some(ra @ (Ret::Error(_) | Ret::Ok)))
-            if ra != rb && !matches!((ra, rb), (Ret::Error(_), Ret::Error(_))) =>
-        {
-            let (c, r) = if fa.ret.as_ref() == Some(ra) {
-                (ra, rb)
+        // Passing a callee's status on reads as a value in Rust, whose tail
+        // expression returns the callee's `Result`.
+        (Some(Ret::Status), Some(Ret::Value)) | (Some(Ret::Value), Some(Ret::Status))
+            if !fa.calls.is_empty() && !fb.calls.is_empty() => {}
+        (Some(ra), Some(rb)) if ra != rb => {
+            // Success versus failure is a behavior change; the other
+            // mismatches (a status variable, a value, `Ok`) are usually
+            // just the two languages' ways of saying the same thing.
+            let error = |r: &Ret| matches!(r, Ret::Error(_));
+            let success = |r: &Ret| matches!(r, Ret::Ok | Ret::Value);
+            let sev = if (error(ra) && success(rb)) || (success(ra) && error(rb)) {
+                Severity::Issue
             } else {
-                (rb, ra)
+                Severity::Note
             };
-            notes.push((
-                Severity::Issue,
-                format!("C++ returns {c}, Rust returns {r}"),
-            ));
+            notes.push((sev, format!("C++ returns {ra}, Rust returns {rb}")));
         }
         _ => {}
     }

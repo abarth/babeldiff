@@ -34,6 +34,9 @@ pub struct PairReport {
     pub cpp: Function,
     pub rust: Function,
     pub link: Link,
+    /// A thin Rust function that forwards to `rust`, standing in for the C++
+    /// by name.
+    pub forwarder: Option<Function>,
     pub origin: CppOrigin,
     pub score: f64,
     pub rows: Vec<Row>,
@@ -145,6 +148,20 @@ fn operator_alias(base: &str) -> &str {
 }
 
 fn name_words(f: &Function) -> Vec<String> {
+    if f.lang == crate::model::Lang::Cpp {
+        let class = f
+            .class
+            .as_deref()
+            .map(|c| c.rsplit("::").next().unwrap_or(c));
+        if f.base.starts_with('~') {
+            // Destructors become `Drop::drop`.
+            return vec!["drop".to_string()];
+        }
+        if class == Some(f.base.as_str()) {
+            // Constructors become `new` or `init`.
+            return vec!["new".to_string()];
+        }
+    }
     normalize::words(operator_alias(&f.base))
 }
 
@@ -212,13 +229,17 @@ fn undecorated(shim: &str) -> String {
 /// Finds the function an FFI shim forwards to.
 fn shim_target<'a>(shim: &Function, rust: &'a [Function]) -> Option<&'a Function> {
     let und = undecorated(&shim.base);
+    // How a call to `r` appears in the shim's call list: `Foo::init` is
+    // recorded as a call of `foo`, like a constructor.
+    let key = |r: &Function| normalize::call(&r.name).unwrap_or_else(|| normalize::ident(&r.base));
     rust.iter()
         .filter(|r| !r.is_ffi && r.name != shim.name)
-        .filter(|r| shim.calls.contains(&normalize::ident(&r.base)))
+        .filter(|r| shim.calls.contains(&key(r)))
         // Prefer the callee whose name is embedded in the shim's name.
         .max_by_key(|r| {
+            let k = key(r);
             let b = normalize::ident(&r.base);
-            (und.ends_with(&b) as usize) * 1000 + b.len()
+            (und.ends_with(&b) as usize) * 1000 + (und.contains(&k) as usize) * 500 + k.len()
         })
 }
 
@@ -278,6 +299,7 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
     };
 
     let mut chosen: Vec<(usize, usize, Link)> = Vec::new();
+    let mut forwarders: Vec<(usize, usize)> = Vec::new();
 
     // 1. Explicit pairs.
     for (c, r) in &forced {
@@ -364,13 +386,29 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
         }
     }
 
+    // A thin Rust method that just calls the method doing the work (say
+    // `MemoryWatchdog::dump` calling `MemoryWatchdogState::dump`) stands in
+    // for the C++ only by name; compare against the method doing the work.
+    for (ci, ri, _) in &mut chosen {
+        if let Some(rj) = forwardee(&cpp[*ci], &rust_pool[*ri], &rust_pool, &rust_used) {
+            rust_used[rj] = true;
+            forwarders.push((rj, *ri));
+            *ri = rj;
+        }
+    }
+
     for (ci, ri, link) in chosen {
-        report.pairs.push(build_pair(
+        let mut pair = build_pair(
             cpp[ci].clone(),
             rust_pool[ri].clone(),
             link,
             CppOrigin::Changed,
-        ));
+        );
+        pair.forwarder = forwarders
+            .iter()
+            .find(|(t, _)| *t == ri)
+            .map(|(_, f)| rust_pool[*f].clone());
+        report.pairs.push(pair);
     }
 
     // 4. Rust with no C++ in the change: look for C++ the change left alone.
@@ -420,6 +458,50 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
     report
 }
 
+/// Number of units in a function's body that do something.
+fn body_len(f: &Function) -> usize {
+    f.units
+        .iter()
+        .filter(|u| !matches!(u.kind, UnitKind::Signature | UnitKind::Comment))
+        .count()
+}
+
+/// If `r` only forwards to another Rust function in `pool` that is named
+/// like it and resembles `c` better, that function's index.
+fn forwardee(c: &Function, r: &Function, pool: &[Function], used: &[bool]) -> Option<usize> {
+    if body_len(r) > 5 {
+        return None;
+    }
+    let own = normalize::words(&normalize::ident(&r.base));
+    let current = score(c, r).0;
+    pool.iter()
+        .enumerate()
+        .filter(|(j, t)| {
+            !used[*j]
+                && !t.is_ffi
+                && (t.path != r.path || t.start_line != r.start_line)
+                && body_len(t) > body_len(r)
+                && calls_function(r, t)
+                && normalize::words(&normalize::ident(&t.base))
+                    .iter()
+                    .all(|w| own.contains(w))
+        })
+        .map(|(j, t)| (j, score(c, t).0))
+        .filter(|(_, s)| *s > current)
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(j, _)| j)
+}
+
+/// Whether `r` calls `t`, allowing for `Type::init()` normalizing to the
+/// type's name.
+fn calls_function(r: &Function, t: &Function) -> bool {
+    let by_type = matches!(t.base.as_str(), "new" | "init")
+        && t.class
+            .as_deref()
+            .is_some_and(|c| r.calls.contains(&normalize::ident(c)));
+    by_type || r.calls.contains(&normalize::ident(&t.base))
+}
+
 fn build_pair(cpp: Function, rust: Function, link: Link, origin: CppOrigin) -> PairReport {
     let (s, pairs) = score(&cpp, &rust);
     let (rows, findings) = check::check(&cpp, &rust, &pairs);
@@ -428,6 +510,7 @@ fn build_pair(cpp: Function, rust: Function, link: Link, origin: CppOrigin) -> P
         cpp,
         rust,
         link,
+        forwarder: None,
         origin,
         score: s,
         rows,

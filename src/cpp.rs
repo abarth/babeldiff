@@ -186,6 +186,21 @@ impl<'a> Ctx<'a> {
         if body.kind() == "compound_statement" {
             self.block(body, 1, &mut b);
         }
+        // `return Foo();` in a function returning a status passes Foo's status
+        // on, which Rust writes `foo()?; Ok(())`.
+        let returns_status = n
+            .child_by_field_name("type")
+            .is_some_and(|t| self.text(t) == "zx_status_t");
+        if returns_status {
+            for u in &mut b.units {
+                if u.kind == UnitKind::Return
+                    && u.features.ret == Some(Ret::Value)
+                    && !u.features.calls.is_empty()
+                {
+                    u.features.ret = Some(Ret::Status);
+                }
+            }
+        }
 
         let end = ts::end_line(n);
         let mut calls: Vec<String> = b
@@ -241,6 +256,7 @@ impl<'a> Ctx<'a> {
                     d.kind() == "init_declarator"
                         && d.child_by_field_name("value").is_some_and(|v| {
                             matches!(v.kind(), "initializer_list" | "argument_list")
+                                && ts::named_children(v).iter().any(|a| !ts::is_comment(*a))
                         })
                 });
                 if let Some(ty) = ty.filter(|t| {
@@ -401,6 +417,7 @@ impl<'a> Ctx<'a> {
         if let Some(v) = value {
             stmts.retain(|s| s.id() != v.id());
         }
+        drop_trailing_break(&mut stmts);
         // `case A: case B:` falls through, which Rust writes as `A | B =>`.
         if let Some(last) = b.units.last_mut() {
             if last.kind == UnitKind::Case
@@ -417,6 +434,7 @@ impl<'a> Ctx<'a> {
             }
         }
         b.push(UnitKind::Case, ts::line(n), ts::line(n), depth, f);
+        drop_trailing_break(&mut stmts);
         for s in stmts {
             self.case_body(s, depth, b);
         }
@@ -424,7 +442,11 @@ impl<'a> Ctx<'a> {
 
     fn case_body(&self, s: Node, depth: usize, b: &mut UnitBuilder) {
         if s.kind() == "compound_statement" {
-            self.block(s, depth + 1, b);
+            let mut stmts = ts::named_children(s);
+            drop_trailing_break(&mut stmts);
+            for c in stmts {
+                self.statement(c, depth + 1, b);
+            }
         } else {
             self.statement(s, depth + 1, b);
         }
@@ -531,6 +553,26 @@ impl<'a> Ctx<'a> {
             }
         }
 
+        // `Foo* x = Get(); if (!x) return ZX_ERR_X;` is how C++ spells
+        // `let x = get().ok_or(X)?;`.
+        if let (Some(c), Some(t), None, false) = (cond, cons, alt, is_else_if) {
+            if let Some((var, errors)) = self.null_check(c, t) {
+                if let Some(prev) = b.units.last_mut() {
+                    if prev.kind == UnitKind::Stmt
+                        && prev.depth == depth
+                        && prev.file.is_none()
+                        && !prev.features.propagates
+                        && self.mentions(prev, &var)
+                    {
+                        prev.features.propagates = true;
+                        prev.features.errors.extend(errors);
+                        prev.end_line = ts::end_line(n);
+                        return;
+                    }
+                }
+            }
+        }
+
         let header_end = cons.map_or(line, |c| {
             let inner = if c.kind() == "attributed_statement" {
                 ts::named_children(c)
@@ -623,6 +665,23 @@ impl<'a> Ctx<'a> {
                 })
             })
         })
+    }
+
+    /// For `if (!x) return ZX_ERR_X;` (or `x == nullptr`), the variable and
+    /// the error codes returned.
+    fn null_check(&self, cond: Node, cons: Node) -> Option<(String, Vec<String>)> {
+        static NULL: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"^\(\s*(?:!\s*(\w+)|(\w+)\s*==\s*nullptr|nullptr\s*==\s*(\w+))\s*\)$")
+                .unwrap()
+        });
+        let c = NULL.captures(self.text(cond).trim())?;
+        let var = (1..=3).find_map(|i| c.get(i))?.as_str().to_string();
+        let ret = single_statement(cons)?;
+        if ret.kind() != "return_statement" {
+            return None;
+        }
+        let errors = crate::normalize::error_codes(self.text(ret));
+        (!errors.is_empty()).then_some((var, errors))
     }
 
     fn is_propagation(&self, cond: Node, cons: Node) -> bool {
@@ -744,4 +803,27 @@ fn split_name(name: &str, class: &[String]) -> (Option<String>, String) {
         Some(parts.join("::"))
     };
     (cls, base)
+}
+
+/// Removes the `break` that ends a switch case, which Rust match arms don't
+/// need. Trailing comments stay.
+fn drop_trailing_break(stmts: &mut Vec<Node>) {
+    if let Some(i) = stmts.iter().rposition(|c| !ts::is_comment(*c)) {
+        // A break inside `case A: { ...; break; }` is handled by `case_body`.
+        if stmts[i].kind() == "break_statement" {
+            stmts.remove(i);
+        }
+    }
+}
+
+/// The one statement in `n`, looking through braces.
+fn single_statement(n: Node) -> Option<Node> {
+    if n.kind() != "compound_statement" {
+        return Some(n);
+    }
+    let stmts: Vec<Node> = ts::named_children(n)
+        .into_iter()
+        .filter(|c| !ts::is_comment(*c))
+        .collect();
+    (stmts.len() == 1).then(|| stmts[0])
 }

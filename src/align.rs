@@ -25,6 +25,28 @@ fn kind_group(k: UnitKind) -> u8 {
 }
 
 /// How similar two units are, in `[0, 1]`. Units of incompatible kinds score 0.
+/// Overlap of two name lists where each name counts by its best word-level
+/// match on the other side, so `get_dispatcher_with_rights` partly matches
+/// `get_with_rights`.
+pub fn soft_overlap(a: &[String], b: &[String]) -> f64 {
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    let wa: Vec<Vec<String>> = a.iter().map(|x| crate::normalize::words(x)).collect();
+    let wb: Vec<Vec<String>> = b.iter().map(|x| crate::normalize::words(x)).collect();
+    let best = |x: &Vec<String>, ys: &[Vec<String>]| -> f64 {
+        ys.iter()
+            .map(|y| if x == y { 1.0 } else { seq_similarity(x, y) })
+            .fold(0.0, f64::max)
+    };
+    let sa: f64 = wa.iter().map(|x| best(x, &wb)).sum();
+    let sb: f64 = wb.iter().map(|y| best(y, &wa)).sum();
+    // Near misses count for less than exact matches.
+    let exactish = |s: f64, n: usize| if n == 0 { 0.0 } else { s / n as f64 };
+    let raw = (sa + sb) / (a.len() + b.len()) as f64;
+    raw.min(exactish(sa, a.len()).max(exactish(sb, b.len())))
+}
+
 /// A call whose failure one side handles in an `if` and the other side
 /// propagates with `?` (or its C++ spelling).
 pub fn is_handled_vs_propagated(a: &Unit, b: &Unit) -> bool {
@@ -60,36 +82,33 @@ pub fn similarity(a: &Unit, b: &Unit) -> f64 {
         _ => 0.1,
     };
     // Weighted overlap of the features that identify what a unit does.
-    let mut num = 0.0;
-    let mut den = 0.0;
-    let mut add = |w: f64, s: f64, present: bool| {
-        if present {
-            num += w * s;
-            den += w;
-        }
-    };
-    let mut add_set = |w: f64, a: &[String], b: &[String]| {
-        add(w, jaccard(a, b), !(a.is_empty() && b.is_empty()));
-    };
+    let mut terms: Vec<(f64, f64)> = Vec::new();
+    let set = |a: &[String], b: &[String]| (!(a.is_empty() && b.is_empty())).then(|| jaccard(a, b));
     // Calls and identifiers only count when both sides have some; a field
     // on one side and an accessor call on the other is judged by `names`.
     if !fa.calls.is_empty() && !fb.calls.is_empty() {
-        add_set(2.0, &fa.calls, &fb.calls);
+        terms.push((2.0, soft_overlap(&fa.calls, &fb.calls)));
     }
     if !fa.idents.is_empty() && !fb.idents.is_empty() {
-        add_set(1.0, &fa.idents, &fb.idents);
+        terms.push((1.0, jaccard(&fa.idents, &fb.idents)));
     }
-    add_set(2.0, &fa.names, &fb.names);
-    add_set(2.0, &fa.errors, &fb.errors);
-    add_set(2.0, &fa.locks, &fb.locks);
-    add(
-        1.0,
-        (fa.propagates == fb.propagates) as u8 as f64,
-        fa.propagates || fb.propagates,
-    );
+    for (w, a, b) in [
+        (2.0, &fa.names, &fb.names),
+        (2.0, &fa.errors, &fb.errors),
+        (2.0, &fa.locks, &fb.locks),
+    ] {
+        if let Some(s) = set(a, b) {
+            terms.push((w, s));
+        }
+    }
+    if fa.propagates || fb.propagates {
+        terms.push((1.0, (fa.propagates == fb.propagates) as u8 as f64));
+    }
     if let (Some(ra), Some(rb)) = (&fa.ret, &fb.ret) {
-        add(1.0, (ra == rb) as u8 as f64, true);
+        terms.push((1.0, (ra == rb) as u8 as f64));
     }
+    let num: f64 = terms.iter().map(|(w, s)| w * s).sum();
+    let den: f64 = terms.iter().map(|(w, _)| w).sum();
     let overlap = if den == 0.0 { 1.0 } else { num / den };
     let mut s = base + (1.0 - base) * overlap;
     if a.depth == b.depth {
