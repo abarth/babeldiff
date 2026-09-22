@@ -18,8 +18,9 @@ pub struct CppFile {
 }
 
 pub fn extract(path: &str, src: &str) -> CppFile {
-    let tree = ts::parse(Lang::Cpp, src);
     let lines = crate::extract::split_lines(src);
+    let src = &mask_annotations(src);
+    let tree = ts::parse(Lang::Cpp, src);
     let mut out = CppFile {
         functions: Vec::new(),
         decl_comments: HashMap::new(),
@@ -674,14 +675,24 @@ impl<'a> Ctx<'a> {
             Regex::new(r"^\(\s*(?:!\s*(\w+)|(\w+)\s*==\s*nullptr|nullptr\s*==\s*(\w+))\s*\)$")
                 .unwrap()
         });
-        let c = NULL.captures(self.text(cond).trim())?;
+        // `if (unlikely(!x))` tests the same thing.
+        static HINT: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"^\(\s*(?:un)?likely\s*(\(.*\))\s*\)$").unwrap());
+        let text = self.text(cond).trim();
+        let text = HINT
+            .captures(text)
+            .map_or(text, |c| c.get(1).map_or(text, |m| m.as_str()));
+        let c = NULL.captures(text)?;
         let var = (1..=3).find_map(|i| c.get(i))?.as_str().to_string();
         let ret = single_statement(cons)?;
         if ret.kind() != "return_statement" {
             return None;
         }
+        // Returning an error code, or null for a failed lookup (which Rust
+        // spells `?` on an `Option`).
         let errors = crate::normalize::error_codes(self.text(ret));
-        (!errors.is_empty()).then_some((var, errors))
+        let null = self.text(ret).trim_end_matches(';').trim() == "return nullptr";
+        (!errors.is_empty() || null).then_some((var, errors))
     }
 
     fn is_propagation(&self, cond: Node, cons: Node) -> bool {
@@ -750,6 +761,13 @@ fn find_bodies<'t>(n: Node<'t>, out: &mut Vec<Node<'t>>) {
 
 fn find_function_declarator(n: Node) -> Option<Node> {
     if n.kind() == "function_declarator" {
+        // `Foo(int x) TA_REQ(lock_)` parses as the macro "calling" `Foo(...)`.
+        if let Some(inner) = n
+            .child_by_field_name("declarator")
+            .filter(|d| d.kind() == "function_declarator")
+        {
+            return find_function_declarator(inner);
+        }
         return Some(n);
     }
     if matches!(
@@ -826,4 +844,19 @@ fn single_statement(n: Node) -> Option<Node> {
         .filter(|c| !ts::is_comment(*c))
         .collect();
     (stmts.len() == 1).then(|| stmts[0])
+}
+
+/// Blanks out Clang thread-safety annotations (`TA_REQ(lock_)` and friends),
+/// which the parser can't place and which otherwise split a method in two.
+/// Lengths and line breaks are kept, so positions don't move.
+fn mask_annotations(src: &str) -> String {
+    static TA: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\b(?:__)?TA_[A-Z_]+\b(?:\s*\((?:[^()]|\([^()]*\))*\))?").unwrap()
+    });
+    TA.replace_all(src, |c: &regex::Captures| {
+        c[0].chars()
+            .map(|ch| if ch == '\n' { '\n' } else { ' ' })
+            .collect::<String>()
+    })
+    .into_owned()
 }

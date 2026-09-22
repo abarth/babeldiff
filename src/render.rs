@@ -69,6 +69,20 @@ pub fn render(report: &Report, opts: &RenderOptions) -> String {
             let _ = writeln!(out, "  > Rust {}  {}", f.name, f.location());
         }
     }
+    if !report.removed_cpp_shims.is_empty() {
+        out.push('\n');
+        let _ = writeln!(out, "==== C++ FFI helpers for Rust, changed or removed");
+        for f in &report.removed_cpp_shims {
+            let _ = writeln!(out, "  < C++  {}  {}", f.name, f.location());
+        }
+    }
+    if !report.rust_facades.is_empty() {
+        out.push('\n');
+        let _ = writeln!(out, "==== Rust that calls C++ through FFI");
+        for (f, callee) in &report.rust_facades {
+            let _ = writeln!(out, "  > Rust {} -> {}  {}", f.name, callee, f.location());
+        }
+    }
     let shims: Vec<_> = report.shims.iter().collect();
     if !shims.is_empty() {
         out.push('\n');

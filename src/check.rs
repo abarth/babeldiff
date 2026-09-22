@@ -487,6 +487,10 @@ pub fn summarize(cpp: &Function, rust: &Function, rows: &[Row]) -> Summary {
             .iter()
             .filter_map(|u| match (&u.features.ret, u.features.propagates) {
                 (Some(Ret::Error(e)), _) => Some(e.clone()),
+                // `ok_or(X)?` and `if (!x) return ZX_ERR_X;` return X.
+                (_, true) if !u.features.errors.is_empty() => {
+                    Some(format!("{}?", u.features.errors.join("|")))
+                }
                 (_, true) => Some("?".to_string()),
                 _ => None,
             })

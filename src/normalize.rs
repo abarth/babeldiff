@@ -173,6 +173,8 @@ fn alias(n: &str) -> &str {
         "memset" | "fill" | "write_bytes" => "memset",
         "push_back" | "push" => "push",
         "kcounter_add" => "add",
+        // `ProcessDispatcher::GetCurrent()` and `with_current(|up| ...)`.
+        "with_current" => "get_current",
         "pop_back" | "pop" => "pop",
         "push_front" => "push_front",
         "pop_front" => "pop_front",

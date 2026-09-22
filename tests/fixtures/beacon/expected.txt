@@ -144,8 +144,8 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
    102   return ZX_OK;
 
   errors   same
-           C++:  ?
-           Rust: ?
+           C++:  OUT_OF_RANGE?
+           Rust: OUT_OF_RANGE?
   locks    same
            C++:  lock
            Rust: lock

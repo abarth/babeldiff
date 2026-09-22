@@ -241,3 +241,57 @@ fn cli_exit_status_reflects_issues() {
         .unwrap();
     assert_eq!(same.status.code(), Some(0));
 }
+
+#[test]
+fn html_report_is_self_contained() {
+    use babeldiff::html::{render_html, HtmlOptions};
+    let report = fifo_report("fifo-html");
+    let html = render_html(
+        &report,
+        &HtmlOptions {
+            title: "fifo <test>".into(),
+        },
+    );
+    assert!(html.starts_with("<!doctype html>"));
+    assert!(html.contains("<title>babeldiff: fifo &lt;test&gt;</title>"));
+    // Nothing is loaded from elsewhere.
+    for needle in ["<link", "src=", "http://", "https://", "@import", "url("] {
+        assert!(!html.contains(needle), "found {needle:?}");
+    }
+    // One section per pair, and a row for the planted error-code change.
+    assert_eq!(
+        html.matches("<section class=\"pair ").count(),
+        report.pairs.len()
+    );
+    assert!(html.contains("error code differs: C++ returns PEER_CLOSED, Rust returns BAD_STATE"));
+    assert!(html.contains("data-k=\"e:PEER_CLOSED\""));
+    assert!(html.contains("data-k=\"e:BAD_STATE\""));
+    // Source text is escaped.
+    assert!(!html.contains("<const"));
+    assert!(html.contains("&lt;<span class=\"kw\">const</span>"));
+}
+
+#[test]
+fn cli_writes_html() {
+    let bin = env!("CARGO_BIN_EXE_babeldiff");
+    let out_path =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("beacon-{}.html", std::process::id()));
+    let out = Command::new(bin)
+        .args(["patch", "--format", "html", "-o"])
+        .arg(&out_path)
+        .arg(fixture("beacon/beacon.patch"))
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let html = std::fs::read_to_string(&out_path).unwrap();
+    let _ = std::fs::remove_file(&out_path);
+    assert!(html.contains(
+        "<title>babeldiff: [kernel] Port BeaconDispatcher subscriptions to Rust</title>"
+    ));
+    assert_eq!(html.matches("<section class=\"pair ").count(), 6);
+}

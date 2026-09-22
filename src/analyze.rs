@@ -70,6 +70,13 @@ pub struct Shim {
 pub struct Report {
     pub pairs: Vec<PairReport>,
     pub unmatched_cpp: Vec<Function>,
+    /// Changed or removed C++ helpers that Rust calls through FFI
+    /// (`cpp_<class>_<method>` in a `*_ffi.cc` file). They have no Rust
+    /// counterpart.
+    pub removed_cpp_shims: Vec<Function>,
+    /// Rust functions that only call into C++ through a `cpp_*` FFI helper,
+    /// with the helper's name. They wrap C++ rather than convert it.
+    pub rust_facades: Vec<(Function, String)>,
     pub unmatched_rust: Vec<Function>,
     pub shims: Vec<Shim>,
 }
@@ -436,17 +443,36 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
     report.pairs.sort_by(|a, b| {
         (a.cpp.path.as_str(), a.cpp.start_line).cmp(&(b.cpp.path.as_str(), b.cpp.start_line))
     });
-    report.unmatched_cpp = cpp
+    let (removed_shims, unmatched): (Vec<Function>, Vec<Function>) = cpp
         .into_iter()
         .zip(cpp_used)
         .filter(|(_, u)| !u)
         .map(|(f, _)| f)
-        .collect();
+        .partition(is_cpp_shim);
+    report.unmatched_cpp = unmatched;
+    report.removed_cpp_shims = removed_shims;
     report.unmatched_rust = rust_pool
         .into_iter()
         .zip(rust_used)
         .filter(|(f, u)| !u && !f.is_ffi)
         .map(|(f, _)| f)
+        .collect();
+    let (facades, unmatched): (Vec<Function>, Vec<Function>) =
+        std::mem::take(&mut report.unmatched_rust)
+            .into_iter()
+            .partition(|f| body_len(f) <= 3 && f.calls.iter().any(|c| c.starts_with("cpp_")));
+    report.unmatched_rust = unmatched;
+    report.rust_facades = facades
+        .into_iter()
+        .map(|f| {
+            let callee = f
+                .calls
+                .iter()
+                .find(|c| c.starts_with("cpp_"))
+                .cloned()
+                .unwrap_or_default();
+            (f, callee)
+        })
         .collect();
     report.shims = shims
         .into_iter()
@@ -456,6 +482,11 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
         })
         .collect();
     report
+}
+
+/// A C++ function that exists for Rust to call through FFI.
+fn is_cpp_shim(f: &Function) -> bool {
+    f.base.starts_with("cpp_") && (f.path.ends_with("_ffi.cc") || f.path.ends_with("_ffi.cpp"))
 }
 
 /// Number of units in a function's body that do something.
