@@ -539,19 +539,28 @@ fn render_code(out: &mut String, i: usize, p: &PairReport) {
     // A run of one-sided rows carries its note on the first row only.
     let mut run_sev: Option<(Marker, Severity)> = None;
     for (k, row) in p.rows.iter().enumerate() {
+        // A safety comment is an expected addition: shown, but not flagged.
+        let expected = row.cpp.is_none()
+            && row.notes.is_empty()
+            && row.rust.is_some_and(|j| p.rust.units[j].features.safety);
         let inherited = match (run_sev, row.notes.is_empty()) {
+            _ if expected => None,
             (Some((m, sev)), true) if m == row.marker => Some(sev),
             _ => None,
         };
-        run_sev = match row.marker {
-            Marker::CppOnly | Marker::RustOnly => row
-                .notes
-                .iter()
-                .map(|n| n.0)
-                .min()
-                .or(inherited)
-                .map(|sev| (row.marker, sev)),
-            _ => None,
+        run_sev = if expected {
+            run_sev
+        } else {
+            match row.marker {
+                Marker::CppOnly | Marker::RustOnly => row
+                    .notes
+                    .iter()
+                    .map(|n| n.0)
+                    .min()
+                    .or(inherited)
+                    .map(|sev| (row.marker, sev)),
+                _ => None,
+            }
         };
         let left = row.cpp.map(|j| c.unit(&p.cpp.units[j])).unwrap_or_default();
         let right = row
@@ -565,13 +574,21 @@ fn render_code(out: &mut String, i: usize, p: &PairReport) {
         let _ = write!(
             html,
             "<div class=\"row {}\" id=\"p{i}r{k}\">",
-            row_class(row, inherited)
+            if expected {
+                "ronly expected"
+            } else {
+                row_class(row, inherited)
+            }
         );
         let _ = write!(
             html,
             "<div class=\"cell c{}\">{left}</div>{}<div class=\"cell r{}\">{right}</div>",
             if row.cpp.is_none() { " none" } else { "" },
-            marker_html(row.marker),
+            if expected {
+                "<span class=\"mk\" title=\"Safety comment, expected in Rust\">+</span>"
+            } else {
+                marker_html(row.marker)
+            },
             if row.rust.is_none() { " none" } else { "" },
         );
         if !row.notes.is_empty() {
@@ -1110,6 +1127,8 @@ main { padding: 16px 20px 80px; min-width: 0; }
 .tx { white-space: pre-wrap; overflow-wrap: anywhere; padding-right: 10px; padding-left: 2ch; text-indent: -2ch; }
 .ln.gap { opacity: .45; }
 .ln.ext .no { color: var(--muted); font-style: italic; }
+.row.expected .mk { color: var(--good); font-weight: 400; }
+.row.expected .cell.c { background-image: none; }
 .row.same .mk { color: color-mix(in srgb, var(--faint) 60%, transparent); }
 .row.bad .mk { color: var(--bad); } .row.warn .mk { color: var(--warn); }
 .row.diff.bad .cell, .row.conly.bad .cell.c, .row.ronly.bad .cell.r { background-color: var(--bad-bg); }

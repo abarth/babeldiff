@@ -91,6 +91,27 @@ fn beacon_follows_ffi_shims_without_false_positives() {
     }
     assert!(report.unmatched_cpp.is_empty());
     assert!(report.unmatched_rust.is_empty());
+    // Safety comments and `# Safety` docs are expected in Rust: no finding.
+    for name in [
+        "BeaconDispatcher::FindLocked",
+        "BeaconDispatcher::GetSubscriber",
+    ] {
+        let p = report.pairs.iter().find(|p| p.cpp.name == name).unwrap();
+        let safety: Vec<usize> = p
+            .rust
+            .units
+            .iter()
+            .filter(|u| u.features.safety)
+            .map(|u| u.start_line)
+            .collect();
+        assert!(!safety.is_empty(), "{name}");
+        for f in &p.findings {
+            assert!(
+                f.rust_line.is_none_or(|l| !safety.contains(&l)),
+                "{name}: {f:?}"
+            );
+        }
+    }
     // Shims are reported as shims, not as unpaired Rust.
     assert!(report
         .shims

@@ -69,6 +69,9 @@ pub fn similarity(a: &Unit, b: &Unit) -> f64 {
     let fa = &a.features;
     let fb = &b.features;
     if a.kind == UnitKind::Comment {
+        if fa.safety != fb.safety {
+            return 0.0;
+        }
         return seq_similarity(&fa.comment, &fb.comment);
     }
     let base = match a.kind {

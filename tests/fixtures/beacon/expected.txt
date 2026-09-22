@@ -128,19 +128,23 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
 
 ==== BeaconDispatcher::GetSubscriber  <->  BeaconDispatcher::get_subscriber
   C++   zircon/kernel/object/beacon_dispatcher.cc:95-103
-  Rust  zircon/kernel/object/beacon_dispatcher.rs:72-77
+  Rust  zircon/kernel/object/beacon_dispatcher.rs:72-82
   via   C++ now calls FFI shim rust_beacon_dispatcher_get_subscriber  zircon/kernel/object/beacon_dispatcher_ffi.rs:42-59
-  similarity 0.79, 0 issues, 1 note
+  similarity 0.70, 0 issues, 1 note
 
                                                                                 >     72 /// Returns the key of the subscriber at `index`.
         ^ ~ comment only in Rust
-    95 zx_status_t BeaconDispatcher::GetSubscriber(uint32_t index, uint64_t* o… =     73 pub fn get_subscriber(&self, index: u32) -> Result<u64, Status> {
-    96   Guard<CriticalMutex> guard{get_lock()};                                =     74     ksync::lock!(let guard = self.lock());
-    97   const uint64_t* key = FindLocked(index);                               =     75     let key = self.find_locked(&guard, index).ok_or(Status::OUT_OF_RANG…
+                                                                                >     74 /// # Safety
+                                                                                      75 ///
+                                                                                      76 /// Nothing here is unsafe; the section exists to test that babeldiff
+                                                                                      77 /// expects safety documentation in Rust.
+    95 zx_status_t BeaconDispatcher::GetSubscriber(uint32_t index, uint64_t* o… =     78 pub fn get_subscriber(&self, index: u32) -> Result<u64, Status> {
+    96   Guard<CriticalMutex> guard{get_lock()};                                =     79     ksync::lock!(let guard = self.lock());
+    97   const uint64_t* key = FindLocked(index);                               =     80     let key = self.find_locked(&guard, index).ok_or(Status::OUT_OF_RANG…
     98   if (!key) {
     99     return ZX_ERR_OUT_OF_RANGE;
    100   }
-   101   *out_key = *key;                                                       =     76     Ok(*key)
+   101   *out_key = *key;                                                       =     81     Ok(*key)
    102   return ZX_OK;
 
   errors   same
@@ -156,11 +160,16 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
 
 ==== BeaconDispatcher::FindLocked  <->  BeaconDispatcher::find_locked
   C++   zircon/kernel/object/beacon_dispatcher.cc:105-107
-  Rust  zircon/kernel/object/beacon_dispatcher.rs:79-81
-  similarity 1.00, 0 issues, 0 notes
+  Rust  zircon/kernel/object/beacon_dispatcher.rs:84-92
+  similarity 0.87, 0 issues, 0 notes
 
-   105 const uint64_t* BeaconDispatcher::FindLocked(uint32_t index) const {     =     79 fn find_locked<'a>(&self, guard: &'a StateLockGuard<'_>, index: u32) ->…
-   106   return index < subscriber_count_ ? &subscribers_[index] : nullptr;     =     80     if index < guard.subscriber_count { Some(&guard.subscribers[index a…
+   105 const uint64_t* BeaconDispatcher::FindLocked(uint32_t index) const {     =     84 fn find_locked<'a>(&self, guard: &'a StateLockGuard<'_>, index: u32) ->…
+   106   return index < subscriber_count_ ? &subscribers_[index] : nullptr;     =     85     if index < guard.subscriber_count {
+                                                                                >     86         // SAFETY: `index` is below `subscriber_count`, which never exc…
+                                                                                      87         // length.
+                                                                                =     88         Some(unsafe { guard.subscribers.get_unchecked(index as usize) })
+                                                                                =     89     } else {
+                                                                                =     90         None
 
   errors   same
   locks    same

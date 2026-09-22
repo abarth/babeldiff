@@ -153,6 +153,9 @@ pub struct Features {
     pub ret: Option<Ret>,
     /// For comment units: normalized words.
     pub comment: Vec<String>,
+    /// For comment units: a Rust safety comment (`// SAFETY: ...` or a
+    /// `# Safety` doc section), which conversions add as a matter of course.
+    pub safety: bool,
 }
 
 /// One aligned step of a function body: a statement, a comment, or the
