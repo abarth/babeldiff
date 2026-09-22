@@ -50,43 +50,53 @@ fn opts(layout: Layout) -> RenderOptions {
     }
 }
 
-fn job_policy_report() -> Report {
-    let text = std::fs::read_to_string(fixture("job_policy/1835293.patch")).unwrap();
+/// A synthetic port with no planted differences, read from a patch.
+fn beacon_report() -> Report {
+    let text = std::fs::read_to_string(fixture("beacon/beacon.patch")).unwrap();
     let files = babeldiff::patch::parse(&text);
     let cs = ChangeSet::from_patch(&files, &mut |_| None);
     babeldiff::run(&cs, &Options::default(), &mut NoFinder)
 }
 
 #[test]
-fn job_policy_golden() {
-    let report = job_policy_report();
+fn beacon_golden() {
+    let report = beacon_report();
     check_golden(
-        &fixture("job_policy/expected.txt"),
+        &fixture("beacon/expected.txt"),
         &render(&report, &opts(Layout::SideBySide)),
     );
 }
 
 #[test]
-fn job_policy_follows_ffi_shims() {
-    let report = job_policy_report();
+fn beacon_follows_ffi_shims_without_false_positives() {
+    let report = beacon_report();
     let pair = report
         .pairs
         .iter()
-        .find(|p| p.cpp.name == "JobPolicy::AddBasicPolicy")
-        .expect("AddBasicPolicy is paired");
-    assert_eq!(pair.rust.name, "JobPolicy::add_basic_policy");
+        .find(|p| p.cpp.name == "BeaconDispatcher::Subscribe")
+        .expect("Subscribe is paired");
+    assert_eq!(pair.rust.name, "BeaconDispatcher::subscribe");
     assert!(
-        matches!(&pair.link, Link::Ffi { shim, .. } if shim == "rust_job_policy_add_basic_policy")
+        matches!(&pair.link, Link::Ffi { shim, .. } if shim == "rust_beacon_dispatcher_subscribe")
     );
-    assert_eq!(pair.summary.cpp_errors, pair.summary.rust_errors);
-    assert_eq!(pair.issues(), 0, "{:#?}", pair.findings);
+    // A faithful port: every function pairs and none has an issue.
+    assert_eq!(report.pairs.len(), 6);
+    for p in &report.pairs {
+        assert_eq!(p.issues(), 0, "{}: {:#?}", p.cpp.name, p.findings);
+        assert_eq!(
+            p.summary.cpp_errors, p.summary.rust_errors,
+            "{}",
+            p.cpp.name
+        );
+    }
+    assert!(report.unmatched_cpp.is_empty());
+    assert!(report.unmatched_rust.is_empty());
     // Shims are reported as shims, not as unpaired Rust.
-    assert!(report.unmatched_rust.iter().all(|f| !f.is_ffi));
     assert!(report
         .shims
         .iter()
-        .any(|s| s.shim.name == "rust_job_policy_query_basic_policy"
-            && s.target.as_deref() == Some("JobPolicy::query_basic_policy")));
+        .any(|s| s.shim.name == "rust_beacon_dispatcher_flash"
+            && s.target.as_deref() == Some("BeaconDispatcher::flash")));
 }
 
 /// Builds a git repository with the fixture's `before` and `after` trees as

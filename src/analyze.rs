@@ -218,7 +218,7 @@ fn score(a: &Function, b: &Function) -> (f64, Vec<Pair>) {
 }
 
 /// The shim's name with the FFI decoration removed:
-/// `rust_job_policy_add_basic_policy` -> `job_policy_add_basic_policy`.
+/// `rust_beacon_dispatcher_flash` -> `beacon_dispatcher_flash`.
 fn undecorated(shim: &str) -> String {
     let n = normalize::ident(shim);
     let n = n.strip_prefix("rust_").unwrap_or(&n);
@@ -387,7 +387,7 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
     }
 
     // A thin Rust method that just calls the method doing the work (say
-    // `MemoryWatchdog::dump` calling `MemoryWatchdogState::dump`) stands in
+    // `Widget::dump` calling `WidgetState::dump`) stands in
     // for the C++ only by name; compare against the method doing the work.
     for (ci, ri, _) in &mut chosen {
         if let Some(rj) = forwardee(&cpp[*ci], &rust_pool[*ri], &rust_pool, &rust_used) {

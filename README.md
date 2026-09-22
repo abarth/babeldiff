@@ -37,12 +37,12 @@ babeldiff git HEAD
 babeldiff git origin/main..my-branch
 
 # A patch file (git format-patch, git show, or git diff output), or stdin.
-babeldiff patch 1835293.patch
+babeldiff patch change.patch
 git show HEAD | babeldiff patch
 
 # With -C, patch mode reads full files from the repository by the blob ids in
 # the patch, and can look up C++ that the change did not touch.
-babeldiff patch -C ~/fuchsia --base origin/main 1835293.patch
+babeldiff patch -C ~/fuchsia --base origin/main change.patch
 
 # Compare every function in a set of files.
 babeldiff files handle_table.cc handle_table.rs
