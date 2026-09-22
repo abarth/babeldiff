@@ -132,8 +132,6 @@ impl FeatureAcc {
                 "try_lock",
                 "acquire",
                 "acquire_irq_save",
-                "read_guard",
-                "write_guard",
             ];
             calls.retain(|c| !LOCK_CALLS.contains(&c.as_str()) && !c.contains("lock"));
             idents.retain(|i| !i.contains("lock"));
@@ -178,7 +176,7 @@ static CPP_LOCK_CALL: LazyLock<Regex> = LazyLock::new(|| {
         .unwrap()
 });
 static RUST_LOCK_CALL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"([A-Za-z_][\w]*(?:\s*(?:\.|::)\s*[A-Za-z_]\w*(?:\(\))?)*)\s*\.\s*(lock|lock_irqsave|lock_irq|try_lock|read_lock|write_lock|lock_read|lock_write|read_guard|write_guard|acquire)\s*\(")
+    Regex::new(r"([A-Za-z_][\w]*(?:\s*(?:\.|::)\s*[A-Za-z_]\w*(?:\(\))?)*)\s*\.\s*(lock|lock_irqsave|lock_irq|try_lock|read_lock|write_lock|lock_read|lock_write|acquire)\s*\(")
         .unwrap()
 });
 static RUST_GUARD_NEW: LazyLock<Regex> = LazyLock::new(|| {
@@ -223,8 +221,8 @@ fn rust_locks(text: &str) -> Vec<String> {
     for c in RUST_LOCK_CALL.captures_iter(text) {
         let method = &c[2];
         let mode = match method {
-            "read_lock" | "lock_read" | "read_guard" => " (read)",
-            "write_lock" | "lock_write" | "write_guard" => " (write)",
+            "read_lock" | "lock_read" => " (read)",
+            "write_lock" | "lock_write" => " (write)",
             _ => "",
         };
         out.push(format!(
