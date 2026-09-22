@@ -156,6 +156,11 @@ pub struct Features {
     /// For comment units: a Rust safety comment (`// SAFETY: ...` or a
     /// `# Safety` doc section), which conversions add as a matter of course.
     pub safety: bool,
+    /// For Rust statements: ksync lock bookkeeping with no C++ counterpart,
+    /// such as taking a lock token from a guard (`let token =
+    /// guard.token();`), asserting a held lock (`LockToken::new()`), or
+    /// binding a guarded field (`let list = self.list.get_mut(token);`).
+    pub lock_plumbing: bool,
 }
 
 /// One aligned step of a function body: a statement, a comment, or the

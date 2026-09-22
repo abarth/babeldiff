@@ -162,6 +162,7 @@ impl FeatureAcc {
             ret: None,
             comment: Vec::new(),
             safety: false,
+            lock_plumbing: false,
         }
     }
 }
@@ -177,7 +178,7 @@ static CPP_LOCK_CALL: LazyLock<Regex> = LazyLock::new(|| {
         .unwrap()
 });
 static RUST_LOCK_CALL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"([A-Za-z_][\w]*(?:\s*(?:\.|::)\s*[A-Za-z_]\w*(?:\(\))?)*)\s*\.\s*(lock|lock_irqsave|lock_irq|try_lock|read_lock|write_lock|lock_read|lock_write|acquire)\s*\(")
+    Regex::new(r"([A-Za-z_][\w]*(?:\s*(?:\.|::)\s*[A-Za-z_]\w*(?:\(\))?)*)\s*\.\s*(lock|lock_irqsave|lock_irq|try_lock|read_lock|write_lock|lock_read|lock_write|acquire|lock_[a-z]\w*)\s*\(")
         .unwrap()
 });
 static RUST_GUARD_NEW: LazyLock<Regex> = LazyLock::new(|| {

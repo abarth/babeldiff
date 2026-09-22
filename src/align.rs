@@ -63,7 +63,10 @@ pub fn similarity(a: &Unit, b: &Unit) -> f64 {
         }
         return 0.2 + 0.8 * jaccard(&fa.calls, &fb.calls);
     }
-    if kind_group(a.kind) != kind_group(b.kind) {
+    if kind_group(a.kind) != kind_group(b.kind)
+        || a.features.lock_plumbing
+        || b.features.lock_plumbing
+    {
         return 0.0;
     }
     let fa = &a.features;

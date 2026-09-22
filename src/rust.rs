@@ -143,6 +143,16 @@ impl<'a> Ctx<'a> {
         if ends_ok_unit {
             fold_status_tail(&mut b.units);
         }
+        for u in &mut b.units {
+            if u.kind == UnitKind::Stmt && u.file.is_none() {
+                let text: String = (u.start_line..=u.end_line)
+                    .filter_map(|l| self.lines.get(l - 1))
+                    .map(|l| l.trim())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                u.features.lock_plumbing = is_lock_plumbing(&text);
+            }
+        }
 
         let end = ts::end_line(n);
         let mut calls: Vec<String> = b
@@ -600,6 +610,26 @@ fn type_name(t: &str) -> String {
     let t = t.trim_start_matches('&').trim_start_matches("mut ").trim();
     let t = t.split('<').next().unwrap_or(t);
     t.rsplit("::").next().unwrap_or(t).trim().to_string()
+}
+
+/// ksync separates holding a lock from using it: a guard hands out a
+/// `LockToken`, and fields marked `#[guarded_by(lock)]` are reached with
+/// `field.get(token)`. C++ has no counterpart for these statements; a
+/// `Guard<>` on the lock is all it needs.
+fn is_lock_plumbing(stmt: &str) -> bool {
+    static TOKEN: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"^let\s+(?:mut\s+)?\w+\s*(?::[^=]*)?=.*(?:\.token(?:_mut)?\(\)|LockToken\s*(?:::\s*<[^>]*>\s*)?::\s*new\s*\(|\.fields(?:_mut)?\(\)|\.guard_(?:read|write)_lock\s*\()",
+        )
+        .unwrap()
+    });
+    static FIELD: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"^let\s+(?:mut\s+)?\w+\s*(?::[^=]*)?=\s*(?:unsafe\s*\{\s*)?[*&]?\s*(?:mut\s+)?self\.\w+\.get(?:_mut)?\(\s*&?\s*(?:mut\s+)?\w*token\s*\)\s*\}?\s*;$",
+        )
+        .unwrap()
+    });
+    TOKEN.is_match(stmt) || FIELD.is_match(stmt)
 }
 
 /// `foo()?; Ok(())` at the end of a function passes on foo's status, which

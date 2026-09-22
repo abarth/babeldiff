@@ -540,9 +540,14 @@ fn render_code(out: &mut String, i: usize, p: &PairReport) {
     let mut run_sev: Option<(Marker, Severity)> = None;
     for (k, row) in p.rows.iter().enumerate() {
         // A safety comment is an expected addition: shown, but not flagged.
-        let expected = row.cpp.is_none()
-            && row.notes.is_empty()
-            && row.rust.is_some_and(|j| p.rust.units[j].features.safety);
+        let expected_title = match row.rust.map(|j| &p.rust.units[j].features) {
+            _ if row.cpp.is_some() || !row.notes.is_empty() => None,
+            Some(f) if f.safety => Some("Safety comment, expected in Rust"),
+            Some(f) if f.lock_plumbing => Some("ksync lock bookkeeping, expected in Rust"),
+            _ => None,
+        };
+        let expected = expected_title.is_some();
+        let expected_title = expected_title.unwrap_or_default();
         let inherited = match (run_sev, row.notes.is_empty()) {
             _ if expected => None,
             (Some((m, sev)), true) if m == row.marker => Some(sev),
@@ -570,6 +575,7 @@ fn render_code(out: &mut String, i: usize, p: &PairReport) {
         if left.is_empty() && right.is_empty() && row.notes.is_empty() {
             continue;
         }
+        let expected_mk = format!("<span class=\"mk\" title=\"{expected_title}\">+</span>");
         let mut html = String::new();
         let _ = write!(
             html,
@@ -585,7 +591,7 @@ fn render_code(out: &mut String, i: usize, p: &PairReport) {
             "<div class=\"cell c{}\">{left}</div>{}<div class=\"cell r{}\">{right}</div>",
             if row.cpp.is_none() { " none" } else { "" },
             if expected {
-                "<span class=\"mk\" title=\"Safety comment, expected in Rust\">+</span>"
+                &expected_mk
             } else {
                 marker_html(row.marker)
             },

@@ -108,7 +108,7 @@ pub fn check(cpp: &Function, rust: &Function, pairs: &[Pair]) -> (Vec<Row>, Vec<
                 let moved =
                     find_moved(u, &cpp.units, &unmatched_c).map(|i| cpp.units[i].start_line);
                 // Safety comments are expected additions, not findings.
-                if !(u.kind == UnitKind::Comment && u.features.safety) {
+                if !(u.kind == UnitKind::Comment && u.features.safety || u.features.lock_plumbing) {
                     notes.push(only_in(u, "Rust", "C++", moved));
                 }
                 Marker::RustOnly
