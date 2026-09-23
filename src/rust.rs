@@ -672,32 +672,26 @@ fn is_pure_or_accessor(v: Node, src: &[u8]) -> bool {
         }
     }
     let mut v = v;
-    loop {
-        match v.kind() {
-            "parenthesized_expression"
-            | "unsafe_block"
-            | "block"
-            | "reference_expression"
-            | "unary_expression" => {
-                let inner: Vec<Node> = ts::named_children(v)
-                    .into_iter()
-                    .filter(|c| !ts::is_comment(*c) && c.kind() != "mutable_specifier")
-                    .collect();
-                match inner.as_slice() {
-                    [one]
-                        if v.kind() != "block"
-                            || one.kind().ends_with("expression")
-                            || one.kind() == "field_expression"
-                            || one.kind() == "identifier" =>
-                    {
-                        v = *one
-                    }
-                    [one] if v.kind() == "block" && one.kind() == "expression_statement" => {
-                        v = *one
-                    }
-                    _ => break,
-                }
+    while let "parenthesized_expression"
+    | "unsafe_block"
+    | "block"
+    | "reference_expression"
+    | "unary_expression" = v.kind()
+    {
+        let inner: Vec<Node> = ts::named_children(v)
+            .into_iter()
+            .filter(|c| !ts::is_comment(*c) && c.kind() != "mutable_specifier")
+            .collect();
+        match inner.as_slice() {
+            [one]
+                if v.kind() != "block"
+                    || one.kind().ends_with("expression")
+                    || one.kind() == "field_expression"
+                    || one.kind() == "identifier" =>
+            {
+                v = *one
             }
+            [one] if v.kind() == "block" && one.kind() == "expression_statement" => v = *one,
             _ => break,
         }
     }
