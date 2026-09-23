@@ -372,12 +372,9 @@ fn render_rows(out: &mut String, p: &PairReport, opts: &RenderOptions) {
                 }
             }
         }
-        for (sev, note) in &row.notes {
-            let tag = match sev {
-                Severity::Issue => "!",
-                Severity::Note => "~",
-            };
-            let _ = writeln!(out, "{:>8}^ {tag} {note}", "");
+        for n in &row.notes {
+            let tag = n.severity.marker();
+            let _ = writeln!(out, "{:>8}^ {tag} {}", "", n.message);
         }
     }
     if skipped {

@@ -161,6 +161,14 @@ pub struct Features {
     /// guard.token();`), asserting a held lock (`LockToken::new()`), or
     /// binding a guarded field (`let list = self.list.get_mut(token);`).
     pub lock_plumbing: bool,
+    /// Bookkeeping that one language needs and the other doesn't, with no
+    /// effect of its own: Rust binding a dispatcher's state struct (`let
+    /// state = self.state();`), or C++ fetching the current process for a
+    /// handle lookup that Rust does in one call.
+    pub plumbing: bool,
+    /// For `if` units: the names each top-level `&&`/`||` operand of the
+    /// condition mentions, so an added or dropped test can be reported.
+    pub conjuncts: Vec<Vec<String>>,
 }
 
 /// One aligned step of a function body: a statement, a comment, or the
