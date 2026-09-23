@@ -146,18 +146,40 @@ pub struct Row {
 
 /// Builds the rows and findings for an aligned pair of functions.
 pub fn check(cpp: &Function, rust: &Function, pairs: &[Pair]) -> (Vec<Row>, Vec<Finding>) {
-    check_with(cpp, rust, pairs, &[])
+    check_with(cpp, rust, pairs, &Context::default())
 }
 
-/// Like [`check`], where the Rust units in `claimed` are accounted for
-/// elsewhere (by a C++ override folded into the same function) and are not
-/// reported as only in Rust.
+/// What else [`check_with`] may consult.
+#[derive(Default)]
+pub struct Context<'a> {
+    /// Rust units accounted for elsewhere (by a C++ override folded into
+    /// the same function), not reported as only in Rust.
+    pub claimed: &'a [usize],
+    /// Functions the Rust calls that code may have moved into: `cpp_*`
+    /// helpers the change added, and other Rust functions. C++ found there
+    /// was moved, not dropped.
+    pub elsewhere: &'a [&'a Function],
+}
+
+/// Like [`check`], with more to go on.
 pub fn check_with(
     cpp: &Function,
     rust: &Function,
     pairs: &[Pair],
-    claimed: &[usize],
+    ctx: &Context,
 ) -> (Vec<Row>, Vec<Finding>) {
+    let claimed = ctx.claimed;
+    // Control flow of a kind that both sides have as much of was most
+    // likely rewritten (a `switch` as `matches!`, a clamp as `min`), not
+    // dropped or added.
+    let flow_balanced = |k: UnitKind| {
+        let g = |u: &Unit| flow_group(u.kind);
+        let (a, b) = (
+            cpp.units.iter().filter(|u| g(u) == flow_group(k)).count(),
+            rust.units.iter().filter(|u| g(u) == flow_group(k)).count(),
+        );
+        a == b
+    };
     let mut rows = Vec::new();
     let unmatched_c: Vec<usize> = pairs
         .iter()
@@ -213,7 +235,9 @@ pub fn check_with(
                         "comment only in C++, but the Rust comments carry its words (merged or reworded)",
                     ));
                 } else if !u.features.plumbing && u.kind != UnitKind::Signature {
-                    notes.push(soften_if_called(only_in(u, "C++", "Rust", moved), u, rust));
+                    let n = soften_if_called(only_in(u, "C++", "Rust", moved), u, rust);
+                    let n = soften_balanced(n, u, flow_balanced(u.kind));
+                    notes.push(soften_moved(n, u, ctx.elsewhere));
                 }
                 Marker::CppOnly
             }
@@ -228,8 +252,16 @@ pub fn check_with(
                     || u.features.lock_plumbing
                     || u.features.plumbing
                     || (new_doc(rust, j) && !has_doc(cpp));
-                if !expected {
-                    notes.push(soften_if_called(only_in(u, "Rust", "C++", moved), u, cpp));
+                // `return Foo();` in C++ is `foo()?; Ok(())` in Rust.
+                let ok_after_status = u.kind == UnitKind::Return
+                    && u.features.ret == Some(Ret::Ok)
+                    && rows.last().is_some_and(|r: &Row| {
+                        r.cpp
+                            .is_some_and(|i| cpp.units[i].features.ret == Some(Ret::Status))
+                    });
+                if !expected && !ok_after_status {
+                    let n = soften_if_called(only_in(u, "Rust", "C++", moved), u, cpp);
+                    notes.push(soften_balanced(n, u, flow_balanced(u.kind)));
                 }
                 Marker::RustOnly
             }
@@ -437,13 +469,67 @@ fn restates_signature(u: &Unit, f: &Function) -> bool {
     }
     let mut named = false;
     for w in words {
-        if strip(w) == name {
+        // `// zx_status_t zx_thread_start` also heads `sys_thread_start_regs`.
+        if strip(w) == name
+            || (w.starts_with("zx") && w.len() > 4 && !TYPE_WORDS.contains(&w.as_str()))
+        {
             named = true;
         } else if !TYPE_WORDS.contains(&w.as_str()) {
             return false;
         }
     }
     named
+}
+
+/// Kinds of control flow counted together when judging balance.
+fn flow_group(k: UnitKind) -> u8 {
+    match k {
+        UnitKind::If | UnitKind::ElseIf => 1,
+        UnitKind::Loop => 2,
+        UnitKind::Switch => 3,
+        UnitKind::Case => 4,
+        _ => 0,
+    }
+}
+
+/// A one-sided `if`, loop, `switch` or `case` when both functions have as
+/// many of them: a rewrite, so a note.
+fn soften_balanced(n: Note, u: &Unit, balanced: bool) -> Note {
+    if n.severity != Severity::Issue || flow_group(u.kind) == 0 || !balanced {
+        return n;
+    }
+    Note::new(
+        Severity::Note,
+        n.category,
+        format!(
+            "{}; both sides have as many, so it was probably rewritten",
+            n.message
+        ),
+    )
+}
+
+/// A C++ step that now lives in a function the Rust calls (a `cpp_*`
+/// helper, or another Rust function) was moved, not dropped.
+fn soften_moved(n: Note, u: &Unit, elsewhere: &[&Function]) -> Note {
+    if n.severity != Severity::Issue || u.kind == UnitKind::Comment {
+        return n;
+    }
+    let found = elsewhere.iter().find(|f| {
+        f.units
+            .iter()
+            .any(|v| v.kind != UnitKind::Signature && similarity(u, v) >= 0.6)
+    });
+    match found {
+        Some(f) => Note::new(
+            Severity::Note,
+            n.category,
+            format!(
+                "{}; it appears in {}, which the Rust calls",
+                n.message, f.name
+            ),
+        ),
+        None => n,
+    }
 }
 
 /// A statement that only makes calls the other function also makes
@@ -613,13 +699,42 @@ fn compare(a: &Unit, b: &Unit, notes: &mut Vec<Note>) {
     }
     if a.kind == UnitKind::Comment {
         if fa.comment != fb.comment {
-            notes.push(Note::new(
-                Severity::Note,
-                Category::Comment,
-                comment_diff(&fa.comment, &fb.comment),
-            ));
+            // Rewording is fine; losing a TODO or a negation is not.
+            const WEIGHTY: &[&str] = &[
+                "todo", "not", "never", "no", "must", "cannot", "can't", "don't", "doesn't",
+                "only", "always",
+            ];
+            let lost: Vec<&str> = WEIGHTY
+                .iter()
+                .copied()
+                .filter(|w| fa.comment.iter().any(|x| x == w) != fb.comment.iter().any(|x| x == w))
+                .collect();
+            let (sev, msg) = if lost.is_empty() {
+                (Severity::Note, comment_diff(&fa.comment, &fb.comment))
+            } else {
+                (
+                    Severity::Issue,
+                    format!(
+                        "{}; only one side says {}",
+                        comment_diff(&fa.comment, &fb.comment),
+                        lost.iter()
+                            .map(|w| format!("\"{w}\""))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                )
+            };
+            notes.push(Note::new(sev, Category::Comment, msg));
         }
         return;
+    }
+    // A trace aligned with a statement that doesn't trace was dropped.
+    if trace_only(fa) && !trace_only(fb) && !fb.calls.iter().any(|c| c == "trace" || c == "print") {
+        notes.push(Note::new(
+            Severity::Issue,
+            Category::Trace,
+            "trace/print statement only in C++",
+        ));
     }
     match (&fa.ret, &fb.ret) {
         (Some(Ret::Error(x)), Some(Ret::Error(y))) if x != y => {
@@ -667,8 +782,15 @@ fn compare(a: &Unit, b: &Unit, notes: &mut Vec<Note>) {
         }
     }
     if fa.locks != fb.locks {
+        // One lock on each side under different names is usually the same
+        // lock spelled two ways; a lock taken on one side only is not.
+        let renamed = fa.locks.len() == fb.locks.len();
         notes.push(Note::new(
-            Severity::Issue,
+            if renamed {
+                Severity::Note
+            } else {
+                Severity::Issue
+            },
             Category::Lock,
             format!(
                 "locks differ: C++ acquires [{}], Rust acquires [{}]",
@@ -717,6 +839,17 @@ fn compare(a: &Unit, b: &Unit, notes: &mut Vec<Note>) {
         .into_iter()
         .filter(|c| !fa.calls.contains(c) && !name_matches(c, fa))
         .collect();
+    // Rust calling back into C++ through `cpp_<class>_<method>` makes the
+    // call C++ made directly.
+    let via_ffi = |x: &str, y: &str| y.starts_with("cpp_") && y.ends_with(&format!("_{x}"));
+    while let Some((i, j)) = only_a
+        .iter()
+        .enumerate()
+        .find_map(|(i, x)| only_b.iter().position(|y| via_ffi(x, y)).map(|j| (i, j)))
+    {
+        only_a.remove(i);
+        only_b.remove(j);
+    }
     for (x, y) in crate::normalize::EQUIVALENT_CALLS {
         let (i, j) = (
             only_a.iter().position(|c| c.as_str() == *x),

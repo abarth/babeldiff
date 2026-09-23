@@ -170,6 +170,9 @@ pub struct Inputs {
     pub cpp_bases: crate::cpp::ClassBases,
     /// Changed C++ that stays C++.
     pub cpp_changes: Vec<crate::input::CppChange>,
+    /// `cpp_*` helpers in the C++ after the change, which Rust calls back
+    /// into.
+    pub cpp_helpers: Vec<Function>,
 }
 
 #[derive(Clone, Debug)]
@@ -458,6 +461,7 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
         forced,
         cpp_bases,
         cpp_changes,
+        cpp_helpers,
     } = inputs;
     let mut report = Report {
         cpp_changes,
@@ -481,6 +485,21 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
         .map(|s| (s.clone(), shim_target(s, &universe)))
         .collect();
 
+    // Functions a Rust function calls, where C++ it doesn't carry itself
+    // may have gone: `cpp_*` helpers the change added, and other Rust.
+    let universe_ref = &universe;
+    let helpers_ref = &cpp_helpers;
+    let elsewhere = |r: &Function| -> Vec<&Function> {
+        helpers_ref
+            .iter()
+            .filter(|h| r.calls.contains(&normalize::ident(&h.base)))
+            .chain(
+                universe_ref
+                    .iter()
+                    .filter(|u| !u.is_ffi && u.name != r.name && calls_function(r, u)),
+            )
+            .collect()
+    };
     let mut cpp_used = vec![false; cpp.len()];
     let mut rust_pool: Vec<Function> = rust;
     for (s, _) in &shims {
@@ -762,6 +781,7 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
             link,
             CppOrigin::Changed,
             ovs,
+            &elsewhere(&rust_pool[ri]),
         );
         pair.rationale = why;
         pair.forwarder = forwarders
@@ -776,6 +796,11 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
     let mut found_used: Vec<(String, usize)> = Vec::new();
     for (ri, r) in rust_pool.iter().enumerate() {
         if rust_used[ri] || r.is_ffi {
+            continue;
+        }
+        // A thin Rust wrapper that calls back into C++ wraps that C++; it
+        // doesn't port it.
+        if body_len(r) <= 3 && r.calls.iter().any(|c| c.starts_with("cpp_")) {
             continue;
         }
         let mut ranked: Vec<(bool, f64, Function)> = finder
@@ -816,6 +841,7 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
             Link::Similarity,
             CppOrigin::Unchanged,
             Vec::new(),
+            &elsewhere(r),
         );
         pair.rationale = format!(
             "found in the repository, not in the change (score {:.2})",
@@ -850,12 +876,14 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
             }
         }
         cpp_used[ci] = true;
+        let ew = elsewhere(&r);
         let mut pair = build_pair(
             c.clone(),
             r,
             Link::Similarity,
             CppOrigin::Changed,
             Vec::new(),
+            &ew,
         );
         pair.rationale = format!(
             "same name; the change left this Rust function alone (score {:.2})",
@@ -1085,6 +1113,7 @@ fn build_pair(
     link: Link,
     origin: CppOrigin,
     overrides: Vec<Function>,
+    elsewhere: &[&Function],
 ) -> PairReport {
     let (s, pairs) = score(&cpp, &rust);
     let ov_refs: Vec<&Function> = overrides.iter().collect();
@@ -1109,13 +1138,21 @@ fn build_pair(
                 .filter(|&j| matches!(rust.units[j].kind, UnitKind::Switch | UnitKind::Case)),
         );
     }
-    let (rows, findings) = check::check_with(&cpp, &rust, &pairs, &claimed);
+    let ctx = check::Context {
+        claimed: &claimed,
+        elsewhere,
+    };
+    let (rows, findings) = check::check_with(&cpp, &rust, &pairs, &ctx);
     let mut summary = check::summarize(&cpp, &rust, &rows);
     let overrides: Vec<OverrideReport> = overrides
         .into_iter()
         .zip(ov_rows)
         .map(|(o, pairs)| {
-            let (rows, mut ov_findings) = check::check_with(&o, &rust, &pairs, &[]);
+            let ctx = check::Context {
+                claimed: &[],
+                elsewhere,
+            };
+            let (rows, mut ov_findings) = check::check_with(&o, &rust, &pairs, &ctx);
             // Code the override shares with the primary has been reported
             // once already.
             ov_findings.retain(|f| {
