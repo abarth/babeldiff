@@ -18,7 +18,13 @@ where the Rust does not do the same thing:
 - **steps** (calls) that only one side performs
 
 The output is plain text in the style of `diff -y`, meant to be read by people
-and by agents.
+and by agents, a self-contained HTML page, or JSON.
+
+Its job is to help reviewers find real mistakes in a conversion, so it errs
+toward precision: differences that are usually just translation (a renamed
+operand, a reworded comment, a helper call spelled differently, a comment that
+stays in the C++) are notes, and only differences a reviewer must check are
+issues.
 
 ## Install
 
@@ -54,6 +60,8 @@ Useful options:
 | --- | --- |
 | `--format html -o report.html` | Write a self-contained HTML page for reviewing in a browser (see below). |
 | `--layout stacked` | Print each C++ unit above the Rust it aligns with, untruncated. Better for agents and narrow terminals. |
+| `--format json` | Machine-readable findings for agents (see below). |
+| `--issues-only` | Leave out notes, and pairs with no issues. |
 | `--summary` | Only the per-function summaries and findings. |
 | `-U N`, `--context N` | Only rows within N rows of a difference. |
 | `--width N` | Width of the side-by-side view (default `$COLUMNS` or 160). |
@@ -126,12 +134,47 @@ Clang thread-safety annotations (`TA_REQ`, `TA_GUARDED`) are ignored on the
 C++ side, since in Rust they become token parameters.
 
 Findings start with `!` (issue) or `~` (note), so `grep '^    !'` lists the
-issues. At the end the report lists functions it could not pair and the FFI
-shims it recognized.
+issues. The first lines of the report count issues by kind. At the end the
+report lists functions it could not pair and the FFI shims it recognized,
+including shims it could not resolve (`-> ambiguous: A or B`), which
+`--pair` settles.
+
+Each finding has a kind, which maps to the part of the porting rubric it
+checks:
+
+| Kind | What it covers |
+| --- | --- |
+| `comment` | A comment lost, added or reworded. Each lost comment is its own finding. |
+| `error-path` | Error codes, propagation, and success versus failure. |
+| `lock` | Locks taken or released. |
+| `control-flow` | Branches, loops, returns, and tests added to or dropped from a condition. |
+| `call` | Calls one side makes and the other doesn't. |
+| `assert` | Assertions. A dropped assert is an issue. |
+| `trace` | Trace and debug printing. A dropped trace is an issue. |
+| `order` | The same step at a different position. |
 
 `tests/fixtures/fifo/expected.txt` is a complete example; its Rust contains
 four planted mistakes (a different error code, a rollback replaced by `?`, a
 lock moved ahead of the argument checks, and a dropped comment).
+`tests/fixtures/doorbell` is a class hierarchy folded into one Rust type with
+an enum, with four more (a test added to a condition, a dropped trace, a
+dropped comment in one override, and a different error code); babeldiff
+reports exactly those four as issues.
+
+## JSON output
+
+`--format json` prints one object for agents and scripts. Each finding has a
+stable id (`<C++ function>#<n>`), its severity, kind and rubric reference, the
+message, and `path`, `line` and source `text` on each side. Each pair says how
+it was found (`link`: `ffi`, `ffi-name`, `similarity` or `forced`), why
+(`rationale`), and which C++ overrides it folds in. Unpaired functions, FFI
+shims (with `ambiguous` candidates when babeldiff could not choose) and C++
+helpers called from Rust are listed at the end. `version` is bumped only when
+a field changes meaning.
+
+```sh
+babeldiff git HEAD --format json --issues-only > findings.json
+```
 
 ## HTML report
 
@@ -181,21 +224,42 @@ on narrow screens, and prints cleanly.
    (`Guard<Mutex> guard{&lock_}` = `self.lock.lock()` = `ksync::lock!(...)`),
    whether it propagates an error, and comment words.
    Common idioms are normalized so they line up:
-   `if (status != ZX_OK) return status;` reads as `?`,
+   `if (status != ZX_OK) return status;` reads as `?`, and so do a status
+   chained through `if (status == ZX_OK) status = B();` to a final
+   `return status;` and a status set in each branch and checked once;
+   `if (!ac.check()) return ZX_ERR_NO_MEMORY;` after an allocation reads as
+   `try_new(..).ok_or(NO_MEMORY)?`;
    `return c ? A : B;` as `if c { A } else { B }`,
    `*out = x; return ZX_OK;` as `Ok(x)`, and `case A: case B:` as `A | B =>`.
+   Declarations with no initializer, pure bindings such as
+   `let state = self.state();`, out-parameter writes and thread-safety
+   assertions are bookkeeping, not steps.
 3. **Pairing.** C++ functions are paired with Rust functions by, in order:
    explicit `--pair`s; the FFI shim pattern (the new C++ body calls
    `rust_<class>_<method>`, whose `#[no_mangle]` definition forwards to the
-   Rust method, or the shim's name spells the C++ function's); then a score
-   combining name similarity and body similarity, where comments count
-   double. Rust functions still unpaired are looked up in the repository
-   (files named like the Rust file, then `git grep` for the CamelCase and
-   snake_case names), so Rust that ports C++ the change did not delete is
-   still compared. Doc comments on C++ declarations in headers are attached
-   to the definitions, since that is where Rust doc comments come from.
+   Rust method, or the shim's name spells the C++ function's); the same
+   class and method name; then a score combining name similarity and body
+   similarity, where comments count double. When a shim calls several
+   same-named methods (`A::create` and `B::create`), the type path decides,
+   and if nothing does the shim is reported as ambiguous rather than
+   guessed. A `#[no_mangle]` function that does the work itself is the port,
+   and a C++ one-line trampoline hands the shim to the C++ it calls.
+   C++ overrides of a method in related classes (found from the class
+   hierarchy) are folded into the one Rust function that replaced virtual
+   dispatch with an enum and a `match`, and each override is aligned against
+   the arm that carries it. Rust functions still unpaired are looked up in
+   the repository (files named like the Rust file, then `git grep` for the
+   CamelCase and snake_case names), so Rust that ports C++ the change did not
+   delete is still compared, and C++ still unpaired is matched with an
+   untouched Rust function of the same name. Doc comments on C++
+   declarations in headers are attached to the definitions, since that is
+   where Rust doc comments come from; a comment that is still in the C++
+   after the change is not reported as lost.
 4. **Alignment.** Units are aligned with an order-preserving weighted LCS over
-   unit similarity. Aligned units are compared feature by feature; unaligned
+   unit similarity. Units left between two aligned rows are then lined up by
+   position when each side has as many of a kind, so a renamed condition or
+   a `case` turned `match` arm is one changed step. Aligned units are
+   compared feature by feature, and `if` conditions test by test; unaligned
    ones are reported, and a unit that resembles one on the other side at a
    different position is reported as possibly reordered.
 
@@ -226,8 +290,10 @@ integration; implement `analyze::CppFinder` to look up C++ some other way.
   paired with its best match only; the rest shows as unpaired.
 - Macros are compared by name and the calls inside their arguments, not
   expanded.
-- Similarity thresholds are tuned on a handful of Zircon changes; use
+- Similarity thresholds are tuned on about 55 Zircon conversion changes; use
   `--pair` when the matcher gets a pairing wrong.
+- It compares functions. C++ that stays C++ but changes, FFI declarations,
+  and class and field comments are not checked.
 
 ## Development
 
