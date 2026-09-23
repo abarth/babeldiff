@@ -2,7 +2,7 @@
 //! different from the C++.
 
 use crate::align::{similarity, Pair};
-use crate::model::{Function, Ret, Unit, UnitKind};
+use crate::model::{Function, Lang, Ret, Unit, UnitKind};
 use crate::normalize::lcs_len;
 
 /// How much a finding matters.
@@ -74,6 +74,8 @@ pub enum Category {
     Order,
     /// How the two sides were paired.
     Pairing,
+    /// Memory ordering of atomic operations.
+    Atomic,
 }
 
 impl Category {
@@ -89,6 +91,7 @@ impl Category {
             Category::Trace => "trace",
             Category::Order => "order",
             Category::Pairing => "pairing",
+            Category::Atomic => "atomic",
         }
     }
 
@@ -102,6 +105,7 @@ impl Category {
             Category::Assert => "assertions (pitfall 23)",
             Category::Trace => "trace parity (rubric 3.9, pitfall 16)",
             Category::Pairing => "pairing",
+            Category::Atomic => "atomics and memory ordering",
         }
     }
 }
@@ -198,6 +202,12 @@ pub fn check_with(
             (Some(i), Some(j)) => {
                 compare(&cpp.units[i], &rust.units[j], &mut notes);
                 condition_diff(i, j, cpp, rust, &mut notes);
+                ordering_diff(
+                    &unit_text(cpp, &cpp.units[i]),
+                    &unit_text(rust, &rust.units[j]),
+                    cpp.units[i].features.asserts,
+                    &mut notes,
+                );
                 if notes.iter().any(|n| n.severity == Severity::Issue) {
                     Marker::Issue
                 } else if notes.is_empty() {
@@ -514,10 +524,26 @@ fn soften_moved(n: Note, u: &Unit, elsewhere: &[&Function]) -> Note {
     if n.severity != Severity::Issue || u.kind == UnitKind::Comment {
         return n;
     }
+    // A bare `else` or a generic status check matches too much to prove
+    // anything moved; a test must name something specific.
+    const GENERIC: &[&str] = &["status", "result", "ok", "err", "res", "rc"];
+    let specific: Vec<&String> = u
+        .features
+        .names
+        .iter()
+        .filter(|n| !GENERIC.contains(&n.as_str()))
+        .collect();
+    let test = matches!(u.kind, UnitKind::If | UnitKind::ElseIf | UnitKind::Else);
+    if test && specific.is_empty() {
+        return n;
+    }
     let found = elsewhere.iter().find(|f| {
-        f.units
-            .iter()
-            .any(|v| v.kind != UnitKind::Signature && similarity(u, v) >= 0.6)
+        f.units.iter().any(|v| {
+            v.kind != UnitKind::Signature
+                && similarity(u, v) >= 0.6
+                && (!test || specific.iter().all(|s| v.features.names.contains(s)))
+                && sorted(&u.features.errors) == sorted(&v.features.errors)
+        })
     });
     match found {
         Some(f) => Note::new(
@@ -709,7 +735,8 @@ fn compare(a: &Unit, b: &Unit, notes: &mut Vec<Note>) {
                 .copied()
                 .filter(|w| fa.comment.iter().any(|x| x == w) != fb.comment.iter().any(|x| x == w))
                 .collect();
-            let (sev, msg) = if lost.is_empty() {
+            // A comment still in the C++ is not lost, however Rust words it.
+            let (sev, msg) = if lost.is_empty() || fa.still_in_cpp {
                 (Severity::Note, comment_diff(&fa.comment, &fb.comment))
             } else {
                 (
@@ -754,7 +781,10 @@ fn compare(a: &Unit, b: &Unit, notes: &mut Vec<Note>) {
             // just the two languages' ways of saying the same thing.
             let error = |r: &Ret| matches!(r, Ret::Error(_));
             let success = |r: &Ret| matches!(r, Ret::Ok | Ret::Value);
-            let sev = if (error(ra) && success(rb)) || (success(ra) && error(rb)) {
+            // C++ mapping a failure to a specific code where Rust passes
+            // the callee's status on changes what the caller sees.
+            let remapped = error(ra) && *rb == Ret::Status;
+            let sev = if (error(ra) && success(rb)) || (success(ra) && error(rb)) || remapped {
                 Severity::Issue
             } else {
                 Severity::Note
@@ -1165,4 +1195,127 @@ pub fn summarize(cpp: &Function, rust: &Function, rows: &[Row]) -> Summary {
         }
     }
     s
+}
+
+/// The source text of a unit.
+fn unit_text(f: &Function, u: &Unit) -> String {
+    if u.file.is_some() {
+        return u.ext_lines.join("\n");
+    }
+    (u.start_line..=u.end_line)
+        .map(|l| f.line(l))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Rank of a memory ordering, weakest first. Acquire and release are
+/// ranked together: each is weaker than acq_rel, neither than the other.
+fn ordering_rank(o: &str) -> u8 {
+    match o.to_ascii_lowercase().as_str() {
+        "relaxed" => 0,
+        "consume" | "acquire" | "release" => 1,
+        "acq_rel" | "acqrel" => 2,
+        _ => 3,
+    }
+}
+
+/// The memory orderings of the atomic operations in C++ or Rust source. A
+/// C++ operation with no explicit order is sequentially consistent.
+fn orderings(text: &str, lang: Lang) -> Vec<String> {
+    static CPP_OP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?:\.|->)(?:load|store|exchange|fetch_\w+|compare_exchange_\w+)\s*\(")
+            .unwrap()
+    });
+    static CPP_ORDER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"memory_order(?:_|::)(relaxed|consume|acquire|release|acq_rel|seq_cst)")
+            .unwrap()
+    });
+    static RUST_ORDER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\bOrdering::(Relaxed|Acquire|Release|AcqRel|SeqCst)\b").unwrap()
+    });
+    let re = match lang {
+        Lang::Rust => &RUST_ORDER,
+        Lang::Cpp => &CPP_ORDER,
+    };
+    let mut out: Vec<String> = re
+        .captures_iter(text)
+        .map(|c| c[1].to_ascii_lowercase())
+        .collect();
+    if lang == Lang::Cpp && out.is_empty() && CPP_OP.is_match(text) {
+        out.push("seq_cst".to_string());
+    }
+    out
+}
+
+/// Rust atomics with a different memory ordering from the C++ they replace:
+/// an issue when weaker, a note when stronger.
+/// An assertion's ordering barely matters, so there it is only a note.
+fn ordering_diff(cpp: &str, rust: &str, asserts: bool, notes: &mut Vec<Note>) {
+    let (a, b) = (orderings(cpp, Lang::Cpp), orderings(rust, Lang::Rust));
+    if a.is_empty() || b.is_empty() {
+        return;
+    }
+    let weakest = |v: &[String]| v.iter().map(|o| ordering_rank(o)).min().unwrap_or(3);
+    let show = |v: &[String]| {
+        let mut v = v.to_vec();
+        v.dedup();
+        v.join(", ")
+    };
+    let (ra, rb) = (weakest(&a), weakest(&b));
+    let (severity, word) = match rb.cmp(&ra) {
+        std::cmp::Ordering::Less if !asserts => (Severity::Issue, "weaker"),
+        std::cmp::Ordering::Less => (Severity::Note, "weaker"),
+        std::cmp::Ordering::Greater => (Severity::Note, "stronger"),
+        std::cmp::Ordering::Equal => return,
+    };
+    notes.push(Note::new(
+        severity,
+        Category::Atomic,
+        format!(
+            "Rust uses a {word} memory ordering ({}) than C++ ({})",
+            show(&b),
+            show(&a)
+        ),
+    ));
+}
+
+#[cfg(test)]
+mod ordering_tests {
+    use super::*;
+
+    fn diff(cpp: &str, rust: &str) -> Vec<Note> {
+        let mut notes = Vec::new();
+        ordering_diff(cpp, rust, false, &mut notes);
+        notes
+    }
+
+    #[test]
+    fn default_cpp_ordering_is_seq_cst() {
+        let n = diff(
+            "state_.exchange(0);",
+            "self.state.swap(0, Ordering::Relaxed);",
+        );
+        assert_eq!(n.len(), 1);
+        assert_eq!(n[0].severity, Severity::Issue);
+        assert!(n[0].message.contains("weaker"), "{}", n[0].message);
+    }
+
+    #[test]
+    fn same_or_stronger_ordering() {
+        assert!(diff(
+            "x.load(ktl::memory_order_acquire);",
+            "x.load(Ordering::Acquire)"
+        )
+        .is_empty());
+        let n = diff(
+            "x.store(1, std::memory_order_relaxed);",
+            "x.store(1, Ordering::SeqCst)",
+        );
+        assert_eq!(n[0].severity, Severity::Note);
+    }
+
+    #[test]
+    fn no_atomics_no_finding() {
+        assert!(diff("count_ = 0;", "self.count = 0;").is_empty());
+    }
 }

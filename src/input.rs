@@ -284,6 +284,12 @@ pub fn build_inputs(cs: &ChangeSet, min_changed: f64) -> Inputs {
         }
     }
     inputs.cpp = cpp;
+    inputs.cpp_changed_paths = cs
+        .cpp_old
+        .iter()
+        .chain(&cs.cpp_new)
+        .map(|v| v.path.clone())
+        .collect();
 
     for (v, e) in cs.cpp_new.iter().zip(&cpp_new) {
         inputs.cpp_changes.extend(stays_cpp(v, &e.functions));
