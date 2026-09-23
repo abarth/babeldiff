@@ -297,9 +297,10 @@ fn render_pair(out: &mut String, p: &PairReport, opts: &RenderOptions) {
     if !findings.is_empty() {
         let _ = writeln!(out, "  findings");
         for (cf, f) in findings {
-            let c = f
-                .cpp_line
-                .map_or("-".to_string(), |l| format!("{}:{}", short(&cf.path), l));
+            let c = f.cpp_line.map_or("-".to_string(), |l| {
+                let path = f.cpp_file.as_deref().unwrap_or(&cf.path);
+                format!("{}:{}", short(path), l)
+            });
             let r = f.rust_line.map_or("-".to_string(), |l| {
                 format!("{}:{}", short(&p.rust.path), l)
             });

@@ -52,29 +52,51 @@ pub fn extract(lang: Lang, path: &str, src: &str) -> Extracted {
 
 /// Gives C++ functions that have no comment of their own the comment on
 /// their declaration (usually in the class body in a header), since that is
-/// where the Rust doc comment came from.
-pub fn attach_decl_comments(functions: &mut [Function], decls: &DeclComments) {
+/// where the Rust doc comment came from. An override with no declaration
+/// comment takes the one on the nearest base class's declaration.
+pub fn attach_decl_comments(
+    functions: &mut [Function],
+    decls: &DeclComments,
+    bases: &cpp::ClassBases,
+) {
+    let inner = |c: &str| c.rsplit("::").next().unwrap_or(c).to_string();
+    let lookup = |class: &str, base: &str| {
+        decls
+            .get(&(class.to_string(), base.to_string()))
+            .or_else(|| decls.get(&(inner(class), base.to_string())))
+    };
     for f in functions.iter_mut().filter(|f| f.lang == Lang::Cpp) {
         let has_leading = f.units.first().is_some_and(|u| u.kind == UnitKind::Comment);
         if has_leading {
             continue;
         }
-        let key = (f.class.clone().unwrap_or_default(), f.base.clone());
-        let found = decls.get(&key).or_else(|| {
-            // Fall back to the innermost class name for nested classes.
-            let inner = f
-                .class
-                .as_deref()
-                .and_then(|c| c.rsplit("::").next())
-                .unwrap_or("");
-            decls.get(&(inner.to_string(), f.base.clone()))
-        });
-        if let Some(units) = found {
-            let mut units = units.clone();
-            for u in &mut units {
-                u.depth = 0;
+        let Some(class) = f.class.clone() else {
+            if let Some(units) = lookup("", &f.base) {
+                prepend(f, units);
             }
-            f.units.splice(0..0, units);
+            continue;
+        };
+        // Breadth-first up the class hierarchy.
+        let mut queue = std::collections::VecDeque::from([class]);
+        let mut seen = std::collections::HashSet::new();
+        while let Some(c) = queue.pop_front() {
+            if !seen.insert(c.clone()) || seen.len() > 32 {
+                continue;
+            }
+            if let Some(units) = lookup(&c, &f.base) {
+                prepend(f, units);
+                break;
+            }
+            let parents = bases.get(&c).or_else(|| bases.get(&inner(&c)));
+            queue.extend(parents.into_iter().flatten().cloned());
         }
     }
+}
+
+fn prepend(f: &mut Function, units: &[crate::model::Unit]) {
+    let mut units = units.to_vec();
+    for u in &mut units {
+        u.depth = 0;
+    }
+    f.units.splice(0..0, units);
 }

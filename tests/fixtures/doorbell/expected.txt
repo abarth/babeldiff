@@ -166,10 +166,13 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
   Rust  zircon/kernel/object/doorbell_dispatcher.rs:24-45
   via   C++ now calls FFI shim rust_doorbell_dispatcher_ring  zircon/kernel/object/doorbell_dispatcher_ffi.rs:14-17
   also  C++ BuzzerDoorbellDispatcher::Ring  zircon/kernel/object/doorbell_dispatcher.cc:84-92  (override in a related class, folded into this Rust function)
-  similarity 0.72, 3 issues, 0 notes
+  note  C++ lines marked * are the declaration's comment in zircon/kernel/object/include/object/doorbell_dispatcher.h
+  similarity 0.84, 3 issues, 0 notes
 
-> R     24  /// Rings the doorbell with `tone`.
-> R     26  /// Returns ZX_ERR_OUT_OF_RANGE if `tone` is above MAX_TONE.
+= C    19*  // Rings the doorbell with |tone|.
+  R     24  /// Rings the doorbell with `tone`.
+= C    21*  // Returns ZX_ERR_OUT_OF_RANGE if |tone| is above kMaxTone.
+  R     26  /// Returns ZX_ERR_OUT_OF_RANGE if `tone` is above MAX_TONE.
 = C     52  zx_status_t ChimeDoorbellDispatcher::Ring(uint32_t tone) {
   R     27  pub fn ring(&self, tone: u32) -> Result<(), Status> {
 ! C     53    if (tone > kMaxTone) {
@@ -196,11 +199,14 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
   R     44      Ok(())
 
   ---- override BuzzerDoorbellDispatcher::Ring  <->  DoorbellDispatcher::ring
+= C    19*  // Rings the doorbell with |tone|.
+  R     24  /// Rings the doorbell with `tone`.
+= C    21*  // Returns ZX_ERR_OUT_OF_RANGE if |tone| is above kMaxTone.
+  R     26  /// Returns ZX_ERR_OUT_OF_RANGE if `tone` is above MAX_TONE.
 = C     84  zx_status_t BuzzerDoorbellDispatcher::Ring(uint32_t tone) {
   R     27  pub fn ring(&self, tone: u32) -> Result<(), Status> {
-! C     85    if (tone > kMaxTone) {
+= C     85    if (tone > kMaxTone) {
   R     28      if tone == 0 || tone > MAX_TONE {
-        ^ ! Rust's condition adds a test that C++ doesn't make: tone == 0
 = C     86      return ZX_ERR_OUT_OF_RANGE;
   R     29          return Err(Status::OUT_OF_RANGE);
 = C     88    Guard<CriticalMutex> guard{get_lock()};
@@ -219,7 +225,7 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
            C++:  lock
            Rust: lock
   flow     if 1, loop 1, return 2
-  comments 2 C++ comments: 1 identical, 0 reworded, 1 missing in Rust
+  comments 6 C++ comments: 5 identical, 0 reworded, 1 missing in Rust
   findings
     ! doorbell_dispatcher.cc:53 | doorbell_dispatcher.rs:28  Rust's condition adds a test that C++ doesn't make: tone == 0
     ! doorbell_dispatcher.cc:56 | -  trace/print statement only in C++

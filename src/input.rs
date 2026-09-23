@@ -260,7 +260,7 @@ pub fn build_inputs(cs: &ChangeSet, min_changed: f64) -> Inputs {
         .filter(|(f, ch)| ch.is_none_or(|c| changed_fraction(f, c) >= min_changed))
         .map(|(f, _)| f)
         .collect();
-    attach_decl_comments(&mut cpp, &decls);
+    attach_decl_comments(&mut cpp, &decls, &inputs.cpp_bases);
 
     // Doc comments that are still in the C++ after the change.
     let mut kept: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();

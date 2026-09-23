@@ -524,6 +524,11 @@ pub fn comment_words(text: &str) -> Vec<String> {
                 || w.chars().skip(1).any(|c| c.is_ascii_uppercase())
                 || raw.contains("()");
             if looks_like_ident {
+                // C++ constants are `kMaxTone`; Rust's are `MAX_TONE`.
+                let w = match w.strip_prefix('k') {
+                    Some(r) if r.starts_with(|c: char| c.is_ascii_uppercase()) => r,
+                    _ => w,
+                };
                 out.push(ident(w).replace('_', ""));
             } else {
                 out.push(w.to_lowercase());
