@@ -135,7 +135,7 @@ fn beacon_follows_ffi_shims_without_false_positives() {
 
 /// Builds a git repository with the fixture's `before` and `after` trees as
 /// two commits.
-fn fifo_repo(name: &str) -> PathBuf {
+fn two_commit_repo(fixture_name: &str, name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -162,11 +162,11 @@ fn fifo_repo(name: &str) -> PathBuf {
         }
     };
     git(&["init", "-q"]);
-    copy(&fixture("fifo/before"));
+    copy(&fixture(&format!("{fixture_name}/before")));
     git(&["add", "-A"]);
     git(&["commit", "-qm", "before"]);
     std::fs::remove_dir_all(dir.join("zircon")).unwrap();
-    copy(&fixture("fifo/after"));
+    copy(&fixture(&format!("{fixture_name}/after")));
     git(&["add", "-A"]);
     git(&["commit", "-qm", "after"]);
     dir
@@ -186,8 +186,8 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn fifo_report(name: &str) -> Report {
-    let repo = fifo_repo(name);
+fn git_report(fixture_name: &str, name: &str) -> Report {
+    let repo = two_commit_repo(fixture_name, name);
     let git = Git::new(&repo);
     let (base, head) = Git::range("HEAD");
     let cs = git.changeset(&base, &head).unwrap();
@@ -195,6 +195,10 @@ fn fifo_report(name: &str) -> Report {
     let report = babeldiff::run(&cs, &Options::default(), &mut finder);
     let _ = std::fs::remove_dir_all(&repo);
     report
+}
+
+fn fifo_report(name: &str) -> Report {
+    git_report("fifo", name)
 }
 
 #[test]
@@ -328,4 +332,97 @@ fn cli_writes_html() {
         "<title>babeldiff: [kernel] Port BeaconDispatcher subscriptions to Rust</title>"
     ));
     assert_eq!(html.matches("<section class=\"pair ").count(), 7);
+}
+
+/// A dispatcher hierarchy folded into one Rust type with an enum, two
+/// same-named `create` functions behind shims, a syscall with a handle
+/// lookup and status chaining, and four planted mistakes.
+fn doorbell_report(name: &str) -> Report {
+    git_report("doorbell", name)
+}
+
+#[test]
+fn doorbell_golden() {
+    let report = doorbell_report("doorbell-golden");
+    check_golden(
+        &fixture("doorbell/expected.txt"),
+        &render(&report, &opts(Layout::Stacked)),
+    );
+}
+
+#[test]
+fn doorbell_finds_exactly_the_planted_mistakes() {
+    let report = doorbell_report("doorbell-planted");
+    let pair = |name: &str| report.pairs.iter().find(|p| p.cpp.name == name).unwrap();
+
+    // Each static Create pairs with its own Rust `create`, told apart by the
+    // type path the shim calls.
+    assert_eq!(
+        pair("ChimeDoorbellDispatcher::Create").rust.name,
+        "ChimeDoorbellDispatcher::create"
+    );
+    assert_eq!(
+        pair("BuzzerDoorbellDispatcher::Create").rust.name,
+        "BuzzerDoorbellDispatcher::create"
+    );
+    // Both overrides of Ring fold into the one Rust `ring`.
+    let ring = pair("ChimeDoorbellDispatcher::Ring");
+    assert_eq!(ring.rust.name, "DoorbellDispatcher::ring");
+    let ovs: Vec<&str> = ring.overrides.iter().map(|o| o.cpp.name.as_str()).collect();
+    assert_eq!(ovs, ["BuzzerDoorbellDispatcher::Ring"]);
+    assert!(report.unmatched_cpp.is_empty());
+    assert!(report.unmatched_rust.is_empty());
+
+    let mut issues: Vec<String> = report
+        .pairs
+        .iter()
+        .flat_map(|p| p.all_findings())
+        .filter(|f| f.severity == Severity::Issue)
+        .map(|f| format!("{} {}", f.category.name(), f.message))
+        .collect();
+    issues.sort();
+    assert_eq!(
+        issues,
+        [
+            "comment comment only in C++",
+            "control-flow Rust's condition adds a test that C++ doesn't make: tone == 0",
+            "error-path error codes differ: C++ [NO_MEMORY], Rust [NO_RESOURCES]",
+            "trace trace/print statement only in C++",
+        ]
+    );
+    // The dropped comment is the Buzzer override's.
+    let lost = ring.overrides[0]
+        .findings
+        .iter()
+        .find(|f| f.message == "comment only in C++")
+        .unwrap();
+    assert_eq!(
+        ring.overrides[0].cpp.line(lost.cpp_line.unwrap()).trim(),
+        "// A buzzer rings once, however long it buzzes."
+    );
+    // Status chaining in the syscall is `?` in Rust.
+    assert_eq!(pair("sys_doorbell_ring").issues(), 0);
+}
+
+#[test]
+fn json_lists_findings_with_locations() {
+    let report = doorbell_report("doorbell-json");
+    let json = babeldiff::json::render_json(&report, "doorbell");
+    assert!(json.starts_with("{\"version\":1,\"title\":\"doorbell\""));
+    assert!(json.contains("\"summary\":{\"pairs\":6,\"issues\":4,"));
+    assert!(json.contains(
+        "\"severity\":\"issue\",\"category\":\"error-path\",\"rubric\":\"behavioral parity of error paths\",\"message\":\"error codes differ: C++ [NO_MEMORY], Rust [NO_RESOURCES]\""
+    ));
+    assert!(json.contains("\"override\":\"BuzzerDoorbellDispatcher::Ring\""));
+    assert!(json.contains("\"path\":\"zircon/kernel/object/doorbell_dispatcher.rs\",\"line\":28,\"text\":\"if tone == 0 || tone > MAX_TONE {\""));
+}
+
+#[test]
+fn issues_only_drops_notes_and_clean_pairs() {
+    let mut report = doorbell_report("doorbell-issues");
+    report.retain_issues();
+    assert_eq!(report.notes(), 0);
+    assert_eq!(report.issues(), 4);
+    assert!(report.pairs.iter().all(|p| p.issues() > 0));
+    assert_eq!(report.pairs.len(), 2);
 }

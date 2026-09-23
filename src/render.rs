@@ -179,7 +179,11 @@ fn render_pair(out: &mut String, p: &PairReport, opts: &RenderOptions) {
         out.push('\n');
         render_rows(out, &p.cpp, &p.rust, &p.rows, opts);
         for o in &p.overrides {
-            let _ = writeln!(out, "\n  ---- override {}  <->  {}", o.cpp.name, p.rust.name);
+            let _ = writeln!(
+                out,
+                "\n  ---- override {}  <->  {}",
+                o.cpp.name, p.rust.name
+            );
             render_rows(out, &o.cpp, &p.rust, &o.rows, opts);
         }
     }
@@ -319,7 +323,13 @@ fn signature_indent(f: &Function) -> usize {
         .unwrap_or(0)
 }
 
-fn render_rows(out: &mut String, cpp: &Function, rust: &Function, rows: &[Row], opts: &RenderOptions) {
+fn render_rows(
+    out: &mut String,
+    cpp: &Function,
+    rust: &Function,
+    rows: &[Row],
+    opts: &RenderOptions,
+) {
     let (ci, ri) = (signature_indent(cpp), signature_indent(rust));
     let (mut last_c, mut last_r) = (0usize, 0usize);
     let visible: Vec<bool> = match opts.context {

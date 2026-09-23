@@ -849,6 +849,10 @@ fn calls_function(r: &Function, t: &Function) -> bool {
 /// Rust units still unmatched. Returns the primary's alignment followed by
 /// one alignment per override, in Rust unit indices; the override
 /// alignments leave out Rust-only rows.
+/// How alike an override's unit and the primary's Rust must be to count as
+/// shared code.
+const SHARED_MIN: f64 = 0.6;
+
 fn override_rows(primary: &Function, rust: &Function, ovs: &[&Function]) -> Vec<Vec<Pair>> {
     let (main, _) = align::align(&primary.units, &rust.units);
     let mut taken: Vec<bool> = vec![false; rust.units.len()];
@@ -878,6 +882,34 @@ fn override_rows(primary: &Function, rust: &Function, ovs: &[&Function]) -> Vec<
                 taken[j] = true;
             }
         }
+        // What the override shares with the primary (an argument check
+        // hoisted above the `match`, the final `Ok(())`) matches the Rust
+        // the primary matched.
+        let mut mapped = mapped;
+        let left: Vec<usize> = mapped
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.rust.is_none())
+            .map(|(k, _)| k)
+            .collect();
+        let shared: Vec<usize> = main.iter().filter_map(|p| p.cpp.and(p.rust)).collect();
+        if !left.is_empty() && !shared.is_empty() {
+            let cu: Vec<crate::model::Unit> = left
+                .iter()
+                .map(|&k| o.units[mapped[k].cpp.unwrap()].clone())
+                .collect();
+            let ru: Vec<crate::model::Unit> =
+                shared.iter().map(|&j| rust.units[j].clone()).collect();
+            let (pairs, _) = align::align(&cu, &ru);
+            for p in pairs {
+                if let (Some(a), Some(b)) = (p.cpp, p.rust) {
+                    if p.score >= SHARED_MIN {
+                        mapped[left[a]].rust = Some(shared[b]);
+                        mapped[left[a]].score = p.score;
+                    }
+                }
+            }
+        }
         out.push(mapped);
     }
     out
@@ -897,26 +929,46 @@ fn build_pair(
     } else {
         override_rows(&cpp, &rust, &ov_refs)
     };
-    // Rust units an override accounts for are not "only in Rust".
-    let claimed: Vec<usize> = ov_rows
+    // Rust units an override accounts for are not "only in Rust", nor is
+    // the `match` that replaced virtual dispatch.
+    let mut claimed: Vec<usize> = ov_rows
         .iter()
         .flatten()
         .filter_map(|p| p.cpp.and(p.rust))
         .collect();
+    if !overrides.is_empty() {
+        claimed.extend(
+            pairs
+                .iter()
+                .filter(|p| p.cpp.is_none())
+                .filter_map(|p| p.rust)
+                .filter(|&j| matches!(rust.units[j].kind, UnitKind::Switch | UnitKind::Case)),
+        );
+    }
     let (rows, findings) = check::check_with(&cpp, &rust, &pairs, &claimed);
-    let summary = check::summarize(&cpp, &rust, &rows);
-    let overrides = overrides
+    let mut summary = check::summarize(&cpp, &rust, &rows);
+    let overrides: Vec<OverrideReport> = overrides
         .into_iter()
         .zip(ov_rows)
         .map(|(o, pairs)| {
-            let (rows, findings) = check::check_with(&o, &rust, &pairs, &[]);
+            let (rows, mut ov_findings) = check::check_with(&o, &rust, &pairs, &[]);
+            // Code the override shares with the primary has been reported
+            // once already.
+            ov_findings.retain(|f| {
+                !findings.iter().any(|g| {
+                    g.rust_line.is_some() && g.rust_line == f.rust_line && g.message == f.message
+                })
+            });
             OverrideReport {
                 cpp: o,
                 rows,
-                findings,
+                findings: ov_findings,
             }
         })
         .collect();
+    if !overrides.is_empty() {
+        merge_override_summaries(&mut summary, &rust, &overrides);
+    }
     PairReport {
         cpp,
         rust,
@@ -930,4 +982,43 @@ fn build_pair(
         overrides,
         rationale: String::new(),
     }
+}
+
+/// Folds the overrides' facts into a pair's summary. The Rust function does
+/// what the primary and each override do, once per arm, so errors and locks
+/// are compared as sets, control flow by the busiest C++ version, and the
+/// `match` that replaced virtual dispatch is not a difference.
+fn merge_override_summaries(s: &mut Summary, rust: &Function, ovs: &[OverrideReport]) {
+    for o in ovs {
+        let os = check::summarize(&o.cpp, rust, &o.rows);
+        s.cpp_errors.extend(os.cpp_errors);
+        s.cpp_locks.extend(os.cpp_locks);
+        s.comments_total += os.comments_total;
+        s.comments_same += os.comments_same;
+        s.comments_changed += os.comments_changed;
+        for (name, a, _) in os.flow {
+            match s.flow.iter_mut().find(|(n, _, _)| *n == name) {
+                Some(e) => e.1 = e.1.max(a),
+                None => {
+                    let b = s
+                        .flow
+                        .iter()
+                        .find(|(n, _, _)| *n == name)
+                        .map_or(0, |e| e.2);
+                    s.flow.push((name, a, b));
+                }
+            }
+        }
+    }
+    for v in [
+        &mut s.cpp_errors,
+        &mut s.rust_errors,
+        &mut s.cpp_locks,
+        &mut s.rust_locks,
+    ] {
+        v.sort();
+        v.dedup();
+    }
+    s.flow
+        .retain(|(name, a, _)| !(*name == "switch" && *a == 0));
 }

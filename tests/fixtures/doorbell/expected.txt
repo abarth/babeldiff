@@ -1,0 +1,231 @@
+babeldiff: 6 pairs, 4 issues, 3 notes; 0 C++ and 0 Rust functions unpaired
+legend: = same  ~ note  ! issue  < only in C++  > only in Rust
+
+==== sys_doorbell_ring  <->  sys_doorbell_ring
+  C++   zircon/kernel/lib/syscalls/doorbell.cc:17-36
+  Rust  zircon/kernel/lib/syscalls/doorbell.rs:17-30
+  similarity 0.79, 0 issues, 1 note
+
+< C     17  // zx_status_t zx_doorbell_ring
+        ^ ~ comment only in C++; it restates the function's name
+= C     18  zx_status_t sys_doorbell_ring(zx_handle_t handle, uint32_t tone,
+  C     19                                user_out_ptr<uint64_t> out_count) {
+  R     17  pub fn sys_doorbell_ring(
+  R     18      handle: HandleValue,
+  R     19      tone: u32,
+  R     20      out_count: UserOutPtr<u64>,
+  R     21  ) -> Result<(), Status> {
+= C     20    LTRACEF("handle %x tone %u\n", handle, tone);
+  R     22      ltracef!("handle {:?} tone {}\n", handle, tone);
+< C     22    zx_status_t status;
+< C     23    auto up = ProcessDispatcher::GetCurrent();
+< C     24    fbl::RefPtr<DoorbellDispatcher> doorbell;
+= C     25    status = up->handle_table().GetDispatcherWithRights(*up, handle, ZX_RIGHT_SIGNAL, &doorbell);
+  C     26    if (status != ZX_OK) {
+  C     27      return status;
+  C     28    }
+  R     24      let doorbell = Dispatcher::get_with_rights::<DoorbellDispatcher>(handle, ZX_RIGHT_SIGNAL)?;
+= C     30    status = doorbell->Ring(tone);
+  R     25      doorbell.ring(tone)?;
+= C     31    if (status == ZX_OK && out_count) {
+  R     26      if !out_count.is_null() {
+= C     32      status = out_count.copy_to_user(doorbell->RingCount());
+  R     27          out_count.write(doorbell.ring_count())?;
+= C     35    return status;
+  R     29      Ok(())
+
+  errors   same
+           C++:  ?, ?, ?
+           Rust: ?, ?, ?
+  locks    same
+  flow     if 1, return 1
+  comments 1 C++ comment: 0 identical, 0 reworded, 1 missing in Rust
+  findings
+    ~ doorbell.cc:17 | -  comment only in C++; it restates the function's name
+
+==== DoorbellDispatcher::RingCount  <->  DoorbellDispatcher::ring_count
+  C++   zircon/kernel/object/doorbell_dispatcher.cc:23-26
+  Rust  zircon/kernel/object/doorbell_dispatcher.rs:47-51
+  via   C++ now calls FFI shim rust_doorbell_dispatcher_ring_count  zircon/kernel/object/doorbell_dispatcher_ffi.rs:19-22
+  note  C++ lines marked * are the declaration's comment in zircon/kernel/object/include/object/doorbell_dispatcher.h
+  similarity 1.00, 0 issues, 0 notes
+
+= C    24*  // Returns how many times the doorbell has rung.
+  R     47  /// Returns how many times the doorbell has rung.
+= C     23  uint64_t DoorbellDispatcher::RingCount() const {
+  R     48  pub fn ring_count(&self) -> u64 {
+= C     24    Guard<CriticalMutex> guard{get_lock()};
+  R     49      ksync::lock!(let guard = self.lock());
+= C     25    return rings_;
+  R     50      guard.rings
+
+  errors   same
+  locks    same
+           C++:  lock
+           Rust: lock
+  flow     return 1
+  comments 1 C++ comment: 1 identical, 0 reworded, 0 missing in Rust
+
+==== DoorbellDispatcher::RecordRingLocked  <->  DoorbellDispatcher::record_ring_locked
+  C++   zircon/kernel/object/doorbell_dispatcher.cc:28-31
+  Rust  zircon/kernel/object/doorbell_dispatcher.rs:53-56
+  similarity 1.00, 0 issues, 0 notes
+
+= C     28  void DoorbellDispatcher::RecordRingLocked() {
+  R     53  fn record_ring_locked(&self, guard: &mut StateLockGuard<'_>) {
+= C     29    rings_++;
+  R     54      guard.rings += 1;
+= C     30    UpdateStateLocked(0u, ZX_DOORBELL_RUNG);
+  R     55      self.update_state_locked(guard, 0, ZX_DOORBELL_RUNG);
+
+  errors   same
+  locks    same
+  flow     none
+  comments 0 C++ comments: 0 identical, 0 reworded, 0 missing in Rust
+
+==== ChimeDoorbellDispatcher::Create  <->  ChimeDoorbellDispatcher::create
+  C++   zircon/kernel/object/doorbell_dispatcher.cc:33-48
+  Rust  zircon/kernel/object/doorbell_dispatcher.rs:60-67
+  via   C++ now calls FFI shim rust_chime_doorbell_dispatcher_create  zircon/kernel/object/doorbell_dispatcher_ffi.rs:24-44
+  similarity 0.81, 0 issues, 1 note
+
+= C     34  zx_status_t ChimeDoorbellDispatcher::Create(uint32_t notes,
+  C     35                                              KernelHandle<DoorbellDispatcher>* handle,
+  C     36                                              zx_rights_t* rights) {
+  R     60  pub fn create(notes: u32) -> Result<(KernelHandle<DoorbellDispatcher>, zx_rights_t), Status> {
+= C     37    if (notes == 0) {
+  R     61      if notes == 0 {
+= C     38      return ZX_ERR_INVALID_ARGS;
+  R     62          return Err(Status::INVALID_ARGS);
+< C     40    fbl::AllocChecker ac;
+~ C     41    KernelHandle new_handle(fbl::AdoptRef(new (&ac) ChimeDoorbellDispatcher(notes)));
+  C     42    if (!ac.check()) {
+  C     43      return ZX_ERR_NO_MEMORY;
+  C     44    }
+  R     64      let handle = KernelHandle::try_new(DoorbellDispatcher::new(DoorbellKind::Chime { notes }))
+  R     65          .ok_or(Status::NO_MEMORY)?;
+        ^ ~ only C++ calls adopt_ref; only Rust calls doorbell_dispatcher
+= C     45    *rights = default_rights();
+  C     46    *handle = ktl::move(new_handle);
+  C     47    return ZX_OK;
+  R     66      Ok((handle, DoorbellDispatcher::default_rights()))
+
+  errors   same
+           C++:  INVALID_ARGS, NO_MEMORY?
+           Rust: INVALID_ARGS, NO_MEMORY?
+  locks    same
+  flow     if 1, return 2
+  comments 0 C++ comments: 0 identical, 0 reworded, 0 missing in Rust
+  findings
+    ~ doorbell_dispatcher.cc:41 | doorbell_dispatcher.rs:64  only C++ calls adopt_ref; only Rust calls doorbell_dispatcher
+
+==== ChimeDoorbellDispatcher::Ring  <->  DoorbellDispatcher::ring
+  C++   zircon/kernel/object/doorbell_dispatcher.cc:52-63
+  Rust  zircon/kernel/object/doorbell_dispatcher.rs:24-45
+  via   C++ now calls FFI shim rust_doorbell_dispatcher_ring  zircon/kernel/object/doorbell_dispatcher_ffi.rs:14-17
+  also  C++ BuzzerDoorbellDispatcher::Ring  zircon/kernel/object/doorbell_dispatcher.cc:84-92  (override in a related class, folded into this Rust function)
+  similarity 0.72, 3 issues, 0 notes
+
+> R     24  /// Rings the doorbell with `tone`.
+> R     26  /// Returns ZX_ERR_OUT_OF_RANGE if `tone` is above MAX_TONE.
+= C     52  zx_status_t ChimeDoorbellDispatcher::Ring(uint32_t tone) {
+  R     27  pub fn ring(&self, tone: u32) -> Result<(), Status> {
+! C     53    if (tone > kMaxTone) {
+  R     28      if tone == 0 || tone > MAX_TONE {
+        ^ ! Rust's condition adds a test that C++ doesn't make: tone == 0
+= C     54      return ZX_ERR_OUT_OF_RANGE;
+  R     29          return Err(Status::OUT_OF_RANGE);
+< C     56    LTRACEF("chime of %u notes, tone %u\n", notes_, tone);
+        ^ ! trace/print statement only in C++
+> R     31      match &self.kind {
+> R     32          DoorbellKind::Chime { notes } => {
+= C     57    Guard<CriticalMutex> guard{get_lock()};
+  R     33              ksync::lock!(let mut guard = self.lock());
+= C     58    // Each note of the chime counts as a ring.
+  R     34              // Each note of the chime counts as a ring.
+= C     59    for (uint32_t i = 0; i < notes_; i++) {
+  R     35              for _ in 0..*notes {
+= C     60      RecordRingLocked();
+  R     36                  self.record_ring_locked(&mut guard);
+> R     39          DoorbellKind::Buzzer { .. } => {
+> R     40              ksync::lock!(let mut guard = self.lock());
+> R     41              self.record_ring_locked(&mut guard);
+= C     62    return ZX_OK;
+  R     44      Ok(())
+
+  ---- override BuzzerDoorbellDispatcher::Ring  <->  DoorbellDispatcher::ring
+= C     84  zx_status_t BuzzerDoorbellDispatcher::Ring(uint32_t tone) {
+  R     27  pub fn ring(&self, tone: u32) -> Result<(), Status> {
+! C     85    if (tone > kMaxTone) {
+  R     28      if tone == 0 || tone > MAX_TONE {
+        ^ ! Rust's condition adds a test that C++ doesn't make: tone == 0
+= C     86      return ZX_ERR_OUT_OF_RANGE;
+  R     29          return Err(Status::OUT_OF_RANGE);
+= C     88    Guard<CriticalMutex> guard{get_lock()};
+  R     40              ksync::lock!(let mut guard = self.lock());
+< C     89    // A buzzer rings once, however long it buzzes.
+        ^ ! comment only in C++
+= C     90    RecordRingLocked();
+  R     41              self.record_ring_locked(&mut guard);
+= C     91    return ZX_OK;
+  R     44      Ok(())
+
+  errors   same
+           C++:  OUT_OF_RANGE
+           Rust: OUT_OF_RANGE
+  locks    same
+           C++:  lock
+           Rust: lock
+  flow     if 1, loop 1, return 2
+  comments 2 C++ comments: 1 identical, 0 reworded, 1 missing in Rust
+  findings
+    ! doorbell_dispatcher.cc:53 | doorbell_dispatcher.rs:28  Rust's condition adds a test that C++ doesn't make: tone == 0
+    ! doorbell_dispatcher.cc:56 | -  trace/print statement only in C++
+    ! doorbell_dispatcher.cc:89 | -  comment only in C++
+
+==== BuzzerDoorbellDispatcher::Create  <->  BuzzerDoorbellDispatcher::create
+  C++   zircon/kernel/object/doorbell_dispatcher.cc:65-80
+  Rust  zircon/kernel/object/doorbell_dispatcher.rs:71-81
+  via   C++ now calls FFI shim rust_buzzer_doorbell_dispatcher_create  zircon/kernel/object/doorbell_dispatcher_ffi.rs:46-66
+  similarity 0.77, 1 issue, 1 note
+
+= C     66  zx_status_t BuzzerDoorbellDispatcher::Create(zx_duration_t length,
+  C     67                                               KernelHandle<DoorbellDispatcher>* handle,
+  C     68                                               zx_rights_t* rights) {
+  R     71  pub fn create(
+  R     72      length: zx_duration_t,
+  R     73  ) -> Result<(KernelHandle<DoorbellDispatcher>, zx_rights_t), Status> {
+= C     69    if (length <= 0) {
+  R     74      if length <= 0 {
+= C     70      return ZX_ERR_INVALID_ARGS;
+  R     75          return Err(Status::INVALID_ARGS);
+< C     72    fbl::AllocChecker ac;
+! C     73    KernelHandle new_handle(fbl::AdoptRef(new (&ac) BuzzerDoorbellDispatcher(length)));
+  C     74    if (!ac.check()) {
+  C     75      return ZX_ERR_NO_MEMORY;
+  C     76    }
+  R     77      let handle =
+  R     78          KernelHandle::try_new(DoorbellDispatcher::new(DoorbellKind::Buzzer { length }))
+  R     79              .ok_or(Status::NO_RESOURCES)?;
+        ^ ! error codes differ: C++ [NO_MEMORY], Rust [NO_RESOURCES]
+        ^ ~ only C++ calls adopt_ref; only Rust calls doorbell_dispatcher
+= C     77    *rights = default_rights();
+  C     78    *handle = ktl::move(new_handle);
+  C     79    return ZX_OK;
+  R     80      Ok((handle, DoorbellDispatcher::default_rights()))
+
+  errors   DIFFERENT
+           C++:  INVALID_ARGS, NO_MEMORY?
+           Rust: INVALID_ARGS, NO_RESOURCES?
+  locks    same
+  flow     if 1, return 2
+  comments 0 C++ comments: 0 identical, 0 reworded, 0 missing in Rust
+  findings
+    ! doorbell_dispatcher.cc:73 | doorbell_dispatcher.rs:77  error codes differ: C++ [NO_MEMORY], Rust [NO_RESOURCES]
+    ~ doorbell_dispatcher.cc:73 | doorbell_dispatcher.rs:77  only C++ calls adopt_ref; only Rust calls doorbell_dispatcher
+
+==== FFI shims
+  rust_doorbell_dispatcher_ring -> DoorbellDispatcher::ring  zircon/kernel/object/doorbell_dispatcher_ffi.rs:14-17
+  rust_doorbell_dispatcher_ring_count -> DoorbellDispatcher::ring_count  zircon/kernel/object/doorbell_dispatcher_ffi.rs:19-22
+  rust_chime_doorbell_dispatcher_create -> ChimeDoorbellDispatcher::create  zircon/kernel/object/doorbell_dispatcher_ffi.rs:24-44
+  rust_buzzer_doorbell_dispatcher_create -> BuzzerDoorbellDispatcher::create  zircon/kernel/object/doorbell_dispatcher_ffi.rs:46-66

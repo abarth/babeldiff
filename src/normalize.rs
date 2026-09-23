@@ -43,6 +43,19 @@ pub fn words(s: &str) -> Vec<String> {
 /// Calls that carry no meaning across the two languages (ownership and
 /// conversion plumbing), dropped from the call lists.
 const NOISE_CALLS: &[&str] = &[
+    // A dispatcher's state struct (`self.state()`) holds what were C++
+    // fields; newtype unwrapping and `size_of` (an operator in C++) do
+    // nothing a reviewer compares.
+    "state",
+    "raw_value",
+    "size_of",
+    "result_into",
+    "enumerate",
+    // `fbl::AllocChecker ac;` only carries the result of a `new`.
+    "alloc_checker",
+    // Branch-prediction hints.
+    "likely",
+    "unlikely",
     // ksync reaches guarded state through the guard or a `KCell`.
     "fields",
     "fields_mut",
@@ -204,14 +217,67 @@ pub fn is_mutating(name: &str) -> bool {
         .trim_end_matches('!');
     let w = ident(last);
     const VERBS: &[&str] = &[
-        "take", "pop", "reset", "release", "clear", "lock", "unlock", "acquire", "cancel", "drain",
-        "next", "commit", "create", "alloc", "allocate", "new", "make", "destroy", "close", "open",
-        "start", "stop", "wait", "signal", "trigger", "ack", "flush", "sync", "leak", "detach",
-        "swap", "replace", "remove", "insert", "push", "increment", "decrement", "bind", "unbind",
-        "init", "initialize", "try", "fetch", "read", "write", "update", "set", "run", "join",
-        "enable", "disable", "mask", "unmask", "register", "unregister", "adopt", "into",
+        "take",
+        "pop",
+        "reset",
+        "release",
+        "clear",
+        "lock",
+        "unlock",
+        "acquire",
+        "cancel",
+        "drain",
+        "next",
+        "commit",
+        "create",
+        "alloc",
+        "allocate",
+        "new",
+        "make",
+        "destroy",
+        "close",
+        "open",
+        "start",
+        "stop",
+        "wait",
+        "signal",
+        "trigger",
+        "ack",
+        "flush",
+        "sync",
+        "leak",
+        "detach",
+        "swap",
+        "replace",
+        "remove",
+        "insert",
+        "push",
+        "increment",
+        "decrement",
+        "bind",
+        "unbind",
+        "init",
+        "initialize",
+        "try",
+        "fetch",
+        "read",
+        "write",
+        "update",
+        "set",
+        "run",
+        "join",
+        "enable",
+        "disable",
+        "mask",
+        "unmask",
+        "register",
+        "unregister",
+        "adopt",
+        "into",
     ];
-    words(&w).first().is_some_and(|first| VERBS.contains(&first.as_str()))
+    words(&w)
+        .first()
+        .is_some_and(|first| VERBS.contains(&first.as_str()))
 }
 
 /// Maps equivalent C++ and Rust spellings onto one name.
@@ -242,7 +308,8 @@ fn alias(n: &str) -> &str {
         | "assert_ne"
         | "static_assert"
         | "const_assert" => "assert",
-        "printf" | "dprintf" | "println" | "print" | "kprintf" | "kprintln" | "eprintln" => "print",
+        "printf" | "dprintf" | "println" | "print" | "kprintf" | "kprint" | "kprintln"
+        | "eprintln" => "print",
         "ltracef" | "ltracef_level" | "tracef" | "ltrace_entry" | "ltrace_exit"
         | "ltrace_entry_obj" | "ltrace_exit_obj" | "trace_duration" | "ktrace" => "trace",
         "panic" | "zx_panic" | "platform_panic_start" => "panic",
