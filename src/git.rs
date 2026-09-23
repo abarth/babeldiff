@@ -257,7 +257,7 @@ impl CppFinder for RepoFinder {
                     .cloned(),
             );
         }
-        attach_decl_comments(&mut out, &decls);
+        attach_decl_comments(&mut out, &decls, &Default::default());
         out
     }
 }

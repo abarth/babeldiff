@@ -1152,14 +1152,28 @@ fn build_pair(
                 claimed: &[],
                 elsewhere,
             };
-            let (rows, mut ov_findings) = check::check_with(&o, &rust, &pairs, &ctx);
+            let (mut rows, mut ov_findings) = check::check_with(&o, &rust, &pairs, &ctx);
             // Code the override shares with the primary has been reported
             // once already.
-            ov_findings.retain(|f| {
-                !findings.iter().any(|g| {
-                    g.rust_line.is_some() && g.rust_line == f.rust_line && g.message == f.message
-                })
-            });
+            let reported = |line: Option<usize>, message: &str| {
+                findings
+                    .iter()
+                    .any(|g| g.rust_line.is_some() && g.rust_line == line && g.message == message)
+            };
+            ov_findings.retain(|f| !reported(f.rust_line, &f.message));
+            for r in &mut rows {
+                let line = r.rust.map(|j| rust.units[j].start_line);
+                r.notes.retain(|n| !reported(line, &n.message));
+                if matches!(r.marker, check::Marker::Note | check::Marker::Issue) {
+                    r.marker = if r.notes.is_empty() {
+                        check::Marker::Same
+                    } else if r.notes.iter().any(|n| n.severity == check::Severity::Issue) {
+                        check::Marker::Issue
+                    } else {
+                        check::Marker::Note
+                    };
+                }
+            }
             OverrideReport {
                 cpp: o,
                 rows,
