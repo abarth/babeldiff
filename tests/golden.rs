@@ -335,8 +335,9 @@ fn cli_writes_html() {
 }
 
 /// A dispatcher hierarchy folded into one Rust type with an enum, two
-/// same-named `create` functions behind shims, a syscall with a handle
-/// lookup and status chaining, and four planted mistakes.
+/// same-named `create` functions behind shims, syscalls with a handle
+/// lookup, status chaining and a status set in each branch, four planted
+/// mistakes in the Rust, and one planted change to C++ that stays C++.
 fn doorbell_report(name: &str) -> Report {
     git_report("doorbell", name)
 }
@@ -402,6 +403,22 @@ fn doorbell_finds_exactly_the_planted_mistakes() {
     );
     // Status chaining in the syscall is `?` in Rust.
     assert_eq!(pair("sys_doorbell_ring").issues(), 0);
+    assert_eq!(pair("sys_doorbell_create").issues(), 0);
+
+    // The one C++ change that stays C++ is listed; the forwarders into Rust
+    // and the FFI declarations are not.
+    let changes: Vec<(usize, &str)> = report
+        .cpp_changes
+        .iter()
+        .map(|c| (c.start_line, c.text.as_str()))
+        .collect();
+    assert_eq!(
+        changes,
+        [(
+            24,
+            "ChimeDoorbellDispatcher::ChimeDoorbellDispatcher(uint32_t notes) : notes_(notes + 1) {}"
+        )]
+    );
 }
 
 #[test]

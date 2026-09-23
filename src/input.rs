@@ -17,6 +17,18 @@ pub struct Version {
     pub changed: Option<BTreeSet<usize>>,
 }
 
+/// A run of changed C++ lines that stay C++.
+#[derive(Clone, Debug)]
+pub struct CppChange {
+    pub path: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    /// The functions the lines are in.
+    pub functions: Vec<String>,
+    /// The first changed line, trimmed.
+    pub text: String,
+}
+
 /// The files a change touches, by language and side.
 #[derive(Clone, Debug, Default)]
 pub struct ChangeSet {
@@ -115,6 +127,100 @@ fn changed_fraction(f: &Function, changed: &BTreeSet<usize>) -> f64 {
     n as f64 / span as f64
 }
 
+/// Changed C++ lines that are not part of the port: not FFI forwarders, FFI
+/// declarations, `*_ffi.cc` helpers or includes. What is left is C++ that
+/// stays C++ but behaves differently, which function-by-function comparison
+/// never shows.
+fn stays_cpp(v: &Version, functions: &[Function]) -> Vec<CppChange> {
+    let Some(changed) = &v.changed else {
+        return Vec::new();
+    };
+    if v.path.ends_with("_ffi.cc") || v.path.ends_with("_ffi.cpp") {
+        return Vec::new();
+    }
+    let lines = extract::split_lines(&v.text);
+    // A body that now only calls into Rust (and unwraps what comes back) is
+    // the port's other half.
+    let forwards = |f: &Function| {
+        f.calls.iter().any(|c| c.starts_with("rust_"))
+            && f.calls
+                .iter()
+                .all(|c| c.starts_with("rust_") || c == "uninitialized")
+    };
+    let skip_fn: Vec<(usize, usize)> = functions
+        .iter()
+        .filter(|f| forwards(f))
+        .map(|f| (f.start_line, f.end_line))
+        .collect();
+    static FFI: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"\b(?:rust|cpp)_\w+\s*\(|^extern\s+"C"|^#|^(?:class|struct)\s+\w+;$"#)
+            .unwrap()
+    });
+    // Statements can span lines; an FFI declaration's continuation lines
+    // are FFI too.
+    let mut ffi = vec![false; lines.len() + 1];
+    let mut start = 1;
+    for n in 1..=lines.len() {
+        let t = lines[n - 1].trim();
+        let prev = (1..n)
+            .rev()
+            .map(|k| lines[k - 1].trim())
+            .find(|l| !l.is_empty());
+        let begins = prev.is_none_or(|p| {
+            p.ends_with([';', '{', '}', ':']) || p.starts_with("//") || p.starts_with('#')
+        });
+        if begins {
+            start = n;
+        }
+        if FFI.is_match(t) {
+            for k in start..=n {
+                ffi[k] = true;
+            }
+        } else if ffi[start] && !begins {
+            ffi[n] = true;
+        }
+    }
+    let keep = |n: usize| {
+        let t = lines.get(n - 1).map_or("", |l| l.trim());
+        !t.is_empty()
+            && !t.starts_with("}")
+            && !matches!(t, "{" | "public:" | "private:" | "protected:")
+            && !ffi.get(n).copied().unwrap_or(false)
+            && !skip_fn.iter().any(|&(a, b)| (a..=b).contains(&n))
+    };
+    let mut out: Vec<CppChange> = Vec::new();
+    for &n in changed.iter().filter(|&&n| keep(n)) {
+        let within = functions
+            .iter()
+            .find(|f| (f.start_line..=f.end_line).contains(&n))
+            .map(|f| f.name.clone());
+        let c = match out.last_mut() {
+            Some(c) if n <= c.end_line + 2 => {
+                c.end_line = n;
+                c
+            }
+            _ => {
+                out.push(CppChange {
+                    path: v.path.clone(),
+                    start_line: n,
+                    end_line: n,
+                    functions: Vec::new(),
+                    text: lines
+                        .get(n - 1)
+                        .map_or(String::new(), |l| l.trim().to_string()),
+                });
+                out.last_mut().unwrap()
+            }
+        };
+        if let Some(f) = within {
+            if !c.functions.contains(&f) {
+                c.functions.push(f);
+            }
+        }
+    }
+    out
+}
+
 /// The comments before a function's signature.
 fn leading_comments(f: &Function) -> impl Iterator<Item = &crate::model::Unit> {
     f.units
@@ -168,6 +274,10 @@ pub fn build_inputs(cs: &ChangeSet, min_changed: f64) -> Inputs {
         }
     }
     inputs.cpp = cpp;
+
+    for (v, e) in cs.cpp_new.iter().zip(&cpp_new) {
+        inputs.cpp_changes.extend(stays_cpp(v, &e.functions));
+    }
 
     for e in cpp_new {
         for (k, b) in e.bases {

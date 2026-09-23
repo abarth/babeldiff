@@ -115,6 +115,10 @@ pub struct Report {
     pub rust_facades: Vec<(Function, String)>,
     pub unmatched_rust: Vec<Function>,
     pub shims: Vec<Shim>,
+    /// C++ the change modified that is not part of the port (not removed,
+    /// not a forwarder into Rust, not an FFI declaration). Reviewers check
+    /// these by hand.
+    pub cpp_changes: Vec<crate::input::CppChange>,
 }
 
 impl Report {
@@ -164,6 +168,8 @@ pub struct Inputs {
     pub forced: Vec<(String, String)>,
     /// Base classes of the C++ classes defined in the changed files.
     pub cpp_bases: crate::cpp::ClassBases,
+    /// Changed C++ that stays C++.
+    pub cpp_changes: Vec<crate::input::CppChange>,
 }
 
 #[derive(Clone, Debug)]
@@ -451,8 +457,12 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
         cpp_new_calls,
         forced,
         cpp_bases,
+        cpp_changes,
     } = inputs;
-    let mut report = Report::default();
+    let mut report = Report {
+        cpp_changes,
+        ..Report::default()
+    };
     let hierarchy = Hierarchy::new(&cpp_bases);
 
     // Resolve FFI shims among the Rust functions.
@@ -863,7 +873,15 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
         .filter(|(_, u)| !u)
         .map(|(f, _)| f)
         .partition(is_cpp_shim);
-    report.unmatched_cpp = unmatched;
+    // A C++ function that is still there after the change, and doesn't call
+    // into Rust, was edited rather than ported; its edits are listed with
+    // the other C++ changes.
+    let stays = |f: &Function| {
+        cpp_new_calls
+            .get(&f.name)
+            .is_some_and(|calls| !calls.iter().any(|c| c.starts_with("rust_")))
+    };
+    report.unmatched_cpp = unmatched.into_iter().filter(|f| !stays(f)).collect();
     report.removed_cpp_shims = removed_shims;
     report.unmatched_rust = rust_pool
         .into_iter()
