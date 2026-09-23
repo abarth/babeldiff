@@ -208,6 +208,7 @@ fn render_pair(out: &mut String, i: usize, p: &PairReport) {
             esc(shim_location)
         )),
         Link::Forced => Some("Paired with <code>--pair</code>".into()),
+        Link::Similarity if !p.rationale.is_empty() => Some(format!("Paired: {}", esc(&p.rationale))),
         Link::Similarity => Some("Paired by name and body similarity".into()),
     };
     if let Some(v) = via {
@@ -221,11 +222,29 @@ fn render_pair(out: &mut String, i: usize, p: &PairReport) {
             esc(&f.location())
         );
     }
+    for o in &p.overrides {
+        let _ = write!(
+            out,
+            "<div class=\"via\">Also folds in the C++ override <code>{}</code> <span class=\"loc\">{}</span>, \
+             from a related class</div>",
+            esc(&o.cpp.name),
+            esc(&o.cpp.location())
+        );
+    }
     out.push_str("</div>\n");
 
     render_checks(out, p);
     render_findings(out, i, p);
-    render_code(out, i, p);
+    render_code(out, &format!("p{i}"), &p.cpp, &p.rust, &p.rows);
+    for (n, o) in p.overrides.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "<h3 class=\"override\">Override <code>{}</code> ⇄ <code>{}</code></h3>",
+            esc(&o.cpp.name),
+            esc(&p.rust.name)
+        );
+        render_code(out, &format!("p{i}o{n}"), &o.cpp, &p.rust, &o.rows);
+    }
     out.push_str("</section>\n");
 }
 
@@ -348,26 +367,39 @@ fn render_checks(out: &mut String, p: &PairReport) {
 
 /// Findings, issues first, each linking to its row.
 fn render_findings(out: &mut String, i: usize, p: &PairReport) {
-    let mut items: Vec<(Severity, usize, String)> = Vec::new();
-    for (k, row) in p.rows.iter().enumerate() {
-        for n in &row.notes {
-            items.push((n.severity, k, n.message.clone()));
+    // (severity, block, row, message), where block 0 is the primary C++
+    // and block n + 1 is override n.
+    let mut items: Vec<(Severity, usize, usize, String)> = Vec::new();
+    let blocks =
+        std::iter::once((&p.cpp, &p.rows)).chain(p.overrides.iter().map(|o| (&o.cpp, &o.rows)));
+    for (b, (_, rows)) in blocks.clone().enumerate() {
+        for (k, row) in rows.iter().enumerate() {
+            for n in &row.notes {
+                items.push((n.severity, b, k, n.message.clone()));
+            }
         }
     }
+    let blocks: Vec<(&Function, &Vec<Row>)> = blocks.collect();
     if items.is_empty() {
         out.push_str(
             "<p class=\"clean\">No differences found. Check the aligned code below.</p>\n",
         );
         return;
     }
-    items.sort_by_key(|(sev, k, _)| (*sev, *k));
+    items.sort_by_key(|(sev, b, k, _)| (*sev, *b, *k));
     out.push_str("<ul class=\"findings\">\n");
-    for (sev, k, msg) in items {
+    for (sev, b, k, msg) in items {
         let (class, icon) = match sev {
             Severity::Issue => ("bad", "!"),
             Severity::Note => ("warn", "~"),
         };
-        let row = &p.rows[k];
+        let (cpp, rows) = blocks[b];
+        let row = &rows[k];
+        let anchor = if b == 0 {
+            format!("p{i}r{k}")
+        } else {
+            format!("p{i}o{}r{k}", b - 1)
+        };
         let at = |u: Option<usize>, f: &Function| {
             u.map(|j| {
                 let unit = &f.units[j];
@@ -377,13 +409,13 @@ fn render_findings(out: &mut String, i: usize, p: &PairReport) {
                 }
             })
         };
-        let loc: Vec<String> = [at(row.cpp, &p.cpp), at(row.rust, &p.rust)]
+        let loc: Vec<String> = [at(row.cpp, cpp), at(row.rust, &p.rust)]
             .into_iter()
             .flatten()
             .collect();
         let _ = writeln!(
             out,
-            "<li class=\"{class}\"><a href=\"#p{i}r{k}\"><span class=\"icon\">{icon}</span>\
+            "<li class=\"{class}\"><a href=\"#{anchor}\"><span class=\"icon\">{icon}</span>\
              <span class=\"msg\">{}</span><span class=\"loc\">{}</span></a></li>",
             esc(&msg),
             esc(&loc.join(" · "))
@@ -510,9 +542,9 @@ fn marker_html(m: Marker) -> &'static str {
     }
 }
 
-fn render_code(out: &mut String, i: usize, p: &PairReport) {
-    let mut c = Side::new(&p.cpp);
-    let mut r = Side::new(&p.rust);
+fn render_code(out: &mut String, id: &str, cpp: &Function, rust: &Function, rows: &[Row]) {
+    let mut c = Side::new(cpp);
+    let mut r = Side::new(rust);
     out.push_str(
         "<div class=\"code\">\n<div class=\"colhead\"><div><span class=\"lang c\">C++</span></div>\
          <div></div><div><span class=\"lang r\">Rust</span></div></div>\n",
@@ -538,9 +570,9 @@ fn render_code(out: &mut String, i: usize, p: &PairReport) {
     };
     // A run of one-sided rows carries its note on the first row only.
     let mut run_sev: Option<(Marker, Severity)> = None;
-    for (k, row) in p.rows.iter().enumerate() {
+    for (k, row) in rows.iter().enumerate() {
         // A safety comment is an expected addition: shown, but not flagged.
-        let expected_title = match row.rust.map(|j| &p.rust.units[j].features) {
+        let expected_title = match row.rust.map(|j| &rust.units[j].features) {
             _ if row.cpp.is_some() || !row.notes.is_empty() => None,
             Some(f) if f.safety => Some("Safety comment, expected in Rust"),
             Some(f) if f.lock_plumbing => Some("ksync lock bookkeeping, expected in Rust"),
@@ -567,11 +599,8 @@ fn render_code(out: &mut String, i: usize, p: &PairReport) {
                 _ => None,
             }
         };
-        let left = row.cpp.map(|j| c.unit(&p.cpp.units[j])).unwrap_or_default();
-        let right = row
-            .rust
-            .map(|j| r.unit(&p.rust.units[j]))
-            .unwrap_or_default();
+        let left = row.cpp.map(|j| c.unit(&cpp.units[j])).unwrap_or_default();
+        let right = row.rust.map(|j| r.unit(&rust.units[j])).unwrap_or_default();
         if left.is_empty() && right.is_empty() && row.notes.is_empty() {
             continue;
         }
@@ -579,7 +608,7 @@ fn render_code(out: &mut String, i: usize, p: &PairReport) {
         let mut html = String::new();
         let _ = write!(
             html,
-            "<div class=\"row {}\" id=\"p{i}r{k}\">",
+            "<div class=\"row {}\" id=\"{id}r{k}\">",
             if expected {
                 "ronly expected"
             } else {
@@ -1092,6 +1121,8 @@ main { padding: 16px 20px 80px; min-width: 0; }
 .rev { white-space: nowrap; color: var(--muted); font-size: 13px; cursor: pointer; padding-top: 2px; }
 .meta { padding: 0 16px 8px; color: var(--muted); font-size: 12.5px; display: grid; gap: 1px; }
 .meta code { color: var(--ink); }
+h3.override { margin: 12px 16px 4px; font-size: 13px; font-weight: 600; color: var(--muted); }
+h3.override code { color: var(--ink); }
 .lang { display: inline-block; min-width: 34px; font: 700 10.5px/1.6 var(--sans); text-transform: uppercase;
   letter-spacing: .04em; text-align: center; border-radius: 4px; padding: 0 4px; }
 .lang.c { color: var(--cpp); background: color-mix(in srgb, var(--cpp) 12%, transparent); }

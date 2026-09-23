@@ -103,6 +103,7 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
 ==== BeaconDispatcher::CheckMode  <->  BeaconDispatcher::check_mode
   C++   zircon/kernel/object/beacon_dispatcher.cc:90-93
   Rust  zircon/kernel/object/beacon_dispatcher.rs:68-70
+  why   same class and method name
   similarity 0.95, 0 issues, 0 notes
 
     91 zx_status_t BeaconDispatcher::CheckMode(uint32_t mode) {                 =     68 fn check_mode(mode: u32) -> Result<(), Status> {
@@ -167,6 +168,7 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
 ==== BeaconDispatcher::FindLocked  <->  BeaconDispatcher::find_locked
   C++   zircon/kernel/object/beacon_dispatcher.cc:110-112
   Rust  zircon/kernel/object/beacon_dispatcher.rs:92-100
+  why   same class and method name
   similarity 0.87, 0 issues, 0 notes
 
    110 const uint64_t* BeaconDispatcher::FindLocked(uint32_t index) const {     =     92 fn find_locked<'a>(&self, guard: &'a StateLockGuard<'_>, index: u32) ->…
