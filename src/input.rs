@@ -115,6 +115,14 @@ fn changed_fraction(f: &Function, changed: &BTreeSet<usize>) -> f64 {
     n as f64 / span as f64
 }
 
+/// The comments before a function's signature.
+fn leading_comments(f: &Function) -> impl Iterator<Item = &crate::model::Unit> {
+    f.units
+        .iter()
+        .take_while(|u| u.kind != UnitKind::Signature)
+        .filter(|u| u.kind == UnitKind::Comment)
+}
+
 /// Extracts functions and selects those the change rewrote.
 pub fn build_inputs(cs: &ChangeSet, min_changed: f64) -> Inputs {
     let mut inputs = Inputs::default();
@@ -137,10 +145,31 @@ pub fn build_inputs(cs: &ChangeSet, min_changed: f64) -> Inputs {
         .map(|(f, _)| f)
         .collect();
     attach_decl_comments(&mut cpp, &decls);
-    inputs.cpp = cpp;
 
+    // Doc comments that are still in the C++ after the change.
+    let mut kept: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
+    let mut cpp_new = Vec::new();
     for v in &cs.cpp_new {
         let e = extract::extract(Lang::Cpp, &v.path, &v.text);
+        for units in e.decl_comments.values() {
+            kept.extend(units.iter().map(|u| u.features.comment.clone()));
+        }
+        for f in &e.functions {
+            kept.extend(leading_comments(f).map(|u| u.features.comment.clone()));
+        }
+        cpp_new.push(e);
+    }
+    for f in &mut cpp {
+        let n = leading_comments(f).count();
+        for u in f.units.iter_mut().take(n) {
+            if !u.features.comment.is_empty() && kept.contains(&u.features.comment) {
+                u.features.still_in_cpp = true;
+            }
+        }
+    }
+    inputs.cpp = cpp;
+
+    for e in cpp_new {
         for (k, b) in e.bases {
             inputs.cpp_bases.entry(k).or_insert(b);
         }

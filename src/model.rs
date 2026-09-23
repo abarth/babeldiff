@@ -172,6 +172,10 @@ pub struct Features {
     /// Calls through a type path, as `type::method` (`Foo::create`), to tell
     /// same-named methods of different types apart.
     pub qcalls: Vec<String>,
+    /// For C++ doc comments: the same comment is still in the C++ after the
+    /// change (on the declaration, or on the function that now calls into
+    /// Rust), so it was not lost.
+    pub still_in_cpp: bool,
 }
 
 /// One operand of a condition's top-level `&&` or `||`.

@@ -486,6 +486,13 @@ impl<'a> Ctx<'a> {
     /// spells these differently or not at all; what matters is where the
     /// value is used.
     fn is_plumbing(&self, n: Node, f: &Features) -> bool {
+        // Clang thread-safety assertions (`AssertHeld(lock)`,
+        // `op->AssertParentLockHeld()`) have no runtime effect.
+        static TA: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"^[\w:.>*()-]*Assert\w*Held\s*\(").unwrap());
+        if n.kind() == "expression_statement" && TA.is_match(self.text(n).trim()) {
+            return true;
+        }
         if n.kind() != "declaration" || !f.errors.is_empty() || !f.locks.is_empty() || f.propagates
         {
             return false;
@@ -871,7 +878,7 @@ impl<'a> Ctx<'a> {
 
     fn is_propagation(&self, cond: Node, cons: Node) -> bool {
         static FAIL: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(r"!=\s*ZX_OK|ZX_OK\s*!=|\.is_error\(\)|!\s*[\w.>-]+(?:\.|->)is_ok\(\)|\bstatus\s*<\s*0")
+            Regex::new(r"!=\s*ZX_OK|ZX_OK\s*!=|\.is_error\(\)|!\s*[\w.>-]+(?:\.|->)is_ok\(\)|\bstatus\s*<\s*0|^\(\s*\w*status\s*\)$")
                 .unwrap()
         });
         if !FAIL.is_match(self.text(cond)) {
@@ -923,7 +930,12 @@ fn chain_status(units: &mut [crate::model::Unit], lines: &[String]) {
     };
     let v = regex::escape(&var);
     let word = Regex::new(&format!(r"\b{v}\b")).unwrap();
-    let assign = Regex::new(&format!(r"^(?:zx_status_t\s+)?{v}\s*=[^=].*\w\s*\(")).unwrap();
+    // `status = f();`, `zx_status_t status = f();`, or a structured binding
+    // `auto [status, n] = f();`.
+    let assign = Regex::new(&format!(
+        r"^(?:(?:zx_status_t\s+)?{v}|auto\s*\[\s*{v}\s*,[^\]]*\])\s*=[^=].*\w\s*\("
+    ))
+    .unwrap();
     let decl = Regex::new(&format!(r"^zx_status_t\s+{v}\s*(?:=\s*ZX_OK\s*)?;")).unwrap();
     let guard = Regex::new(&format!(r"\b{v}\s*==\s*ZX_OK\b|\bZX_OK\s*==\s*{v}\b")).unwrap();
     let ret = Regex::new(&format!(r"^return\s+{v}\s*;")).unwrap();
@@ -969,11 +981,11 @@ fn chain_status(units: &mut [crate::model::Unit], lines: &[String]) {
 /// The variable a failure check tests, e.g. `status` in `status != ZX_OK`.
 fn propagation_var(cond: &str) -> Option<String> {
     static VAR: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(\w+)\s*!=\s*ZX_OK|ZX_OK\s*!=\s*(\w+)|(\w+)\s*(?:\.|->)is_error\(\)|!\s*(\w+)\s*(?:\.|->)is_ok\(\)|(\w+)\s*<\s*0")
+        Regex::new(r"(\w+)\s*!=\s*ZX_OK|ZX_OK\s*!=\s*(\w+)|(\w+)\s*(?:\.|->)is_error\(\)|!\s*(\w+)\s*(?:\.|->)is_ok\(\)|(\w+)\s*<\s*0|^\(\s*(\w*status)\s*\)$")
             .unwrap()
     });
     let c = VAR.captures(cond)?;
-    let v = (1..=5).find_map(|i| c.get(i))?;
+    let v = (1..=6).find_map(|i| c.get(i))?;
     Some(v.as_str().to_string())
 }
 

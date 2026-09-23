@@ -301,6 +301,21 @@ fn qualified_key(f: &Function) -> Option<String> {
     ))
 }
 
+/// Fraction of directory names two paths share, in `[0, 1]`.
+fn path_affinity(a: &str, b: &str) -> f64 {
+    let dirs = |p: &str| -> Vec<String> {
+        let mut v: Vec<String> = p.split('/').map(str::to_string).collect();
+        v.pop();
+        v
+    };
+    let (da, db) = (dirs(a), dirs(b));
+    if da.is_empty() || db.is_empty() {
+        return 0.0;
+    }
+    let shared = da.iter().filter(|d| db.contains(d)).count();
+    shared as f64 / da.len().max(db.len()) as f64
+}
+
 /// A path's file name without extension and `_ffi` suffix.
 fn file_stem(path: &str) -> String {
     let base = path.rsplit('/').next().unwrap_or(path);
@@ -498,10 +513,11 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
 
     // 2. FFI links: the new C++ body calls the shim, or the shim is named
     //    after the C++ function.
-    for (ci, c) in cpp.iter().enumerate() {
-        if cpp_used[ci] {
+    for orig in 0..cpp.len() {
+        if cpp_used[orig] {
             continue;
         }
+        let c = &cpp[orig];
         let new_calls = cpp_new_calls.get(&c.name);
         let qualified = normalize::ident(&format!(
             "{}_{}",
@@ -534,6 +550,27 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
             if rust_used[ri] {
                 continue;
             }
+            // A C++ trampoline (`mask_interrupt(v)` calling
+            // `manager.MaskInterrupt(v)`) shares the shim's name, but the
+            // C++ it calls holds the body the Rust ports.
+            let callee = (body_len(c) <= 2)
+                .then(|| {
+                    cpp.iter().enumerate().find(|(k, d)| {
+                        *k != orig
+                            && !cpp_used[*k]
+                            && body_len(d) > body_len(c)
+                            && c.calls.contains(&normalize::ident(&d.base))
+                            && score(d, target).0 > score(&cpp[orig], target).0
+                    })
+                })
+                .flatten()
+                .map(|(k, _)| k);
+            let ci = callee.unwrap_or(orig);
+            let c = &cpp[ci];
+            // Nothing in common at all: the name led astray.
+            if body_len(c) > 2 && body_len(target) > 2 && score(c, target).0 < 0.05 {
+                continue;
+            }
             let (link, why) = if by_call {
                 (
                     Link::Ffi {
@@ -551,6 +588,13 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
                     format!("FFI shim {} is named after the C++ function", shim.name),
                 )
             };
+            let why = match callee {
+                Some(_) => format!("{why}, through the C++ trampoline {}", cpp[orig].name),
+                None => why,
+            };
+            if callee.is_some() {
+                cpp_used[orig] = true;
+            }
             cpp_used[ci] = true;
             rust_used[ri] = true;
             chosen.push((ci, ri, link, why));
@@ -558,7 +602,44 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
         }
     }
 
-    // 3. Similarity, greedily from the best score down.
+    // 3. Same class and method name, where exactly one of each exists: a
+    //    name match that close beats body similarity.
+    for ci in 0..cpp.len() {
+        if cpp_used[ci] || is_cpp_shim(&cpp[ci]) {
+            continue;
+        }
+        let c = &cpp[ci];
+        let exact = |r: &Function| {
+            !r.is_ffi && class_key(r) == class_key(c) && name_words(r) == name_words(c)
+        };
+        let hits: Vec<usize> = (0..rust_pool.len())
+            .filter(|&ri| !rust_used[ri] && exact(&rust_pool[ri]))
+            .collect();
+        let rivals = cpp
+            .iter()
+            .enumerate()
+            .filter(|(k, d)| {
+                *k != ci
+                    && !cpp_used[*k]
+                    && hits.iter().any(|&ri| {
+                        class_key(d) == class_key(&rust_pool[ri])
+                            && name_words(d) == name_words(&rust_pool[ri])
+                    })
+            })
+            .count();
+        if let ([ri], 0) = (hits.as_slice(), rivals) {
+            cpp_used[ci] = true;
+            rust_used[*ri] = true;
+            chosen.push((
+                ci,
+                *ri,
+                Link::Similarity,
+                "same class and method name".into(),
+            ));
+        }
+    }
+
+    // 4. Similarity, greedily from the best score down.
     let mut cands: Vec<(f64, usize, usize)> = Vec::new();
     for (ci, c) in cpp.iter().enumerate() {
         if cpp_used[ci] {
@@ -581,7 +662,9 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
             }
             let (s, _) = score(c, r);
             if s >= opts.min_score && plausible(c, r) {
-                cands.push((s, ci, ri));
+                // Among equals, prefer the C++ from the same directory
+                // (`arch/riscv64` over `arch/arm64`).
+                cands.push((s + 0.01 * path_affinity(&c.path, &r.path), ci, ri));
             }
         }
     }
@@ -610,7 +693,7 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
         }
     }
 
-    // 4. Overrides: a C++ override of a method whose base or sibling version
+    // 5. Overrides: a C++ override of a method whose base or sibling version
     //    is paired, in a related class, is folded into the same Rust
     //    function (an enum and `match` replacing virtual dispatch).
     let mut overrides: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -665,7 +748,7 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
         report.pairs.push(pair);
     }
 
-    // 5. Rust with no C++ in the change: look for C++ the change left alone.
+    // 6. Rust with no C++ in the change: look for C++ the change left alone.
     let in_change = |c: &Function| cpp.iter().any(|x| x.path == c.path && x.name == c.name);
     let mut found_used: Vec<(String, usize)> = Vec::new();
     for (ri, r) in rust_pool.iter().enumerate() {
@@ -696,6 +779,14 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
         }
         rust_used[ri] = true;
         found_used.push((c.path.clone(), c.start_line));
+        // The change left this C++ alone, so its comments are all still
+        // there.
+        let mut c = c;
+        for u in &mut c.units {
+            if u.kind == UnitKind::Comment {
+                u.features.still_in_cpp = true;
+            }
+        }
         let mut pair = build_pair(
             c,
             r.clone(),
@@ -705,6 +796,46 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
         );
         pair.rationale = format!(
             "found in the repository, not in the change (score {:.2})",
+            pair.score
+        );
+        report.pairs.push(pair);
+    }
+
+    // 7. C++ with no Rust in the change: the Rust may already exist, in a
+    //    file the change touched elsewhere.
+    for ci in 0..cpp.len() {
+        if cpp_used[ci] || is_cpp_shim(&cpp[ci]) {
+            continue;
+        }
+        let c = &cpp[ci];
+        let hits: Vec<&Function> = universe
+            .iter()
+            .filter(|r| !r.is_ffi && class_key(r) == class_key(c) && name_words(r) == name_words(c))
+            .filter(|r| find_rust(&rust_pool, r).is_none_or(|ri| !rust_used[ri]))
+            .collect();
+        let [r] = hits.as_slice() else { continue };
+        let (s, _) = score(c, r);
+        if s < opts.min_unchanged_score {
+            continue;
+        }
+        let r = (*r).clone();
+        match find_rust(&rust_pool, &r) {
+            Some(ri) => rust_used[ri] = true,
+            None => {
+                rust_pool.push(r.clone());
+                rust_used.push(true);
+            }
+        }
+        cpp_used[ci] = true;
+        let mut pair = build_pair(
+            c.clone(),
+            r,
+            Link::Similarity,
+            CppOrigin::Changed,
+            Vec::new(),
+        );
+        pair.rationale = format!(
+            "same name; the change left this Rust function alone (score {:.2})",
             pair.score
         );
         report.pairs.push(pair);
@@ -825,9 +956,11 @@ fn forwardee(c: &Function, r: &Function, pool: &[Function], used: &[bool]) -> Op
                 && (t.path != r.path || t.start_line != r.start_line)
                 && body_len(t) > body_len(r)
                 && calls_function(r, t)
-                && normalize::words(&normalize::ident(&t.base))
-                    .iter()
-                    .all(|w| own.contains(w))
+                && {
+                    // `dump` and `dump`, or `create` and `create_locked`.
+                    let theirs = normalize::words(&normalize::ident(&t.base));
+                    theirs.iter().all(|w| own.contains(w)) || own.iter().all(|w| theirs.contains(w))
+                }
         })
         .map(|(j, t)| (j, score(c, t).0))
         .filter(|(_, s)| *s > current)

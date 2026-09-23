@@ -175,7 +175,7 @@ pub fn check_with(
         let marker = match (p.cpp, p.rust) {
             (Some(i), Some(j)) => {
                 compare(&cpp.units[i], &rust.units[j], &mut notes);
-                condition_diff(&cpp.units[i], &rust.units[j], cpp, rust, &mut notes);
+                condition_diff(i, j, cpp, rust, &mut notes);
                 if notes.iter().any(|n| n.severity == Severity::Issue) {
                     Marker::Issue
                 } else if notes.is_empty() {
@@ -194,8 +194,26 @@ pub fn check_with(
                         Category::Comment,
                         "comment only in C++; it restates the function's name",
                     ));
+                } else if u.kind == UnitKind::Comment && u.features.still_in_cpp {
+                    notes.push(Note::new(
+                        Severity::Note,
+                        Category::Comment,
+                        "comment only in C++; it is still in the C++ after the change",
+                    ));
+                } else if u.kind == UnitKind::Comment && is_banner(u) {
+                    notes.push(Note::new(
+                        Severity::Note,
+                        Category::Comment,
+                        "comment only in C++; it labels a section",
+                    ));
+                } else if u.kind == UnitKind::Comment && words_kept(u, rust) {
+                    notes.push(Note::new(
+                        Severity::Note,
+                        Category::Comment,
+                        "comment only in C++, but the Rust comments carry its words (merged or reworded)",
+                    ));
                 } else if !u.features.plumbing && u.kind != UnitKind::Signature {
-                    notes.push(only_in(u, "C++", "Rust", moved));
+                    notes.push(soften_if_called(only_in(u, "C++", "Rust", moved), u, rust));
                 }
                 Marker::CppOnly
             }
@@ -211,7 +229,7 @@ pub fn check_with(
                     || u.features.plumbing
                     || (new_doc(rust, j) && !has_doc(cpp));
                 if !expected {
-                    notes.push(only_in(u, "Rust", "C++", moved));
+                    notes.push(soften_if_called(only_in(u, "Rust", "C++", moved), u, cpp));
                 }
                 Marker::RustOnly
             }
@@ -291,14 +309,20 @@ fn group_runs(rows: &mut [Row], cpp: &Function, rust: &Function) {
         }
         // Rows with no note (expected additions such as safety comments)
         // stay in the run but don't count toward it, and neither do
-        // comments or trace-only statements, which are reported alone.
+        // comments, traces, asserts and moved steps, which are reported
+        // alone.
         let noted: Vec<usize> = (i..j)
             .filter(|&k| {
                 !rows[k].notes.is_empty()
-                    && rows[k]
-                        .notes
-                        .iter()
-                        .all(|n| !matches!(n.category, Category::Comment | Category::Trace))
+                    && rows[k].notes.iter().all(|n| {
+                        !matches!(
+                            n.category,
+                            Category::Comment
+                                | Category::Trace
+                                | Category::Assert
+                                | Category::Order
+                        )
+                    })
             })
             .collect();
         if noted.len() >= 3 {
@@ -422,6 +446,54 @@ fn restates_signature(u: &Unit, f: &Function) -> bool {
     named
 }
 
+/// A statement that only makes calls the other function also makes
+/// somewhere was most likely split, merged or moved, not dropped: a note.
+fn soften_if_called(n: Note, u: &Unit, other: &Function) -> Note {
+    if n.severity != Severity::Issue
+        || n.category != Category::Call
+        || u.kind != UnitKind::Stmt
+        || u.features.calls.is_empty()
+        || !u.features.calls.iter().all(|c| other.calls.contains(c))
+    {
+        return n;
+    }
+    Note::new(
+        Severity::Note,
+        Category::Call,
+        format!(
+            "{}; the other side makes the same calls elsewhere",
+            n.message
+        ),
+    )
+}
+
+/// A section label such as `// Socket methods.` or `/* external api */`.
+fn is_banner(u: &Unit) -> bool {
+    const LAST: &[&str] = &["methods", "implementation", "api", "functions", "helpers"];
+    let w = &u.features.comment;
+    !w.is_empty() && w.len() <= 4 && w.last().is_some_and(|l| LAST.contains(&l.as_str()))
+}
+
+/// Whether most of a C++ comment's words appear in the Rust function's
+/// comments, as when several comments were merged into one Rust block.
+fn words_kept(u: &Unit, rust: &Function) -> bool {
+    let words = &u.features.comment;
+    if words.len() < 4 {
+        return false;
+    }
+    let rust_words: std::collections::HashSet<&str> = rust
+        .units
+        .iter()
+        .filter(|r| r.kind == UnitKind::Comment)
+        .flat_map(|r| r.features.comment.iter().map(String::as_str))
+        .collect();
+    let kept = words
+        .iter()
+        .filter(|w| rust_words.contains(w.as_str()))
+        .count();
+    kept as f64 >= 0.8 * words.len() as f64
+}
+
 fn only_in(u: &Unit, here: &str, there: &str, moved: Option<usize>) -> Note {
     let f = &u.features;
     let what = match u.kind {
@@ -490,6 +562,16 @@ fn only_in(u: &Unit, here: &str, there: &str, moved: Option<usize>) -> Note {
             )
         }
         UnitKind::Signature => (false, Category::ControlFlow),
+        // An `else`, `break`, `goto` or label on its own is a change of shape
+        // (`goto done` became `break`, an `else` became an early return);
+        // the flow counts show any real imbalance.
+        UnitKind::Else
+        | UnitKind::Break
+        | UnitKind::Continue
+        | UnitKind::Goto
+        | UnitKind::Label => (false, Category::ControlFlow),
+        // Rust's exhaustive `match` needs arms C++'s `switch` doesn't.
+        UnitKind::Case => (from_cpp, Category::ControlFlow),
         _ => (true, Category::ControlFlow),
     };
     let sev = if significant {
@@ -688,17 +770,31 @@ fn propagation_is_implied(a: &Unit, b: &Unit) -> bool {
 }
 
 /// Every condition operand a function tests.
-fn all_conjuncts(f: &Function) -> Vec<&crate::model::Conjunct> {
-    f.units
+/// Conjuncts of the conditions near unit `k`: a C++ `if (a && b)` split
+/// into nested Rust `if`s (or the reverse) keeps its tests close by.
+fn nearby_conjuncts(f: &Function, k: usize) -> Vec<&crate::model::Conjunct> {
+    let lo = k.saturating_sub(3);
+    let hi = (k + 4).min(f.units.len());
+    f.units[lo..hi]
         .iter()
         .flat_map(|u| u.features.conjuncts.iter())
         .collect()
 }
 
+/// Whether two normalized names are the same, or one contains the other
+/// (`modewrite` and `write`).
+fn name_like(x: &str, y: &str) -> bool {
+    x == y || (x.len() >= 3 && y.len() >= 3 && (x.contains(y) || y.contains(x)))
+}
+
 /// Reports tests one side's `if` makes and the other's doesn't, operand by
-/// operand. A test the other function makes in some other condition (a
-/// C++ `if (a && b)` split into nested Rust `if`s) doesn't count.
-fn condition_diff(a: &Unit, b: &Unit, cpp: &Function, rust: &Function, notes: &mut Vec<Note>) {
+/// operand. A test the other function makes in a condition close by (a
+/// C++ `if (a && b)` split into nested Rust `if`s) doesn't count. When both
+/// conditions have as many tests but they read differently, the operands
+/// were probably renamed or hoisted into locals: that is a note. A test
+/// added or dropped outright is an issue.
+fn condition_diff(i: usize, j: usize, cpp: &Function, rust: &Function, notes: &mut Vec<Note>) {
+    let (a, b) = (&cpp.units[i], &rust.units[j]);
     let conds = |u: &Unit| matches!(u.kind, UnitKind::If | UnitKind::ElseIf);
     let (fa, fb) = (&a.features, &b.features);
     if !conds(a) || !conds(b) || fa.checks_error || fb.checks_error {
@@ -720,27 +816,47 @@ fn condition_diff(a: &Unit, b: &Unit, cpp: &Function, rust: &Function, notes: &m
     // Tests of the same names with different comparisons (`x == 0` and
     // `x > MAX`) are different tests.
     let same = |x: &crate::model::Conjunct, y: &crate::model::Conjunct| {
+        let covered =
+            |p: &[String], q: &[String]| p.iter().all(|w| q.iter().any(|v| name_like(w, v)));
         let names = crate::normalize::jaccard(&x.names, &y.names) >= 0.5
-            || x.names.iter().all(|w| y.names.contains(w))
-            || y.names.iter().all(|w| x.names.contains(w));
+            || covered(&x.names, &y.names)
+            || covered(&y.names, &x.names);
         let (ox, oy) = (comparison(&x.text), comparison(&y.text));
         names && (ox.is_none() || oy.is_none() || ox == oy)
     };
-    let (all_a, all_b) = (all_conjuncts(cpp), all_conjuncts(rust));
-    let missing = |xs: &[crate::model::Conjunct],
-                   ys: &[crate::model::Conjunct],
-                   all: &[&crate::model::Conjunct]|
-     -> Vec<String> {
-        xs.iter()
-            .filter(|x| !ys.iter().any(|y| same(x, y)) && !all.iter().any(|y| same(x, y)))
-            .map(|x| x.text.clone())
-            .collect()
-    };
-    let only_b = missing(&fb.conjuncts, &fa.conjuncts, &all_a);
-    let only_a = missing(&fa.conjuncts, &fb.conjuncts, &all_b);
+    let (near_a, near_b) = (nearby_conjuncts(cpp, i), nearby_conjuncts(rust, j));
+    let missing =
+        |xs: &[crate::model::Conjunct], near: &[&crate::model::Conjunct]| -> Vec<String> {
+            xs.iter()
+                .filter(|x| !near.iter().any(|y| same(x, y)))
+                .map(|x| x.text.clone())
+                .collect()
+        };
+    let only_b = missing(&fb.conjuncts, &near_a);
+    let only_a = missing(&fa.conjuncts, &near_b);
+    if only_a.is_empty() && only_b.is_empty() {
+        return;
+    }
+    let (na, nb) = (fa.conjuncts.len(), fb.conjuncts.len());
+    if na == nb && !only_a.is_empty() && !only_b.is_empty() {
+        notes.push(Note::new(
+            Severity::Note,
+            Category::ControlFlow,
+            format!(
+                "condition reads differently: C++ tests {}, Rust tests {}",
+                only_a.join("; "),
+                only_b.join("; ")
+            ),
+        ));
+        return;
+    }
     if !only_b.is_empty() {
         notes.push(Note::new(
-            Severity::Issue,
+            if nb > na {
+                Severity::Issue
+            } else {
+                Severity::Note
+            },
             Category::ControlFlow,
             format!(
                 "Rust's condition adds a test that C++ doesn't make: {}",
@@ -750,7 +866,11 @@ fn condition_diff(a: &Unit, b: &Unit, cpp: &Function, rust: &Function, notes: &m
     }
     if !only_a.is_empty() {
         notes.push(Note::new(
-            Severity::Issue,
+            if na > nb {
+                Severity::Issue
+            } else {
+                Severity::Note
+            },
             Category::ControlFlow,
             format!(
                 "C++'s condition tests {}, which the Rust doesn't",

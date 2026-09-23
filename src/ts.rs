@@ -174,6 +174,7 @@ impl FeatureAcc {
             plumbing: false,
             conjuncts: Vec::new(),
             qcalls: self.qcalls,
+            still_in_cpp: false,
         }
     }
 }
