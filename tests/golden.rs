@@ -419,6 +419,24 @@ fn doorbell_finds_exactly_the_planted_mistakes() {
             "ChimeDoorbellDispatcher::ChimeDoorbellDispatcher(uint32_t notes) : notes_(notes + 1) {}"
         )]
     );
+
+    // One of each rubric lint is planted: an `extern "C"` parameter of the
+    // wrong width, an unsafe block without a SAFETY comment, and a C++ FFI
+    // helper that branches.
+    let lints: Vec<(&str, usize, &str)> = report
+        .lints
+        .iter()
+        .map(|l| (l.path.rsplit('/').next().unwrap(), l.line, l.kind.name()))
+        .collect();
+    assert_eq!(
+        lints,
+        [
+            ("doorbell_dispatcher_ffi.cc", 17, "shim-logic"),
+            ("doorbell_dispatcher_ffi.rs", 15, "extern-signature"),
+            ("doorbell_dispatcher_ffi.rs", 61, "unsafe-safety"),
+        ]
+    );
+    assert_eq!(report.lint_issues(), 3);
 }
 
 #[test]
@@ -431,6 +449,8 @@ fn json_lists_findings_with_locations() {
         "\"severity\":\"issue\",\"category\":\"error-path\",\"rubric\":\"behavioral parity of error paths\",\"message\":\"error codes differ: C++ [NO_MEMORY], Rust [NO_RESOURCES]\""
     ));
     assert!(json.contains("\"override\":\"BuzzerDoorbellDispatcher::Ring\""));
+    assert!(json.contains("\"lint_issues\":3,\"lint_notes\":0"));
+    assert!(json.contains("{\"kind\":\"extern-signature\",\"severity\":\"issue\",\"rubric\":\"FFI declarations match on both sides\",\"message\":\"cpp_doorbell_dispatcher_log: parameter 2: C++ `uint32_t kind`, Rust `u64` (4-byte vs 8-byte value)\",\"location\":{\"path\":\"zircon/kernel/object/doorbell_dispatcher_ffi.rs\",\"line\":15},\"related\":{\"path\":\"zircon/kernel/object/doorbell_dispatcher_ffi.cc\",\"line\":15}}"));
     assert!(json.contains("\"path\":\"zircon/kernel/object/doorbell_dispatcher.rs\",\"line\":28,\"text\":\"if tone == 0 || tone > MAX_TONE {\""));
 }
 

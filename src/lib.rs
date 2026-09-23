@@ -37,6 +37,7 @@ pub mod git;
 pub mod html;
 pub mod input;
 pub mod json;
+pub mod lint;
 pub mod model;
 pub mod normalize;
 pub mod patch;
@@ -67,5 +68,7 @@ pub fn run_with(
 ) -> analyze::Report {
     let mut inputs = input::build_inputs(cs, min_changed);
     inputs.forced = forced;
-    analyze::analyze(inputs, opts, finder)
+    let mut report = analyze::analyze(inputs, opts, finder);
+    report.lints = lint::lint(cs);
+    report
 }

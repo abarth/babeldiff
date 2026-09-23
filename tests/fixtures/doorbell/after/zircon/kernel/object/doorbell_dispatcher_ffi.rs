@@ -11,6 +11,10 @@ use crate::object::dispatcher::KernelHandle;
 use zx_status::Status;
 use zx_types::{zx_duration_t, zx_rights_t, zx_status_t, ZX_OK};
 
+unsafe extern "C" {
+    pub(crate) fn cpp_doorbell_dispatcher_log(doorbell: *const DoorbellDispatcher, kind: u64);
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_doorbell_dispatcher_ring(doorbell: &DoorbellDispatcher, tone: u32) -> zx_status_t {
     Status::from_result(doorbell.ring(tone))
@@ -54,7 +58,6 @@ pub unsafe extern "C" fn rust_buzzer_doorbell_dispatcher_create(
 ) -> zx_status_t {
     match BuzzerDoorbellDispatcher::create(length) {
         Ok((h, r)) => {
-            // SAFETY: The caller guarantees both pointers are valid for writes.
             unsafe {
                 *handle = h;
                 *rights = r;

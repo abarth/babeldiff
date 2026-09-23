@@ -154,13 +154,26 @@ checks:
 | `order` | The same step at a different position. |
 | `atomic` | Memory ordering of atomic operations. A Rust ordering weaker than the C++ one (which is `seq_cst` when unstated) is an issue. |
 
+Separately, babeldiff runs rubric lints over the changed files. They need
+no pairing, and they are listed at the end of the report, under
+`lints` in JSON, and in their own HTML section:
+
+| Lint | What it checks |
+| --- | --- |
+| `extern-signature` | A Rust `extern "C"` declaration of a `cpp_*` helper, or a `rust_*` export, has the parameters and return type of the C++ side: the same count, pointer depth and scalar widths. A mutable pointer the receiving side may write through while the other treats it as const is a note. |
+| `unsafe-safety` | Every `unsafe` block and `unsafe impl` has a `// SAFETY:` comment, and every `unsafe fn` a `# Safety` doc section. Blocks are reported once per function. |
+| `shim-logic` | A `rust_*` shim or `cpp_*` helper only forwards. Branches, loops and `match` arms are reported unless they only convert a result, a status, or a null pointer or empty optional. |
+
+A lint issue counts toward the exit status like any other issue.
+
 `tests/fixtures/fifo/expected.txt` is a complete example; its Rust contains
 four planted mistakes (a different error code, a rollback replaced by `?`, a
 lock moved ahead of the argument checks, and a dropped comment).
 `tests/fixtures/doorbell` is a class hierarchy folded into one Rust type with
 an enum, with four more (a test added to a condition, a dropped trace, a
 dropped comment in one override, and a different error code); babeldiff
-reports exactly those four as issues.
+reports exactly those four as issues. It also plants one of each rubric
+lint.
 
 ## JSON output
 

@@ -29,6 +29,11 @@ pub fn render_json(report: &Report, title: &str) -> String {
         by.num(c.name(), n as f64);
     }
     s.raw("issues_by_category", &by.finish());
+    s.num("lint_issues", report.lint_issues() as f64);
+    s.num(
+        "lint_notes",
+        (report.lints.len() - report.lint_issues()) as f64,
+    );
     o.raw("summary", &s.finish());
     let pairs: Vec<String> = report.pairs.iter().map(pair).collect();
     o.raw("pairs", &array(&pairs));
@@ -80,6 +85,30 @@ pub fn render_json(report: &Report, title: &str) -> String {
         })
         .collect();
     o.raw("cpp_changes_outside_port", &array(&changes));
+    let lints: Vec<String> = report
+        .lints
+        .iter()
+        .map(|l| {
+            let mut x = Obj::new();
+            x.str("kind", l.kind.name());
+            x.str(
+                "severity",
+                match l.severity {
+                    Severity::Issue => "issue",
+                    Severity::Note => "note",
+                },
+            );
+            x.str("rubric", l.kind.rubric());
+            x.str("message", &l.message);
+            x.raw("location", &location(&l.path, l.line, ""));
+            match &l.related {
+                Some((p, n)) => x.raw("related", &location(p, *n, "")),
+                None => x.raw("related", "null"),
+            }
+            x.finish()
+        })
+        .collect();
+    o.raw("lints", &array(&lints));
     let mut out = o.finish();
     out.push('\n');
     out
