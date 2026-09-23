@@ -91,6 +91,26 @@ pub fn render(report: &Report, opts: &RenderOptions) -> String {
             let _ = writeln!(out, "  > Rust {} -> {}  {}", f.name, callee, f.location());
         }
     }
+    if !report.cpp_changes.is_empty() {
+        out.push('\n');
+        let _ = writeln!(
+            out,
+            "==== C++ changed outside the port (stays C++; check by hand)"
+        );
+        for c in &report.cpp_changes {
+            let span = if c.start_line == c.end_line {
+                format!("{}:{}", c.path, c.start_line)
+            } else {
+                format!("{}:{}-{}", c.path, c.start_line, c.end_line)
+            };
+            let within = if c.functions.is_empty() {
+                String::new()
+            } else {
+                format!("  in {}", c.functions.join(", "))
+            };
+            let _ = writeln!(out, "  {span}{within}  {}", c.text);
+        }
+    }
     let shims: Vec<_> = report.shims.iter().collect();
     if !shims.is_empty() {
         out.push('\n');

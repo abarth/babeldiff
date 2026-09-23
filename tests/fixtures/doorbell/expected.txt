@@ -266,6 +266,9 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
     ! doorbell_dispatcher.cc:73 | doorbell_dispatcher.rs:77  error codes differ: C++ [NO_MEMORY], Rust [NO_RESOURCES]
     ~ doorbell_dispatcher.cc:73 | doorbell_dispatcher.rs:77  only C++ calls adopt_ref; only Rust calls doorbell_dispatcher
 
+==== C++ changed outside the port (stays C++; check by hand)
+  zircon/kernel/object/doorbell_dispatcher.cc:24  in ChimeDoorbellDispatcher::ChimeDoorbellDispatcher  ChimeDoorbellDispatcher::ChimeDoorbellDispatcher(uint32_t notes) : notes_(notes + 1) {}
+
 ==== FFI shims
   rust_doorbell_dispatcher_ring -> DoorbellDispatcher::ring  zircon/kernel/object/doorbell_dispatcher_ffi.rs:14-17
   rust_doorbell_dispatcher_ring_count -> DoorbellDispatcher::ring_count  zircon/kernel/object/doorbell_dispatcher_ffi.rs:19-22

@@ -21,7 +21,7 @@ zx_status_t ChimeDoorbellDispatcher::Create(uint32_t notes,
   return rust_chime_doorbell_dispatcher_create(notes, handle, rights);
 }
 
-ChimeDoorbellDispatcher::ChimeDoorbellDispatcher(uint32_t notes) : notes_(notes) {}
+ChimeDoorbellDispatcher::ChimeDoorbellDispatcher(uint32_t notes) : notes_(notes + 1) {}
 
 zx_status_t ChimeDoorbellDispatcher::Ring(uint32_t tone) {
   return rust_doorbell_dispatcher_ring(this, tone);

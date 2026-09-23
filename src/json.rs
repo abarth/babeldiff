@@ -65,6 +65,21 @@ pub fn render_json(report: &Report, title: &str) -> String {
         })
         .collect();
     o.raw("shims", &array(&shims));
+    let changes: Vec<String> = report
+        .cpp_changes
+        .iter()
+        .map(|c| {
+            let mut x = Obj::new();
+            x.str("path", &c.path);
+            x.num("start_line", c.start_line as f64);
+            x.num("end_line", c.end_line as f64);
+            let fs: Vec<String> = c.functions.iter().map(|f| quote(f)).collect();
+            x.raw("functions", &array(&fs));
+            x.str("text", &c.text);
+            x.finish()
+        })
+        .collect();
+    o.raw("cpp_changes_outside_port", &array(&changes));
     let mut out = o.finish();
     out.push('\n');
     out
