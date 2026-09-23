@@ -374,8 +374,12 @@ const NOISE_IDENTS: &[&str] = &[
 pub fn ident_feature(s: &str) -> Option<String> {
     // Google-style constants: `kMaxSize` is `MAX_SIZE` in Rust.
     let mut c = s.chars();
+    let screaming =
+        s.chars().any(|c| c.is_ascii_uppercase()) && !s.chars().any(|c| c.is_ascii_lowercase());
     let s = match (c.next(), c.next()) {
         (Some('k'), Some(u)) if u.is_ascii_uppercase() => &s[1..],
+        // A constant ported by mechanically upper-casing `kMaxSize`.
+        (Some('K'), Some('_')) if screaming => &s[2..],
         _ => s,
     };
     let n = ident(s);
@@ -385,7 +389,11 @@ pub fn ident_feature(s: &str) -> Option<String> {
     // ksync's lock tokens and guards (`token`, `list_token`, `state_guard`,
     // `LockToken`, `TableWriteTokenGuard`, `FooLockClass`) are
     // plumbing; the lock itself is compared as a lock.
-    if n == "token" || n.ends_with("_token") || n.ends_with("_guard") || n.ends_with("_lock_class")
+    // An all-caps `TOKEN` is a constant or enum variant, not a lock token.
+    if (n == "token" && !screaming)
+        || n.ends_with("_token")
+        || n.ends_with("_guard")
+        || n.ends_with("_lock_class")
     {
         return None;
     }

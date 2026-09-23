@@ -192,6 +192,7 @@ pub fn align(a: &[Unit], b: &[Unit]) -> (Vec<Pair>, f64) {
     pending_a.extend(i..n);
     pending_b.extend(j..m);
     flush(&mut out, &mut pending_a, &mut pending_b);
+    let out = pair_gaps(a, b, out, &sim);
     let total = dp[0][0];
     let norm = if n + m == 0 {
         1.0
@@ -199,4 +200,112 @@ pub fn align(a: &[Unit], b: &[Unit]) -> (Vec<Pair>, f64) {
         2.0 * total / (n + m) as f64
     };
     (out, norm)
+}
+
+/// Kinds of unit that [`pair_gaps`] lines up by position.
+fn gap_pairable(k: UnitKind) -> bool {
+    !matches!(k, UnitKind::Comment | UnitKind::Signature)
+}
+
+/// Lines up units left over between two aligned rows when each side has
+/// the same number of units of a kind there, in order: an `if` whose
+/// operands were renamed, or a `case` that became a `match` arm on an enum
+/// variant, is the same step changed, not one step dropped and another
+/// added. Statements must still share something. Such rows keep their low
+/// score, so checks can tell them from confident matches.
+fn pair_gaps(a: &[Unit], b: &[Unit], rows: Vec<Pair>, sim: &[Vec<f64>]) -> Vec<Pair> {
+    let mut out: Vec<Pair> = Vec::with_capacity(rows.len());
+    let mut k = 0;
+    while k < rows.len() {
+        if rows[k].cpp.is_some() && rows[k].rust.is_some() {
+            out.push(rows[k]);
+            k += 1;
+            continue;
+        }
+        let start = k;
+        while k < rows.len() && (rows[k].cpp.is_none() || rows[k].rust.is_none()) {
+            k += 1;
+        }
+        let gap = &rows[start..k];
+        let ca: Vec<usize> = gap.iter().filter_map(|p| p.cpp).collect();
+        let cb: Vec<usize> = gap.iter().filter_map(|p| p.rust).collect();
+        let mut matched: Vec<(usize, usize)> = Vec::new();
+        for g in 0..=12u8 {
+            let xs: Vec<usize> = ca
+                .iter()
+                .copied()
+                .filter(|&i| kind_group(a[i].kind) == g && gap_pairable(a[i].kind))
+                .collect();
+            let ys: Vec<usize> = cb
+                .iter()
+                .copied()
+                .filter(|&j| kind_group(b[j].kind) == g && gap_pairable(b[j].kind))
+                .collect();
+            if xs.is_empty() || xs.len() != ys.len() {
+                continue;
+            }
+            let ok = xs.iter().zip(&ys).all(|(&i, &j)| {
+                let min = if a[i].kind == UnitKind::Stmt {
+                    0.2
+                } else {
+                    0.0
+                };
+                sim[i][j] > min
+            });
+            if ok {
+                matched.extend(xs.into_iter().zip(ys));
+            }
+        }
+        if matched.is_empty() {
+            out.extend_from_slice(gap);
+            continue;
+        }
+        // Keep both sides in order: pairs must not cross each other.
+        matched.sort();
+        let mut kept: Vec<(usize, usize)> = Vec::new();
+        for (i, j) in matched {
+            if kept.last().is_none_or(|&(_, pj)| j > pj) {
+                kept.push((i, j));
+            }
+        }
+        // Emit the gap again, with the kept pairs as rows and everything
+        // else one-sided, C++ before Rust between pairs.
+        let (mut ia, mut ib) = (0usize, 0usize);
+        for &(i, j) in &kept {
+            while ia < ca.len() && ca[ia] < i {
+                out.push(Pair {
+                    cpp: Some(ca[ia]),
+                    rust: None,
+                    score: 0.0,
+                });
+                ia += 1;
+            }
+            while ib < cb.len() && cb[ib] < j {
+                out.push(Pair {
+                    cpp: None,
+                    rust: Some(cb[ib]),
+                    score: 0.0,
+                });
+                ib += 1;
+            }
+            out.push(Pair {
+                cpp: Some(i),
+                rust: Some(j),
+                score: sim[i][j],
+            });
+            ia += 1;
+            ib += 1;
+        }
+        out.extend(ca[ia..].iter().map(|&i| Pair {
+            cpp: Some(i),
+            rust: None,
+            score: 0.0,
+        }));
+        out.extend(cb[ib..].iter().map(|&j| Pair {
+            cpp: None,
+            rust: Some(j),
+            score: 0.0,
+        }));
+    }
+    out
 }
