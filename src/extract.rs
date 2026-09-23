@@ -29,6 +29,7 @@ pub fn split_lines(src: &str) -> Vec<String> {
 pub struct Extracted {
     pub functions: Vec<Function>,
     pub decl_comments: DeclComments,
+    pub bases: cpp::ClassBases,
 }
 
 pub fn extract(lang: Lang, path: &str, src: &str) -> Extracted {
@@ -38,11 +39,13 @@ pub fn extract(lang: Lang, path: &str, src: &str) -> Extracted {
             Extracted {
                 functions: f.functions,
                 decl_comments: f.decl_comments,
+                bases: f.bases,
             }
         }
         Lang::Rust => Extracted {
             functions: rust::extract(path, src),
             decl_comments: Default::default(),
+            bases: Default::default(),
         },
     }
 }

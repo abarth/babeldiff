@@ -11,10 +11,15 @@ use tree_sitter::Node;
 /// in a header), keyed by `(class, base name)`.
 pub type DeclComments = HashMap<(String, String), Vec<Unit>>;
 
+/// Base classes of each class defined in a file, keyed by the class's
+/// unqualified name, also unqualified and without template arguments.
+pub type ClassBases = HashMap<String, Vec<String>>;
+
 /// Everything extracted from one C++ file.
 pub struct CppFile {
     pub functions: Vec<Function>,
     pub decl_comments: DeclComments,
+    pub bases: ClassBases,
 }
 
 pub fn extract(path: &str, src: &str) -> CppFile {
@@ -24,6 +29,7 @@ pub fn extract(path: &str, src: &str) -> CppFile {
     let mut out = CppFile {
         functions: Vec::new(),
         decl_comments: HashMap::new(),
+        bases: HashMap::new(),
     };
     let ctx = Ctx {
         path,
@@ -106,6 +112,25 @@ impl<'a> Ctx<'a> {
         };
         let mut path = class.to_vec();
         path.push(self.text(name).to_string());
+        for c in ts::named_children(n) {
+            if c.kind() != "base_class_clause" {
+                continue;
+            }
+            let bases: Vec<String> = ts::named_children(c)
+                .into_iter()
+                .filter(|b| {
+                    matches!(
+                        b.kind(),
+                        "type_identifier" | "qualified_identifier" | "template_type"
+                    )
+                })
+                .map(|b| unqualified_type(self.text(b)))
+                .collect();
+            out.bases
+                .entry(unqualified_type(self.text(name)))
+                .or_default()
+                .extend(bases);
+        }
         self.walk_scope(body, &path, out);
     }
 
@@ -187,6 +212,25 @@ impl<'a> Ctx<'a> {
         if body.kind() == "compound_statement" {
             self.block(body, 1, &mut b);
         }
+        // `*out = value;` hands a result back through a pointer parameter,
+        // which Rust returns instead.
+        let outs = fdecl
+            .child_by_field_name("parameters")
+            .map(|p| self.pointer_params(p))
+            .unwrap_or_default();
+        if !outs.is_empty() {
+            static OUT: LazyLock<Regex> =
+                LazyLock::new(|| Regex::new(r"^\*\s*(\w+)\s*=[^=]").unwrap());
+            for u in &mut b.units {
+                if u.kind != UnitKind::Stmt || !u.features.calls.is_empty() {
+                    continue;
+                }
+                let text = self.lines.get(u.start_line - 1).map_or("", |l| l.trim());
+                if OUT.captures(text).is_some_and(|c| outs.contains(&c[1].to_string())) {
+                    u.features.plumbing = true;
+                }
+            }
+        }
         // `return Foo();` in a function returning a status passes Foo's status
         // on, which Rust writes `foo()?; Ok(())`.
         let returns_status = n
@@ -211,6 +255,13 @@ impl<'a> Ctx<'a> {
             .collect();
         calls.sort();
         calls.dedup();
+        let mut qcalls: Vec<String> = b
+            .units
+            .iter()
+            .flat_map(|u| u.features.qcalls.clone())
+            .collect();
+        qcalls.sort();
+        qcalls.dedup();
         let name = match &cls {
             Some(c) => format!("{c}::{base}"),
             None => base.clone(),
@@ -226,6 +277,7 @@ impl<'a> Ctx<'a> {
             lines: self.lines[start - 1..end.min(self.lines.len())].to_vec(),
             units: b.units,
             calls,
+            qcalls,
             is_ffi: false,
         })
     }
@@ -249,7 +301,9 @@ impl<'a> Ctx<'a> {
                     }
                 }
             }
-            "identifier" | "field_identifier" => acc.ident(self.text(n)),
+            "identifier" | "field_identifier" | "namespace_identifier" => {
+                acc.ident(self.text(n))
+            }
             "declaration" => {
                 // `Foo foo{args};` constructs a Foo, like Rust `Foo::new(args)`.
                 let ty = n.child_by_field_name("type");
@@ -260,8 +314,14 @@ impl<'a> Ctx<'a> {
                                 && ts::named_children(v).iter().any(|a| !ts::is_comment(*a))
                         })
                 });
+                // `AutoLock guard;` and `AutoBlocked by(REASON);` (which parses
+                // as a function declaration) construct RAII objects too.
+                let raii = n.child_by_field_name("declarator").is_some_and(|d| {
+                    d.kind() == "function_declarator"
+                        || (d.kind() == "identifier" && ty.is_some_and(|t| is_class_type(self.text(t))))
+                });
                 if let Some(ty) = ty.filter(|t| {
-                    ctor && matches!(t.kind(), "type_identifier" | "qualified_identifier")
+                    (ctor || raii) && matches!(t.kind(), "type_identifier" | "qualified_identifier")
                 }) {
                     acc.call(self.text(ty));
                 }
@@ -383,12 +443,82 @@ impl<'a> Ctx<'a> {
             .into_iter()
             .filter(|l| ts::end_line(*l) > ts::line(*l))
             .collect();
-        let f = self.features(n, &lambdas);
+        let mut f = self.features(n, &lambdas);
+        f.plumbing = self.is_plumbing(n, &f);
         let end = lambdas.first().map_or(ts::end_line(n), |l| ts::line(*l));
         b.push(UnitKind::Stmt, ts::line(n), end, depth, f);
         for l in lambdas {
             self.block(l, depth + 1, b);
         }
+    }
+
+    /// Names of a function's pointer parameters.
+    fn pointer_params(&self, params: Node) -> Vec<String> {
+        let mut out = Vec::new();
+        for p in ts::named_children(params) {
+            let mut d = p.child_by_field_name("declarator");
+            let mut is_ptr = false;
+            while let Some(x) = d {
+                if x.kind() == "pointer_declarator" {
+                    is_ptr = true;
+                }
+                if x.kind() == "identifier" {
+                    if is_ptr {
+                        out.push(self.text(x).to_string());
+                    }
+                    break;
+                }
+                d = x.child_by_field_name("declarator");
+            }
+        }
+        out
+    }
+
+    /// Declarations that only name a value for later: `zx_status_t status;`,
+    /// `auto count = count_;`, or binding the result of a zero-argument
+    /// accessor (`auto* up = ProcessDispatcher::GetCurrent();`). Rust
+    /// spells these differently or not at all; what matters is where the
+    /// value is used.
+    fn is_plumbing(&self, n: Node, f: &Features) -> bool {
+        if n.kind() != "declaration"
+            || !f.errors.is_empty()
+            || !f.locks.is_empty()
+            || f.propagates
+        {
+            return false;
+        }
+        let decls: Vec<Node> = ts::named_children(n)
+            .into_iter()
+            .filter(|c| {
+                !matches!(
+                    c.kind(),
+                    "primitive_type"
+                        | "type_identifier"
+                        | "qualified_identifier"
+                        | "template_type"
+                        | "sized_type_specifier"
+                        | "type_qualifier"
+                        | "storage_class_specifier"
+                        | "placeholder_type_specifier"
+                        | "enum_specifier"
+                        | "struct_specifier"
+                        | "comment"
+                )
+            })
+            .collect();
+        if decls.is_empty() {
+            return false;
+        }
+        decls.iter().all(|d| match d.kind() {
+            "identifier" | "pointer_declarator" | "reference_declarator" | "array_declarator" => {
+                // Constructing a class type is a call (see `collect`).
+                f.calls.is_empty()
+            }
+            "init_declarator" => d
+                .child_by_field_name("value")
+                .is_some_and(|v| is_pure_or_accessor(v, self.src)),
+            _ => false,
+        })
     }
 
     fn body(&self, n: Node, depth: usize, b: &mut UnitBuilder) {
@@ -658,7 +788,7 @@ impl<'a> Ctx<'a> {
     }
 
     /// The names each top-level `&&` or `||` operand of a condition mentions.
-    fn conjuncts(&self, n: Node, out: &mut Vec<Vec<String>>) {
+    fn conjuncts(&self, n: Node, out: &mut Vec<crate::model::Conjunct>) {
         let n = match n.kind() {
             "condition_clause" => match n.child_by_field_name("value") {
                 Some(v) => v,
@@ -682,7 +812,10 @@ impl<'a> Ctx<'a> {
                 }
             }
         }
-        out.push(self.features(n, &[]).names);
+        out.push(crate::model::Conjunct {
+            text: self.text(n).split_whitespace().collect::<Vec<_>>().join(" "),
+            names: self.features(n, &[]).names,
+        });
     }
 
     /// Whether a unit's source mentions `name` as a whole word.
@@ -852,6 +985,55 @@ fn split_name(name: &str, class: &[String]) -> (Option<String>, String) {
         Some(parts.join("::"))
     };
     (cls, base)
+}
+
+/// Whether a type names a class with a constructor worth counting: `Foo`
+/// or `ns::Foo`, but not `zx_status_t`, `size_t` or a template like
+/// `fbl::RefPtr<T>`.
+fn is_class_type(t: &str) -> bool {
+    let t = t.trim();
+    if t.contains('<') {
+        return false;
+    }
+    let last = t.rsplit("::").next().unwrap_or(t);
+    last.starts_with(|c: char| c.is_ascii_uppercase()) && !last.ends_with("_t")
+}
+
+/// An initializer with no effect of its own: a value read with no calls,
+/// or a call of a zero-argument accessor.
+fn is_pure_or_accessor(v: Node, src: &[u8]) -> bool {
+    let v = strip_parens(v);
+    let mut calls = Vec::new();
+    collect_calls(v, &mut calls);
+    match calls.as_slice() {
+        [] => true,
+        [c] if c.id() == v.id() => {
+            let no_args = c
+                .child_by_field_name("arguments")
+                .is_some_and(|a| ts::named_children(a).iter().all(|x| ts::is_comment(*x)));
+            let name = c
+                .child_by_field_name("function")
+                .map(|f| ts::text(f, src))
+                .unwrap_or("");
+            no_args && !crate::normalize::is_mutating(name)
+        }
+        _ => false,
+    }
+}
+
+fn collect_calls<'t>(n: Node<'t>, out: &mut Vec<Node<'t>>) {
+    if n.kind() == "call_expression" {
+        out.push(n);
+    }
+    for c in ts::named_children(n) {
+        collect_calls(c, out);
+    }
+}
+
+/// `ns::Foo<T, U>` -> `Foo`.
+pub fn unqualified_type(t: &str) -> String {
+    let t = t.split('<').next().unwrap_or(t);
+    t.rsplit("::").next().unwrap_or(t).trim().to_string()
 }
 
 /// Removes the `break` that ends a switch case, which Rust match arms don't

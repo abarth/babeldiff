@@ -126,6 +126,9 @@ pub fn build_inputs(cs: &ChangeSet, min_changed: f64) -> Inputs {
         for (k, u) in e.decl_comments {
             decls.entry(k).or_insert(u);
         }
+        for (k, b) in e.bases {
+            inputs.cpp_bases.entry(k).or_insert(b);
+        }
         cpp_all.extend(e.functions.into_iter().map(|f| (f, v.changed.as_ref())));
     }
     let mut cpp: Vec<Function> = cpp_all
@@ -137,7 +140,11 @@ pub fn build_inputs(cs: &ChangeSet, min_changed: f64) -> Inputs {
     inputs.cpp = cpp;
 
     for v in &cs.cpp_new {
-        for f in extract::extract(Lang::Cpp, &v.path, &v.text).functions {
+        let e = extract::extract(Lang::Cpp, &v.path, &v.text);
+        for (k, b) in e.bases {
+            inputs.cpp_bases.entry(k).or_insert(b);
+        }
+        for f in e.functions {
             inputs
                 .cpp_new_calls
                 .entry(f.name.clone())

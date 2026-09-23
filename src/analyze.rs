@@ -42,18 +42,39 @@ pub struct PairReport {
     pub rows: Vec<Row>,
     pub findings: Vec<Finding>,
     pub summary: Summary,
+    /// C++ overrides of the same method in related classes whose bodies the
+    /// Rust function also carries, typically as arms of a `match` on an
+    /// enum that replaced the class hierarchy.
+    pub overrides: Vec<OverrideReport>,
+    /// Why the pair was chosen, for readers who need to judge it.
+    pub rationale: String,
+}
+
+/// A C++ override folded into the Rust function of a pair.
+#[derive(Clone, Debug)]
+pub struct OverrideReport {
+    pub cpp: Function,
+    /// Rows of the override against the Rust units it matched. Rust units
+    /// that belong to the primary C++ function or other overrides are left
+    /// out.
+    pub rows: Vec<Row>,
+    pub findings: Vec<Finding>,
 }
 
 impl PairReport {
-    pub fn issues(&self) -> usize {
+    /// Every finding of the pair, including those of its overrides.
+    pub fn all_findings(&self) -> impl Iterator<Item = &Finding> {
         self.findings
             .iter()
+            .chain(self.overrides.iter().flat_map(|o| o.findings.iter()))
+    }
+    pub fn issues(&self) -> usize {
+        self.all_findings()
             .filter(|f| f.severity == Severity::Issue)
             .count()
     }
     pub fn notes(&self) -> usize {
-        self.findings
-            .iter()
+        self.all_findings()
             .filter(|f| f.severity == Severity::Note)
             .count()
     }
@@ -64,6 +85,8 @@ impl PairReport {
 pub struct Shim {
     pub shim: Function,
     pub target: Option<String>,
+    /// Functions the shim could forward to when babeldiff can't tell which.
+    pub ambiguous: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -105,6 +128,8 @@ pub struct Inputs {
     pub cpp_new_calls: HashMap<String, Vec<String>>,
     /// Explicit `(C++ name, Rust name)` pairs.
     pub forced: Vec<(String, String)>,
+    /// Base classes of the C++ classes defined in the changed files.
+    pub cpp_bases: crate::cpp::ClassBases,
 }
 
 #[derive(Clone, Debug)]
@@ -182,7 +207,10 @@ pub fn name_similarity(a: &Function, b: &Function) -> f64 {
     };
     match (last(a), last(b)) {
         (Some(ca), Some(cb)) => 0.8 * base + 0.2 * seq_similarity(&ca, &cb),
-        _ => base,
+        // A method and a free function are less alike than two methods or
+        // two free functions with the same name.
+        (Some(_), None) | (None, Some(_)) => 0.8 * base,
+        (None, None) => base,
     }
 }
 
@@ -233,21 +261,136 @@ fn undecorated(shim: &str) -> String {
     n.to_string()
 }
 
-/// Finds the function an FFI shim forwards to.
-fn shim_target<'a>(shim: &Function, rust: &'a [Function]) -> Option<&'a Function> {
+/// What an FFI shim forwards to.
+enum Target {
+    One(Function),
+    /// Several functions fit equally well.
+    Ambiguous(Vec<String>),
+    None,
+}
+
+/// `Foo::bar` as `foo::bar`, the form of [`crate::model::Features::qcalls`].
+fn qualified_key(f: &Function) -> Option<String> {
+    let class = f.class.as_deref()?;
+    let class = class.rsplit("::").next().unwrap_or(class);
+    Some(format!(
+        "{}::{}",
+        normalize::ident(class),
+        normalize::ident(&f.base)
+    ))
+}
+
+/// A path's file name without extension and `_ffi` suffix.
+fn file_stem(path: &str) -> String {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    let s = base.split('.').next().unwrap_or(base);
+    s.strip_suffix("_ffi").unwrap_or(s).to_string()
+}
+
+/// Finds the function an FFI shim forwards to. When the shim calls
+/// several same-named methods (`A::create` and `B::create`), the type path
+/// of the call, the shim's name and its file decide; if they don't, the
+/// target is ambiguous rather than guessed.
+fn shim_target(shim: &Function, rust: &[Function]) -> Target {
     let und = undecorated(&shim.base);
     // How a call to `r` appears in the shim's call list: `Foo::init` is
     // recorded as a call of `foo`, like a constructor.
     let key = |r: &Function| normalize::call(&r.name).unwrap_or_else(|| normalize::ident(&r.base));
-    rust.iter()
+    let scored: Vec<(usize, &Function)> = rust
+        .iter()
         .filter(|r| !r.is_ffi && r.name != shim.name)
         .filter(|r| shim.calls.contains(&key(r)))
-        // Prefer the callee whose name is embedded in the shim's name.
-        .max_by_key(|r| {
+        .map(|r| {
             let k = key(r);
             let b = normalize::ident(&r.base);
-            (und.ends_with(&b) as usize) * 1000 + (und.contains(&k) as usize) * 500 + k.len()
+            let q = qualified_key(r);
+            let by_path = q.as_ref().is_some_and(|q| shim.qcalls.contains(q));
+            let exact = q.as_ref().is_some_and(|q| q.replace("::", "_") == und);
+            let same_file = file_stem(&r.path) == file_stem(&shim.path);
+            let score = (by_path as usize) * 4000
+                + (exact as usize) * 2000
+                + (und.ends_with(&b) as usize) * 1000
+                + (und.contains(&k) as usize) * 500
+                + (same_file as usize) * 100
+                + k.len();
+            (score, r)
         })
+        .collect();
+    let Some(best) = scored.iter().map(|(s, _)| *s).max() else {
+        return Target::None;
+    };
+    let top: Vec<&Function> = scored
+        .iter()
+        .filter(|(s, _)| *s == best)
+        .map(|(_, r)| *r)
+        .collect();
+    match top.as_slice() {
+        [one] => Target::One((*one).clone()),
+        many => Target::Ambiguous(many.iter().map(|r| r.name.clone()).collect()),
+    }
+}
+
+/// The last component of a class path, normalized.
+fn class_key(f: &Function) -> Option<String> {
+    let c = f.class.as_deref()?;
+    Some(normalize::ident(c.rsplit("::").next().unwrap_or(c)))
+}
+
+/// The C++ class hierarchy of the change, by normalized class name.
+struct Hierarchy {
+    bases: HashMap<String, Vec<String>>,
+}
+
+impl Hierarchy {
+    fn new(raw: &crate::cpp::ClassBases) -> Hierarchy {
+        let bases = raw
+            .iter()
+            .map(|(k, v)| {
+                (
+                    normalize::ident(k),
+                    v.iter().map(|b| normalize::ident(b)).collect(),
+                )
+            })
+            .collect();
+        Hierarchy { bases }
+    }
+
+    fn direct(&self, class: &str) -> &[String] {
+        self.bases.get(class).map_or(&[], Vec::as_slice)
+    }
+
+    fn ancestors(&self, class: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut todo = vec![class.to_string()];
+        while let Some(c) = todo.pop() {
+            for b in self.direct(&c) {
+                if !out.contains(b) && b != class {
+                    out.push(b.clone());
+                    todo.push(b.clone());
+                }
+            }
+        }
+        out
+    }
+
+    fn is_ancestor(&self, a: &str, of: &str) -> bool {
+        self.ancestors(of).iter().any(|x| x == a)
+    }
+
+    /// One class derives from the other, or both derive directly from the
+    /// same class.
+    fn related(&self, a: &str, b: &str) -> bool {
+        a == b
+            || self.is_ancestor(a, b)
+            || self.is_ancestor(b, a)
+            || self.direct(a).iter().any(|x| self.direct(b).contains(x))
+    }
+}
+
+/// The name a function goes by for matching overrides: constructors are
+/// `new` and destructors `drop`, like their Rust counterparts.
+fn override_key(f: &Function) -> String {
+    name_words(f).join("_")
 }
 
 /// Runs the analysis.
@@ -258,8 +401,10 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
         all_rust,
         cpp_new_calls,
         forced,
+        cpp_bases,
     } = inputs;
     let mut report = Report::default();
+    let hierarchy = Hierarchy::new(&cpp_bases);
 
     // Resolve FFI shims among the Rust functions.
     let mut universe: Vec<Function> = all_rust;
@@ -271,10 +416,10 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
             universe.push(r.clone());
         }
     }
-    let shims: Vec<(Function, Option<Function>)> = universe
+    let shims: Vec<(Function, Target)> = universe
         .iter()
         .filter(|f| f.is_ffi)
-        .map(|s| (s.clone(), shim_target(s, &universe).cloned()))
+        .map(|s| (s.clone(), shim_target(s, &universe)))
         .collect();
 
     let mut cpp_used = vec![false; cpp.len()];
@@ -290,7 +435,7 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
     // Shim targets may live in files the change did not touch much; make
     // sure they are pairable.
     for (_, t) in &shims {
-        if let Some(t) = t {
+        if let Target::One(t) = t {
             if !rust_pool
                 .iter()
                 .any(|r| r.path == t.path && r.start_line == t.start_line)
@@ -305,7 +450,16 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
             .position(|r| r.path == f.path && r.start_line == f.start_line)
     };
 
-    let mut chosen: Vec<(usize, usize, Link)> = Vec::new();
+    // Types that exist on each side, to tell a port of `A::f` from a
+    // same-named method of another class.
+    let cpp_classes: Vec<String> = cpp
+        .iter()
+        .filter_map(class_key)
+        .chain(hierarchy.bases.keys().cloned())
+        .collect();
+    let rust_classes: Vec<String> = universe.iter().filter_map(class_key).collect();
+
+    let mut chosen: Vec<(usize, usize, Link, String)> = Vec::new();
     let mut forwarders: Vec<(usize, usize)> = Vec::new();
 
     // 1. Explicit pairs.
@@ -316,7 +470,7 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
             if !cpp_used[ci] && !rust_used[ri] {
                 cpp_used[ci] = true;
                 rust_used[ri] = true;
-                chosen.push((ci, ri, Link::Forced));
+                chosen.push((ci, ri, Link::Forced, "requested with --pair".into()));
             }
         }
     }
@@ -343,27 +497,38 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
             if !(by_call || by_name) {
                 continue;
             }
-            let target = target.as_ref().unwrap_or(shim);
+            let target = match target {
+                Target::One(t) => t,
+                Target::None => shim,
+                // Leave it to the similarity pass rather than guess.
+                Target::Ambiguous(_) => continue,
+            };
             let Some(ri) = find_rust(&rust_pool, target) else {
                 continue;
             };
             if rust_used[ri] {
                 continue;
             }
-            let link = if by_call {
-                Link::Ffi {
-                    shim: shim.name.clone(),
-                    shim_location: shim.location(),
-                }
+            let (link, why) = if by_call {
+                (
+                    Link::Ffi {
+                        shim: shim.name.clone(),
+                        shim_location: shim.location(),
+                    },
+                    format!("the new C++ body calls FFI shim {}", shim.name),
+                )
             } else {
-                Link::FfiName {
-                    shim: shim.name.clone(),
-                    shim_location: shim.location(),
-                }
+                (
+                    Link::FfiName {
+                        shim: shim.name.clone(),
+                        shim_location: shim.location(),
+                    },
+                    format!("FFI shim {} is named after the C++ function", shim.name),
+                )
             };
             cpp_used[ci] = true;
             rust_used[ri] = true;
-            chosen.push((ci, ri, link));
+            chosen.push((ci, ri, link, why));
             break;
         }
     }
@@ -378,6 +543,17 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
             if rust_used[ri] || r.is_ffi {
                 continue;
             }
+            if !class_compatible(c, r, &cpp_classes, &rust_classes, &hierarchy) {
+                continue;
+            }
+            // A C++ method that calls a free function named like `r` is a
+            // caller of what `r` ports, not its source.
+            if r.class.is_none()
+                && c.class.is_some()
+                && c.calls.contains(&normalize::ident(&r.base))
+            {
+                continue;
+            }
             let (s, _) = score(c, r);
             if s >= opts.min_score && plausible(c, r) {
                 cands.push((s, ci, ri));
@@ -385,18 +561,23 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
         }
     }
     cands.sort_by(|a, b| b.0.total_cmp(&a.0));
-    for (_, ci, ri) in cands {
+    for (s, ci, ri) in cands {
         if !cpp_used[ci] && !rust_used[ri] {
             cpp_used[ci] = true;
             rust_used[ri] = true;
-            chosen.push((ci, ri, Link::Similarity));
+            chosen.push((
+                ci,
+                ri,
+                Link::Similarity,
+                format!("names and bodies are similar (score {s:.2})"),
+            ));
         }
     }
 
     // A thin Rust method that just calls the method doing the work (say
     // `Widget::dump` calling `WidgetState::dump`) stands in
     // for the C++ only by name; compare against the method doing the work.
-    for (ci, ri, _) in &mut chosen {
+    for (ci, ri, _, _) in &mut chosen {
         if let Some(rj) = forwardee(&cpp[*ci], &rust_pool[*ri], &rust_pool, &rust_used) {
             rust_used[rj] = true;
             forwarders.push((rj, *ri));
@@ -404,13 +585,54 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
         }
     }
 
-    for (ci, ri, link) in chosen {
+    // 4. Overrides: a C++ override of a method whose base or sibling version
+    //    is paired, in a related class, is folded into the same Rust
+    //    function (an enum and `match` replacing virtual dispatch).
+    let mut overrides: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (ci, c) in cpp.iter().enumerate() {
+        if cpp_used[ci] || is_cpp_shim(c) {
+            continue;
+        }
+        let Some(ck) = class_key(c) else { continue };
+        let key = override_key(c);
+        let host = chosen.iter().position(|(pi, _, _, _)| {
+            let p = &cpp[*pi];
+            override_key(p) == key && class_key(p).is_some_and(|pk| hierarchy.related(&pk, &ck))
+        });
+        if let Some(h) = host {
+            let (pi, ri, _, _) = &chosen[h];
+            let rust_fn = &rust_pool[*ri];
+            // Only when the Rust carries something of the override, or the
+            // override is too small to say.
+            let claimed = override_rows(&cpp[*pi], rust_fn, &[c]);
+            let matched = claimed[0]
+                .iter()
+                .filter(|p| {
+                    p.cpp.is_some_and(|i| {
+                        !matches!(c.units[i].kind, UnitKind::Signature | UnitKind::Comment)
+                    }) && p.rust.is_some()
+                })
+                .count();
+            if matched > 0 || body_len(c) <= 1 {
+                cpp_used[ci] = true;
+                overrides.entry(h).or_default().push(ci);
+            }
+        }
+    }
+
+    for (h, (ci, ri, link, why)) in chosen.into_iter().enumerate() {
+        let ovs: Vec<Function> = overrides
+            .get(&h)
+            .map(|v| v.iter().map(|&k| cpp[k].clone()).collect())
+            .unwrap_or_default();
         let mut pair = build_pair(
             cpp[ci].clone(),
             rust_pool[ri].clone(),
             link,
             CppOrigin::Changed,
+            ovs,
         );
+        pair.rationale = why;
         pair.forwarder = forwarders
             .iter()
             .find(|(t, _)| *t == ri)
@@ -418,26 +640,49 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
         report.pairs.push(pair);
     }
 
-    // 4. Rust with no C++ in the change: look for C++ the change left alone.
+    // 5. Rust with no C++ in the change: look for C++ the change left alone.
+    let in_change = |c: &Function| cpp.iter().any(|x| x.path == c.path && x.name == c.name);
+    let mut found_used: Vec<(String, usize)> = Vec::new();
     for (ri, r) in rust_pool.iter().enumerate() {
         if rust_used[ri] || r.is_ffi {
             continue;
         }
-        let best = finder
+        let mut ranked: Vec<(bool, f64, Function)> = finder
             .find(r)
             .into_iter()
-            .map(|c| (score(&c, r).0, c))
-            .filter(|(s, _)| *s >= opts.min_unchanged_score)
-            .max_by(|a, b| a.0.total_cmp(&b.0));
-        if let Some((_, c)) = best {
-            rust_used[ri] = true;
-            report.pairs.push(build_pair(
-                c,
-                r.clone(),
-                Link::Similarity,
-                CppOrigin::Unchanged,
-            ));
+            .filter(|c| !in_change(c))
+            .filter(|c| !found_used.contains(&(c.path.clone(), c.start_line)))
+            .map(|c| {
+                let ok = unchanged_class_ok(&c, r, &hierarchy);
+                (ok, score(&c, r).0, c)
+            })
+            .filter(|(_, s, _)| *s >= opts.min_unchanged_score)
+            .collect();
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.total_cmp(&a.1)));
+        let Some((ok, s, c)) = ranked.first().cloned() else {
+            continue;
+        };
+        // Two equally good candidates in unrelated classes: don't guess.
+        let tie = ranked.get(1).is_some_and(|(ok2, s2, c2)| {
+            *ok2 == ok && (s - s2).abs() < 0.02 && class_key(c2) != class_key(&c)
+        });
+        if tie {
+            continue;
         }
+        rust_used[ri] = true;
+        found_used.push((c.path.clone(), c.start_line));
+        let mut pair = build_pair(
+            c,
+            r.clone(),
+            Link::Similarity,
+            CppOrigin::Unchanged,
+            Vec::new(),
+        );
+        pair.rationale = format!(
+            "found in the repository, not in the change (score {:.2})",
+            pair.score
+        );
+        report.pairs.push(pair);
     }
 
     report.pairs.sort_by(|a, b| {
@@ -476,12 +721,54 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
         .collect();
     report.shims = shims
         .into_iter()
-        .map(|(shim, target)| Shim {
-            shim,
-            target: target.map(|t| t.name),
+        .map(|(shim, target)| match target {
+            Target::One(t) => Shim {
+                shim,
+                target: Some(t.name),
+                ambiguous: Vec::new(),
+            },
+            Target::Ambiguous(names) => Shim {
+                shim,
+                target: None,
+                ambiguous: names,
+            },
+            Target::None => Shim {
+                shim,
+                target: None,
+                ambiguous: Vec::new(),
+            },
         })
         .collect();
     report
+}
+
+/// Whether C++ `c` and Rust `r` may be the same method, judging by their
+/// classes. `A::f` doesn't port to `B::f` when the change has both a C++
+/// class named like `B` and a Rust type named like `A`, unless one class
+/// derives from the other.
+fn class_compatible(
+    c: &Function,
+    r: &Function,
+    cpp_classes: &[String],
+    rust_classes: &[String],
+    h: &Hierarchy,
+) -> bool {
+    let (Some(ca), Some(rb)) = (class_key(c), class_key(r)) else {
+        return true;
+    };
+    if ca == rb || h.is_ancestor(&ca, &rb) || h.is_ancestor(&rb, &ca) {
+        return true;
+    }
+    !(rust_classes.contains(&ca) && cpp_classes.contains(&rb))
+}
+
+/// Whether unchanged C++ `c` can stand for Rust `r` by class: the same
+/// class, or a base of the C++ class named like the Rust type.
+fn unchanged_class_ok(c: &Function, r: &Function, h: &Hierarchy) -> bool {
+    match (class_key(c), class_key(r)) {
+        (Some(ca), Some(rb)) => ca == rb || h.is_ancestor(&ca, &rb),
+        _ => true,
+    }
 }
 
 /// A C++ function that exists for Rust to call through FFI.
@@ -533,10 +820,78 @@ fn calls_function(r: &Function, t: &Function) -> bool {
     by_type || r.calls.contains(&normalize::ident(&t.base))
 }
 
-fn build_pair(cpp: Function, rust: Function, link: Link, origin: CppOrigin) -> PairReport {
+/// Aligns the primary C++ function, then each override in turn against the
+/// Rust units still unmatched. Returns the primary's alignment followed by
+/// one alignment per override, in Rust unit indices; the override
+/// alignments leave out Rust-only rows.
+fn override_rows(primary: &Function, rust: &Function, ovs: &[&Function]) -> Vec<Vec<Pair>> {
+    let (main, _) = align::align(&primary.units, &rust.units);
+    let mut taken: Vec<bool> = vec![false; rust.units.len()];
+    for p in &main {
+        if let (Some(_), Some(j)) = (p.cpp, p.rust) {
+            taken[j] = true;
+        }
+    }
+    let mut out = Vec::new();
+    for o in ovs {
+        let free: Vec<usize> = (0..rust.units.len())
+            .filter(|&j| !taken[j] && rust.units[j].kind != UnitKind::Signature)
+            .collect();
+        let units: Vec<crate::model::Unit> = free.iter().map(|&j| rust.units[j].clone()).collect();
+        let (pairs, _) = align::align(&o.units, &units);
+        let mapped: Vec<Pair> = pairs
+            .into_iter()
+            .filter(|p| p.cpp.is_some())
+            .map(|p| Pair {
+                cpp: p.cpp,
+                rust: p.rust.map(|j| free[j]),
+                score: p.score,
+            })
+            .collect();
+        for p in &mapped {
+            if let Some(j) = p.rust {
+                taken[j] = true;
+            }
+        }
+        out.push(mapped);
+    }
+    out
+}
+
+fn build_pair(
+    cpp: Function,
+    rust: Function,
+    link: Link,
+    origin: CppOrigin,
+    overrides: Vec<Function>,
+) -> PairReport {
     let (s, pairs) = score(&cpp, &rust);
-    let (rows, findings) = check::check(&cpp, &rust, &pairs);
+    let ov_refs: Vec<&Function> = overrides.iter().collect();
+    let ov_rows = if overrides.is_empty() {
+        Vec::new()
+    } else {
+        override_rows(&cpp, &rust, &ov_refs)
+    };
+    // Rust units an override accounts for are not "only in Rust".
+    let claimed: Vec<usize> = ov_rows
+        .iter()
+        .flatten()
+        .filter_map(|p| p.cpp.and(p.rust))
+        .collect();
+    let (rows, findings) = check::check_with(&cpp, &rust, &pairs, &claimed);
     let summary = check::summarize(&cpp, &rust, &rows);
+    let overrides = overrides
+        .into_iter()
+        .zip(ov_rows)
+        .map(|(o, pairs)| {
+            let (rows, findings) = check::check_with(&o, &rust, &pairs, &[]);
+            OverrideReport {
+                cpp: o,
+                rows,
+                findings,
+            }
+        })
+        .collect();
     PairReport {
         cpp,
         rust,
@@ -547,5 +902,7 @@ fn build_pair(cpp: Function, rust: Function, link: Link, origin: CppOrigin) -> P
         rows,
         findings,
         summary,
+        overrides,
+        rationale: String::new(),
     }
 }

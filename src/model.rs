@@ -166,9 +166,21 @@ pub struct Features {
     /// state = self.state();`), or C++ fetching the current process for a
     /// handle lookup that Rust does in one call.
     pub plumbing: bool,
-    /// For `if` units: the names each top-level `&&`/`||` operand of the
-    /// condition mentions, so an added or dropped test can be reported.
-    pub conjuncts: Vec<Vec<String>>,
+    /// For `if` units: the top-level `&&`/`||` operands of the condition,
+    /// so an added or dropped test can be reported.
+    pub conjuncts: Vec<Conjunct>,
+    /// Calls through a type path, as `type::method` (`Foo::create`), to tell
+    /// same-named methods of different types apart.
+    pub qcalls: Vec<String>,
+}
+
+/// One operand of a condition's top-level `&&` or `||`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Conjunct {
+    /// Source text, whitespace collapsed.
+    pub text: String,
+    /// Normalized names it mentions.
+    pub names: Vec<String>,
 }
 
 /// One aligned step of a function body: a statement, a comment, or the
@@ -209,6 +221,8 @@ pub struct Function {
     pub units: Vec<Unit>,
     /// Normalized names of everything the body calls.
     pub calls: Vec<String>,
+    /// Calls through a type path, as `type::method`.
+    pub qcalls: Vec<String>,
     /// Rust `extern "C"` or `#[no_mangle]` function.
     pub is_ffi: bool,
 }

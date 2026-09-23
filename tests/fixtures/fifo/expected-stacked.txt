@@ -1,4 +1,4 @@
-babeldiff: 4 pairs, 9 issues, 2 notes; 0 C++ and 0 Rust functions unpaired
+babeldiff: 4 pairs, 7 issues, 1 note; 0 C++ and 0 Rust functions unpaired
 legend: = same  ~ note  ! issue  < only in C++  > only in Rust
 
 ==== FifoDispatcher::WriteFromUser  <->  FifoDispatcher::write_from_user
@@ -140,7 +140,7 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
   Rust  zircon/kernel/object/fifo_dispatcher.rs:89-153
   via   C++ now calls FFI shim rust_fifo_dispatcher_read_to_user  zircon/kernel/object/fifo_dispatcher_ffi.rs:32-51
   note  C++ lines marked * are the declaration's comment in zircon/kernel/object/include/object/fifo_dispatcher.h
-  similarity 0.93, 5 issues, 1 note
+  similarity 0.93, 3 issues, 0 notes
 
 = C    23*  // Reads up to |count| elements of |elem_size| bytes into |ptr|.
   R     89  /// Reads up to `count` elements of `elem_size` bytes into `ptr`.
@@ -172,13 +172,12 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
   R    108      let avail = guard.head().wrapping_sub(guard.tail()) as usize;
 = C    100    if (avail == 0) {
   R    110      if avail == 0 {
-~ C    101      return peer() ? ZX_ERR_SHOULD_WAIT : ZX_ERR_PEER_CLOSED;
+= C    101      return peer() ? ZX_ERR_SHOULD_WAIT : ZX_ERR_PEER_CLOSED;
   R    111          return Err(if self.peer(&guard).is_some() {
   R    112              Status::SHOULD_WAIT
   R    113          } else {
   R    114              Status::PEER_CLOSED
   R    115          });
-        ^ ~ only Rust calls is_some
 = C    104    bool was_full = IsFullLocked();
   R    118      let was_full = self.is_full_locked(&guard);
 = C    106    if (count > avail) {
@@ -199,10 +198,9 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
   R    130          if n > count {
 = C    117        n = count;
   R    131              n = count;
-! C    120      zx_status_t status = ptr.copy_array_to_user(&data_[offset * elem_size_], n * elem_size_);
+= C    120      zx_status_t status = ptr.copy_array_to_user(&data_[offset * elem_size_], n * elem_size_);
   C    121      if (status != ZX_OK) {
   R    134          if ptr.copy_array_to_user(self.data(&guard, offset, n)).is_err() {
-        ^ ! Rust's condition adds a test of [copy_array_to_user data offset ptr]
 = C    122        // Roll back, in case this is the second copy.
   R    135              // Roll back, in case this is the second copy.
 = C    123        tail_ = old_tail;
@@ -219,9 +217,8 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
   R    145      // If the fifo was full, it is now writable.
 > R    146      if was_full {
         ^ ! if only in Rust
-! C    133    if (was_full && peer()) {
+= C    133    if (was_full && peer()) {
   R    147          if let Some(peer) = self.peer(&guard) {
-        ^ ! C++'s condition also tests [was_full], which Rust's doesn't
 = C    134      peer()->UpdateStateLocked(0u, ZX_FIFO_WRITABLE);
   R    148              peer.update_state_locked(&guard, 0, ZX_FIFO_WRITABLE);
 = C    137    *actual = (tail_ - old_tail);
@@ -239,10 +236,7 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
   findings
     ! - | fifo_dispatcher.rs:98  statement (acquires lock) only in Rust; resembles C++ line 95, so the order may differ
     ! fifo_dispatcher.cc:95 | -  statement (acquires lock) only in C++; resembles Rust line 98, so the order may differ
-    ! fifo_dispatcher.cc:120 | fifo_dispatcher.rs:134  Rust's condition adds a test of [copy_array_to_user data offset ptr]
     ! - | fifo_dispatcher.rs:146  if only in Rust
-    ! fifo_dispatcher.cc:133 | fifo_dispatcher.rs:147  C++'s condition also tests [was_full], which Rust's doesn't
-    ~ fifo_dispatcher.cc:101 | fifo_dispatcher.rs:111  only Rust calls is_some
 
 ==== FifoDispatcher::IsFullLocked  <->  FifoDispatcher::is_full_locked
   C++   zircon/kernel/object/fifo_dispatcher.cc:141-141  (not changed by this diff)
