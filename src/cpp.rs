@@ -226,7 +226,10 @@ impl<'a> Ctx<'a> {
                     continue;
                 }
                 let text = self.lines.get(u.start_line - 1).map_or("", |l| l.trim());
-                if OUT.captures(text).is_some_and(|c| outs.contains(&c[1].to_string())) {
+                if OUT
+                    .captures(text)
+                    .is_some_and(|c| outs.contains(&c[1].to_string()))
+                {
                     u.features.plumbing = true;
                 }
             }
@@ -248,7 +251,7 @@ impl<'a> Ctx<'a> {
         }
 
         if returns_status {
-            chain_status(&mut b.units, &self.lines);
+            chain_status(&mut b.units, self.lines);
         }
 
         let end = ts::end_line(n);
@@ -305,9 +308,7 @@ impl<'a> Ctx<'a> {
                     }
                 }
             }
-            "identifier" | "field_identifier" | "namespace_identifier" => {
-                acc.ident(self.text(n))
-            }
+            "identifier" | "field_identifier" | "namespace_identifier" => acc.ident(self.text(n)),
             "declaration" => {
                 // `Foo foo{args};` constructs a Foo, like Rust `Foo::new(args)`.
                 let ty = n.child_by_field_name("type");
@@ -322,7 +323,8 @@ impl<'a> Ctx<'a> {
                 // as a function declaration) construct RAII objects too.
                 let raii = n.child_by_field_name("declarator").is_some_and(|d| {
                     d.kind() == "function_declarator"
-                        || (d.kind() == "identifier" && ty.is_some_and(|t| is_class_type(self.text(t))))
+                        || (d.kind() == "identifier"
+                            && ty.is_some_and(|t| is_class_type(self.text(t))))
                 });
                 if let Some(ty) = ty.filter(|t| {
                     (ctor || raii) && matches!(t.kind(), "type_identifier" | "qualified_identifier")
@@ -484,10 +486,7 @@ impl<'a> Ctx<'a> {
     /// spells these differently or not at all; what matters is where the
     /// value is used.
     fn is_plumbing(&self, n: Node, f: &Features) -> bool {
-        if n.kind() != "declaration"
-            || !f.errors.is_empty()
-            || !f.locks.is_empty()
-            || f.propagates
+        if n.kind() != "declaration" || !f.errors.is_empty() || !f.locks.is_empty() || f.propagates
         {
             return false;
         }
@@ -629,13 +628,13 @@ impl<'a> Ctx<'a> {
             Some(e) => ts::classify_return(self.text(e)),
             None => Ret::Value,
         });
-        // `*actual = n; return ZX_OK;` is how C++ returns a value with a
-        // status; Rust returns `Ok(n)`.
+        // `*actual = n; return ZX_OK;` is how C++ returns values with a
+        // status; Rust returns `Ok(n)` or `Ok((a, b))`.
         static OUT_PARAM: LazyLock<Regex> =
             LazyLock::new(|| Regex::new(r"^\*\s*\w+\s*=[^=]").unwrap());
         let mut line = line;
         if f.ret == Some(Ret::Ok) {
-            if let Some(prev) = b.units.last() {
+            while let Some(prev) = b.units.last() {
                 let text = self.lines.get(prev.start_line - 1).map_or("", |l| l.trim());
                 if prev.kind == UnitKind::Stmt
                     && prev.depth == depth
@@ -647,6 +646,8 @@ impl<'a> Ctx<'a> {
                     f.calls.extend(prev.features.calls);
                     f.idents.extend(prev.features.idents);
                     f.names.extend(prev.features.names);
+                } else {
+                    break;
                 }
             }
         }
@@ -817,7 +818,11 @@ impl<'a> Ctx<'a> {
             }
         }
         out.push(crate::model::Conjunct {
-            text: self.text(n).split_whitespace().collect::<Vec<_>>().join(" "),
+            text: self
+                .text(n)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
             names: self.features(n, &[]).names,
         });
     }
@@ -836,11 +841,12 @@ impl<'a> Ctx<'a> {
         })
     }
 
-    /// For `if (!x) return ZX_ERR_X;` (or `x == nullptr`), the variable and
-    /// the error codes returned.
+    /// For `if (!x) return ZX_ERR_X;` (or `x == nullptr`, or an
+    /// `fbl::AllocChecker`'s `!ac.check()`), the variable and the error codes
+    /// returned.
     fn null_check(&self, cond: Node, cons: Node) -> Option<(String, Vec<String>)> {
         static NULL: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(r"^\(\s*(?:!\s*(\w+)|(\w+)\s*==\s*nullptr|nullptr\s*==\s*(\w+))\s*\)$")
+            Regex::new(r"^\(\s*(?:!\s*(\w+)(?:\.check\(\))?|(\w+)\s*==\s*nullptr|nullptr\s*==\s*(\w+))\s*\)$")
                 .unwrap()
         });
         // `if (unlikely(!x))` tests the same thing.
@@ -899,8 +905,7 @@ impl<'a> Ctx<'a> {
 /// assignments propagate, its `== ZX_OK` guards are bookkeeping, and the
 /// final `return status` is the success path.
 fn chain_status(units: &mut [crate::model::Unit], lines: &[String]) {
-    static RET: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"^return\s+(\w+)\s*;").unwrap());
+    static RET: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^return\s+(\w+)\s*;").unwrap());
     let text = |u: &crate::model::Unit| -> String {
         (u.start_line..=u.end_line)
             .filter_map(|l| lines.get(l - 1))
@@ -934,7 +939,9 @@ fn chain_status(units: &mut [crate::model::Unit], lines: &[String]) {
             continue;
         }
         match u.kind {
-            UnitKind::Stmt if assign.is_match(&t) && !u.features.calls.is_empty() => assigns.push(i),
+            UnitKind::Stmt if assign.is_match(&t) && !u.features.calls.is_empty() => {
+                assigns.push(i)
+            }
             UnitKind::Stmt if decl.is_match(&t) => {}
             UnitKind::If | UnitKind::ElseIf if guard.is_match(&t) => guards.push(i),
             UnitKind::Return if ret.is_match(&t) => rets.push(i),

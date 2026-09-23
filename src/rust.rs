@@ -563,7 +563,11 @@ impl<'a> Ctx<'a> {
             _ => {}
         }
         out.push(crate::model::Conjunct {
-            text: self.text(n).split_whitespace().collect::<Vec<_>>().join(" "),
+            text: self
+                .text(n)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
             names: self.features(n, &[]).names,
         });
     }
@@ -657,7 +661,10 @@ impl<'a> Ctx<'a> {
 /// zero-argument accessor (`self.state()`).
 fn is_pure_or_accessor(v: Node, src: &[u8]) -> bool {
     fn calls<'t>(n: Node<'t>, out: &mut Vec<Node<'t>>) {
-        if matches!(n.kind(), "call_expression" | "macro_invocation" | "try_expression") {
+        if matches!(
+            n.kind(),
+            "call_expression" | "macro_invocation" | "try_expression"
+        ) {
             out.push(n);
         }
         for c in ts::named_children(n) {
@@ -667,15 +674,27 @@ fn is_pure_or_accessor(v: Node, src: &[u8]) -> bool {
     let mut v = v;
     loop {
         match v.kind() {
-            "parenthesized_expression" | "unsafe_block" | "block" | "reference_expression"
+            "parenthesized_expression"
+            | "unsafe_block"
+            | "block"
+            | "reference_expression"
             | "unary_expression" => {
                 let inner: Vec<Node> = ts::named_children(v)
                     .into_iter()
                     .filter(|c| !ts::is_comment(*c) && c.kind() != "mutable_specifier")
                     .collect();
                 match inner.as_slice() {
-                    [one] if v.kind() != "block" || one.kind().ends_with("expression") || one.kind() == "field_expression" || one.kind() == "identifier" => v = *one,
-                    [one] if v.kind() == "block" && one.kind() == "expression_statement" => v = *one,
+                    [one]
+                        if v.kind() != "block"
+                            || one.kind().ends_with("expression")
+                            || one.kind() == "field_expression"
+                            || one.kind() == "identifier" =>
+                    {
+                        v = *one
+                    }
+                    [one] if v.kind() == "block" && one.kind() == "expression_statement" => {
+                        v = *one
+                    }
                     _ => break,
                 }
             }

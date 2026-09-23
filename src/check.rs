@@ -379,8 +379,7 @@ pub(crate) fn find_moved(u: &Unit, others: &[Unit], candidates: &[usize]) -> Opt
 /// A statement that only traces or prints.
 fn trace_only(f: &crate::model::Features) -> bool {
     !f.calls.is_empty()
-        && f
-            .calls
+        && f.calls
             .iter()
             .all(|c| matches!(c.as_str(), "trace" | "print"))
         && f.locks.is_empty()
@@ -675,14 +674,15 @@ fn name_matches(call: &str, other: &crate::model::Features) -> bool {
         .or_else(|| call.strip_prefix("get_"))
         .unwrap_or(call)
         .replace('_', "");
-    other.names.iter().any(|n| *n == bare) || other.idents.iter().any(|n| *n == bare)
+    other.names.contains(&bare) || other.idents.contains(&bare)
 }
 
 /// One side propagates with `?` where the other returns the status it
 /// checked in the same unit, which is the same thing.
 fn propagation_is_implied(a: &Unit, b: &Unit) -> bool {
     let returns_status = |u: &Unit| {
-        matches!(u.features.ret, Some(Ret::Status) | Some(Ret::Value)) && !u.features.calls.is_empty()
+        matches!(u.features.ret, Some(Ret::Status) | Some(Ret::Value))
+            && !u.features.calls.is_empty()
     };
     (a.features.propagates && returns_status(b)) || (b.features.propagates && returns_status(a))
 }
@@ -709,16 +709,28 @@ fn condition_diff(a: &Unit, b: &Unit, cpp: &Function, rust: &Function, notes: &m
     }
     // Status tests (`status != ZX_OK`) have no names left once noise is
     // dropped; they are compared as error checks instead.
-    if fa.conjuncts.iter().chain(&fb.conjuncts).any(|c| c.names.is_empty()) {
+    if fa
+        .conjuncts
+        .iter()
+        .chain(&fb.conjuncts)
+        .any(|c| c.names.is_empty())
+    {
         return;
     }
+    // Tests of the same names with different comparisons (`x == 0` and
+    // `x > MAX`) are different tests.
     let same = |x: &crate::model::Conjunct, y: &crate::model::Conjunct| {
-        crate::normalize::jaccard(&x.names, &y.names) >= 0.5
+        let names = crate::normalize::jaccard(&x.names, &y.names) >= 0.5
             || x.names.iter().all(|w| y.names.contains(w))
-            || y.names.iter().all(|w| x.names.contains(w))
+            || y.names.iter().all(|w| x.names.contains(w));
+        let (ox, oy) = (comparison(&x.text), comparison(&y.text));
+        names && (ox.is_none() || oy.is_none() || ox == oy)
     };
     let (all_a, all_b) = (all_conjuncts(cpp), all_conjuncts(rust));
-    let missing = |xs: &[crate::model::Conjunct], ys: &[crate::model::Conjunct], all: &[&crate::model::Conjunct]| -> Vec<String> {
+    let missing = |xs: &[crate::model::Conjunct],
+                   ys: &[crate::model::Conjunct],
+                   all: &[&crate::model::Conjunct]|
+     -> Vec<String> {
         xs.iter()
             .filter(|x| !ys.iter().any(|y| same(x, y)) && !all.iter().any(|y| same(x, y)))
             .map(|x| x.text.clone())
@@ -746,6 +758,20 @@ fn condition_diff(a: &Unit, b: &Unit, cpp: &Function, rust: &Function, notes: &m
             ),
         ));
     }
+}
+
+/// The kind of comparison a condition makes, with `<` and `>` (and `<=`
+/// and `>=`) alike, since either can be written with its operands swapped.
+fn comparison(text: &str) -> Option<&'static str> {
+    static OP: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\s(==|!=|<=|>=|<|>)\s").unwrap());
+    let op = OP.captures(text)?.get(1)?.as_str();
+    Some(match op {
+        "==" => "eq",
+        "!=" => "ne",
+        "<" | ">" => "lt",
+        _ => "le",
+    })
 }
 
 fn sorted(v: &[String]) -> Vec<String> {

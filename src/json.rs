@@ -144,7 +144,11 @@ fn finding(
     match f.cpp_line {
         Some(l) => {
             let path = f.cpp_file.as_deref().unwrap_or(&cpp.path);
-            let text = if f.cpp_file.is_some() { "" } else { cpp.line(l) };
+            let text = if f.cpp_file.is_some() {
+                ""
+            } else {
+                cpp.line(l)
+            };
             o.raw("cpp", &location(path, l, text));
         }
         None => o.raw("cpp", "null"),
