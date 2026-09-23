@@ -1155,10 +1155,50 @@ fn mask_annotations(src: &str) -> String {
     static TA: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"\b(?:__)?TA_[A-Z_]+\b(?:\s*\((?:[^()]|\([^()]*\))*\))?").unwrap()
     });
-    TA.replace_all(src, |c: &regex::Captures| {
+    let masked = TA.replace_all(src, |c: &regex::Captures| {
         c[0].chars()
             .map(|ch| if ch == '\n' { '\n' } else { ' ' })
             .collect::<String>()
-    })
-    .into_owned()
+    });
+    rewrite_init_captures(&masked)
+}
+
+/// Rewrites lambda init-captures written with braces, `[x{a.begin()}]`, as
+/// `[x=a.begin() ]`, which tree-sitter-cpp parses. Without this, a function
+/// holding such a lambda swallows the rest of the file. Lengths and line
+/// numbers are unchanged.
+fn rewrite_init_captures(src: &str) -> String {
+    static CAPTURES: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\[((?:[^\[\]{}()]|\{[^{}]*\}|\([^()]*\))*)\]\s*(?:\(|mutable\b|\{)").unwrap()
+    });
+    static INIT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\w)\{([^{}]*)\}").unwrap());
+    CAPTURES
+        .replace_all(src, |c: &regex::Captures| {
+            let list = c.get(1).unwrap();
+            if !INIT.is_match(list.as_str()) {
+                return c[0].to_string();
+            }
+            let fixed = INIT.replace_all(list.as_str(), "${1}=${2} ");
+            let start = list.start() - c.get(0).unwrap().start();
+            let end = list.end() - c.get(0).unwrap().start();
+            format!("{}{}{}", &c[0][..start], fixed, &c[0][end..])
+        })
+        .into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn rewrites_brace_init_captures() {
+        let src = "auto f = [this, it{v.begin()}, n{3}](int x) mutable { return x; };";
+        let out = super::rewrite_init_captures(src);
+        assert_eq!(
+            out,
+            "auto f = [this, it=v.begin() , n=3 ](int x) mutable { return x; };"
+        );
+        assert_eq!(out.len(), src.len());
+        // Array subscripts and plain captures are left alone.
+        let plain = "a[i] = b[j]; auto g = [&x](int y) { return y; };";
+        assert_eq!(super::rewrite_init_captures(plain), plain);
+    }
 }

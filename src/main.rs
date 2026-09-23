@@ -216,7 +216,11 @@ fn run(cli: &Cli) -> Result<usize, String> {
         Some(path) => {
             std::fs::write(path, text).map_err(|e| format!("writing {}: {e}", path.display()))?
         }
-        None => print!("{text}"),
+        // A closed pipe (`babeldiff ... | head`) is not an error.
+        None => {
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(text.as_bytes());
+        }
     }
     Ok(report.issues())
 }
