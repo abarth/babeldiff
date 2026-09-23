@@ -7,7 +7,7 @@ use crate::input::{ChangeSet, Version};
 use crate::model::{Function, Lang};
 use crate::normalize;
 use crate::patch;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -259,5 +259,48 @@ impl CppFinder for RepoFinder {
         }
         attach_decl_comments(&mut out, &decls, &Default::default());
         out
+    }
+
+    fn still_present(&mut self, lines: &[String], changed: &[String]) -> HashSet<String> {
+        let mut found = HashSet::new();
+        // Search the top-level directory of the changed files, as `find`
+        // does.
+        let top = changed
+            .first()
+            .and_then(|p| p.split_once('/'))
+            .map(|(t, _)| format!("{t}/"))
+            .unwrap_or_default();
+        let prefix = format!("{}:", self.rev);
+        for chunk in lines.chunks(200) {
+            let mut args: Vec<String> = vec!["grep".into(), "-F".into(), "-I".into()];
+            for l in chunk {
+                args.push("-e".into());
+                args.push(l.clone());
+            }
+            args.push(self.rev.clone());
+            args.push("--".into());
+            for ext in ["cc", "cpp", "h", "hpp"] {
+                args.push(format!(":(glob){top}**/*.{ext}"));
+            }
+            let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+            let Ok(out) = self.git.run(&argv) else {
+                continue;
+            };
+            for l in out.lines() {
+                let rest = l.strip_prefix(&prefix).unwrap_or(l);
+                let Some((path, text)) = rest.split_once(':') else {
+                    continue;
+                };
+                if changed.iter().any(|c| c == path) {
+                    continue;
+                }
+                for want in chunk {
+                    if text.contains(want.as_str()) {
+                        found.insert(want.clone());
+                    }
+                }
+            }
+        }
+        found
     }
 }

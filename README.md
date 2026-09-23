@@ -152,6 +152,7 @@ checks:
 | `assert` | Assertions. A dropped assert is an issue. |
 | `trace` | Trace and debug printing. A dropped trace is an issue. |
 | `order` | The same step at a different position. |
+| `atomic` | Memory ordering of atomic operations. A Rust ordering weaker than the C++ one (which is `seq_cst` when unstated) is an issue. |
 
 `tests/fixtures/fifo/expected.txt` is a complete example; its Rust contains
 four planted mistakes (a different error code, a rollback replaced by `?`, a
@@ -253,8 +254,10 @@ on narrow screens, and prints cleanly.
    delete is still compared, and C++ still unpaired is matched with an
    untouched Rust function of the same name. Doc comments on C++
    declarations in headers are attached to the definitions, since that is
-   where Rust doc comments come from; a comment that is still in the C++
-   after the change is not reported as lost.
+   where Rust doc comments come from (an override without one takes its base
+   class's). A comment that is still in the C++ after the change, in a
+   changed file or word for word in one the change did not touch, is not
+   reported as lost.
 4. **Alignment.** Units are aligned with an order-preserving weighted LCS over
    unit similarity. Units left between two aligned rows are then lined up by
    position when each side has as many of a kind, so a renamed condition or

@@ -3,9 +3,9 @@
 
 use crate::align::{self, Pair};
 use crate::check::{self, Finding, Row, Severity, Summary};
-use crate::model::{Function, UnitKind};
+use crate::model::{Function, Unit, UnitKind};
 use crate::normalize::{self, seq_similarity};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// How a pair was found.
 #[derive(Clone, Debug, PartialEq)]
@@ -173,6 +173,8 @@ pub struct Inputs {
     /// `cpp_*` helpers in the C++ after the change, which Rust calls back
     /// into.
     pub cpp_helpers: Vec<Function>,
+    /// Every C++ file the change touched.
+    pub cpp_changed_paths: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -196,6 +198,12 @@ impl Default for Options {
 /// Rust function. Implemented by the git layer.
 pub trait CppFinder {
     fn find(&mut self, rust: &Function) -> Vec<Function>;
+
+    /// Which of `lines` (trimmed source text) are still in C++ files the
+    /// change did not touch (`changed`).
+    fn still_present(&mut self, _lines: &[String], _changed: &[String]) -> HashSet<String> {
+        HashSet::new()
+    }
 }
 
 /// A finder that finds nothing.
@@ -462,7 +470,10 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
         cpp_bases,
         cpp_changes,
         cpp_helpers,
+        cpp_changed_paths,
     } = inputs;
+    let mut cpp = cpp;
+    mark_comments_in_untouched_cpp(&mut cpp, &cpp_changed_paths, finder);
     let mut report = Report {
         cpp_changes,
         ..Report::default()
@@ -1236,4 +1247,75 @@ fn merge_override_summaries(s: &mut Summary, rust: &Function, ovs: &[OverrideRep
     }
     s.flow
         .retain(|(name, a, _)| !(*name == "switch" && *a == 0));
+}
+
+/// The text of a comment line without its markers, if it is long enough to
+/// be distinctive.
+fn comment_line_text(l: &str) -> Option<String> {
+    let t = l.trim();
+    let t = ["///", "//!", "//", "/**", "/*", "*/", "*"]
+        .iter()
+        .find_map(|m| t.strip_prefix(m))
+        .unwrap_or(t)
+        .trim_end_matches("*/")
+        .trim();
+    (t.len() >= 16).then(|| t.to_string())
+}
+
+/// Marks C++ doc comments that are still, word for word, in C++ the change
+/// didn't touch (usually the declaration's comment in an unchanged header):
+/// not carrying them into Rust loses nothing.
+fn mark_comments_in_untouched_cpp(
+    cpp: &mut [Function],
+    changed: &[String],
+    finder: &mut dyn CppFinder,
+) {
+    let lines_of = |f: &Function, u: &Unit| -> Vec<String> {
+        let raw: Vec<&str> = if u.file.is_some() {
+            u.ext_lines.iter().map(String::as_str).collect()
+        } else {
+            (u.start_line..=u.end_line).map(|l| f.line(l)).collect()
+        };
+        raw.into_iter().filter_map(comment_line_text).collect()
+    };
+    let leading = |f: &Function| {
+        f.units
+            .iter()
+            .take_while(|u| u.kind != UnitKind::Signature)
+            .count()
+    };
+    let mut wanted: Vec<String> = Vec::new();
+    for f in cpp.iter() {
+        for u in &f.units[..leading(f)] {
+            if u.kind == UnitKind::Comment && !u.features.still_in_cpp {
+                wanted.extend(lines_of(f, u));
+            }
+        }
+    }
+    wanted.sort();
+    wanted.dedup();
+    if wanted.is_empty() {
+        return;
+    }
+    let found = finder.still_present(&wanted, changed);
+    if found.is_empty() {
+        return;
+    }
+    for f in cpp.iter_mut() {
+        let n = leading(f);
+        let marks: Vec<bool> = f.units[..n]
+            .iter()
+            .map(|u| {
+                let ls = lines_of(f, u);
+                u.kind == UnitKind::Comment
+                    && ls.iter().map(String::len).sum::<usize>() >= 30
+                    && ls.iter().all(|l| found.contains(l))
+            })
+            .collect();
+        for (u, m) in f.units.iter_mut().zip(marks) {
+            if m {
+                u.features.still_in_cpp = true;
+            }
+        }
+    }
 }
