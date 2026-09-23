@@ -1,4 +1,5 @@
 babeldiff: 4 pairs, 7 issues, 1 note; 0 C++ and 0 Rust functions unpaired
+issues by kind: error-path 3, order 2, comment 1, control-flow 1
 legend: = same  ~ note  ! issue  < only in C++  > only in Rust
 
 ==== FifoDispatcher::WriteFromUser  <->  FifoDispatcher::write_from_user
@@ -37,6 +38,7 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
 ==== FifoDispatcher::WriteSelfLocked  <->  FifoDispatcher::write_self_locked
   C++   zircon/kernel/object/fifo_dispatcher.cc:25-82
   Rust  zircon/kernel/object/fifo_dispatcher.rs:31-87
+  why   same class and method name
   similarity 0.92, 3 issues, 1 note
 
     25 zx_status_t FifoDispatcher::WriteSelfLocked(size_t elem_size, user_in_p… =     31 fn write_self_locked(
@@ -169,6 +171,7 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
 ==== FifoDispatcher::IsFullLocked  <->  FifoDispatcher::is_full_locked
   C++   zircon/kernel/object/fifo_dispatcher.cc:141-141  (not changed by this diff)
   Rust  zircon/kernel/object/fifo_dispatcher.rs:155-158
+  why   found in the repository, not in the change (score 0.98)
   note  C++ lines marked * are the declaration's comment in zircon/kernel/object/include/object/fifo_dispatcher.h
   similarity 0.98, 0 issues, 0 notes
 

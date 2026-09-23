@@ -24,6 +24,11 @@ pub fn render_json(report: &Report, title: &str) -> String {
     s.num("notes", report.notes() as f64);
     s.num("unpaired_cpp", report.unmatched_cpp.len() as f64);
     s.num("unpaired_rust", report.unmatched_rust.len() as f64);
+    let mut by = Obj::new();
+    for (c, n) in crate::analyze::issues_by_category(report) {
+        by.num(c.name(), n as f64);
+    }
+    s.raw("issues_by_category", &by.finish());
     o.raw("summary", &s.finish());
     let pairs: Vec<String> = report.pairs.iter().map(pair).collect();
     o.raw("pairs", &array(&pairs));

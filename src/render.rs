@@ -51,6 +51,14 @@ pub fn render(report: &Report, opts: &RenderOptions) -> String {
         report.unmatched_rust.len(),
         plural(report.unmatched_rust.len()),
     );
+    let by_cat = crate::analyze::issues_by_category(report);
+    if !by_cat.is_empty() {
+        let parts: Vec<String> = by_cat
+            .iter()
+            .map(|(c, n)| format!("{} {n}", c.name()))
+            .collect();
+        let _ = writeln!(out, "issues by kind: {}", parts.join(", "));
+    }
     let _ = writeln!(
         out,
         "legend: = same  ~ note  ! issue  < only in C++  > only in Rust"
@@ -91,6 +99,15 @@ pub fn render(report: &Report, opts: &RenderOptions) -> String {
             match &s.target {
                 Some(t) => {
                     let _ = writeln!(out, "  {} -> {}  {}", s.shim.name, t, s.shim.location());
+                }
+                None if !s.ambiguous.is_empty() => {
+                    let _ = writeln!(
+                        out,
+                        "  {} -> ambiguous: {}  {}  (pass --pair CPP=RUST to choose)",
+                        s.shim.name,
+                        s.ambiguous.join(" or "),
+                        s.shim.location()
+                    );
                 }
                 None => {
                     let _ = writeln!(out, "  {}  {}", s.shim.name, s.shim.location());
@@ -135,6 +152,9 @@ fn render_pair(out: &mut String, p: &PairReport, opts: &RenderOptions) {
         }
         Link::Forced => {
             let _ = writeln!(out, "  via   --pair");
+        }
+        Link::Similarity if !p.rationale.is_empty() => {
+            let _ = writeln!(out, "  why   {}", p.rationale);
         }
         Link::Similarity => {}
     }

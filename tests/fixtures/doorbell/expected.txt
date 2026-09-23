@@ -1,9 +1,11 @@
 babeldiff: 7 pairs, 4 issues, 5 notes; 0 C++ and 0 Rust functions unpaired
+issues by kind: comment 1, error-path 1, control-flow 1, trace 1
 legend: = same  ~ note  ! issue  < only in C++  > only in Rust
 
 ==== sys_doorbell_ring  <->  sys_doorbell_ring
   C++   zircon/kernel/lib/syscalls/doorbell.cc:17-36
   Rust  zircon/kernel/lib/syscalls/doorbell.rs:19-32
+  why   same class and method name
   similarity 0.79, 0 issues, 1 note
 
 < C     17  // zx_status_t zx_doorbell_ring
@@ -46,6 +48,7 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
 ==== sys_doorbell_create  <->  sys_doorbell_create
   C++   zircon/kernel/lib/syscalls/doorbell.cc:38-52
   Rust  zircon/kernel/lib/syscalls/doorbell.rs:34-42
+  why   same class and method name
   similarity 0.73, 0 issues, 2 notes
 
 < C     38  // zx_status_t zx_doorbell_create
@@ -107,6 +110,7 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
 ==== DoorbellDispatcher::RecordRingLocked  <->  DoorbellDispatcher::record_ring_locked
   C++   zircon/kernel/object/doorbell_dispatcher.cc:28-31
   Rust  zircon/kernel/object/doorbell_dispatcher.rs:53-56
+  why   same class and method name
   similarity 1.00, 0 issues, 0 notes
 
 = C     28  void DoorbellDispatcher::RecordRingLocked() {

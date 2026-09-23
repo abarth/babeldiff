@@ -80,6 +80,19 @@ impl PairReport {
     }
 }
 
+/// Issue counts by category, most first.
+pub fn issues_by_category(report: &Report) -> Vec<(check::Category, usize)> {
+    let mut counts: HashMap<check::Category, usize> = HashMap::new();
+    for f in report.pairs.iter().flat_map(PairReport::all_findings) {
+        if f.severity == Severity::Issue {
+            *counts.entry(f.category).or_default() += 1;
+        }
+    }
+    let mut v: Vec<(check::Category, usize)> = counts.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    v
+}
+
 /// An FFI shim and the Rust function it forwards to.
 #[derive(Clone, Debug)]
 pub struct Shim {
