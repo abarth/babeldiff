@@ -184,6 +184,12 @@ pub fn call(name: &str) -> Option<String> {
     if n.is_empty() || NOISE_CALLS.contains(&n.as_str()) {
         return None;
     }
+    // C's `arch_zero_page()` is Rust's `arch::zero_page()`.
+    if let Some(rest) = n.strip_prefix("arch_") {
+        if !rest.is_empty() {
+            n = rest.to_string();
+        }
+    }
     // Test checks: zxtest's `EXPECT_EQ` and `ASSERT_OK` are Rust's
     // `assert_eq!` and `assert!`.
     if (n.starts_with("expect_") || n.starts_with("assert_")) && n != "assert_held" {
@@ -344,6 +350,17 @@ fn alias(n: &str) -> &str {
         "sub_overflow" | "checked_sub" => "checked_sub",
         "mul_overflow" | "checked_mul" => "checked_mul",
         "adopt_ref" | "make_ref_counted" => "adopt_ref",
+        // Memory barriers.
+        "mb"
+        | "rmb"
+        | "wmb"
+        | "smp_mb"
+        | "smp_rmb"
+        | "smp_wmb"
+        | "fence"
+        | "compiler_fence"
+        | "atomic_thread_fence"
+        | "atomic_signal_fence" => "fence",
         "release" | "unlock" | "drop" => "release",
         other => other,
     }

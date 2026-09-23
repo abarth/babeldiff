@@ -55,8 +55,16 @@ pub fn is_handled_vs_propagated(a: &Unit, b: &Unit) -> bool {
     (handled(a) && propagated(b)) || (propagated(a) && handled(b))
 }
 
+/// C++ `return Foo();` passing a status on, against Rust's `foo()?;`.
+fn is_return_vs_propagated(a: &Unit, b: &Unit) -> bool {
+    let ret =
+        |u: &Unit| u.kind == UnitKind::Return && u.features.ret == Some(crate::model::Ret::Status);
+    let prop = |u: &Unit| u.kind == UnitKind::Stmt && u.features.propagates;
+    (ret(a) && prop(b)) || (prop(a) && ret(b))
+}
+
 pub fn similarity(a: &Unit, b: &Unit) -> f64 {
-    if is_handled_vs_propagated(a, b) {
+    if is_handled_vs_propagated(a, b) || is_return_vs_propagated(a, b) {
         let (fa, fb) = (&a.features, &b.features);
         if fa.calls.is_empty() || fb.calls.is_empty() {
             return 0.0;

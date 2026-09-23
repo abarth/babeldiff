@@ -294,6 +294,9 @@ pub fn build_inputs(cs: &ChangeSet, min_changed: f64) -> Inputs {
             inputs.cpp_bases.entry(k).or_insert(b);
         }
         for f in e.functions {
+            if f.base.starts_with("cpp_") {
+                inputs.cpp_helpers.push(f.clone());
+            }
             inputs
                 .cpp_new_calls
                 .entry(f.name.clone())
