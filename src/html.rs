@@ -350,8 +350,8 @@ fn render_checks(out: &mut String, p: &PairReport) {
 fn render_findings(out: &mut String, i: usize, p: &PairReport) {
     let mut items: Vec<(Severity, usize, String)> = Vec::new();
     for (k, row) in p.rows.iter().enumerate() {
-        for (sev, msg) in &row.notes {
-            items.push((*sev, k, msg.clone()));
+        for n in &row.notes {
+            items.push((n.severity, k, n.message.clone()));
         }
     }
     if items.is_empty() {
@@ -488,7 +488,7 @@ impl<'a> Side<'a> {
 }
 
 fn row_class(row: &Row, inherited: Option<Severity>) -> &'static str {
-    let worst = row.notes.iter().map(|n| n.0).min().or(inherited);
+    let worst = row.notes.iter().map(|n| n.severity).min().or(inherited);
     match (row.marker, worst) {
         (Marker::Same, _) => "same",
         (Marker::CppOnly, Some(Severity::Issue)) => "conly bad",
@@ -560,7 +560,7 @@ fn render_code(out: &mut String, i: usize, p: &PairReport) {
                 Marker::CppOnly | Marker::RustOnly => row
                     .notes
                     .iter()
-                    .map(|n| n.0)
+                    .map(|n| n.severity)
                     .min()
                     .or(inherited)
                     .map(|sev| (row.marker, sev)),
@@ -599,8 +599,9 @@ fn render_code(out: &mut String, i: usize, p: &PairReport) {
         );
         if !row.notes.is_empty() {
             html.push_str("<div class=\"notes\">");
-            for (sev, msg) in &row.notes {
-                let (class, icon) = match sev {
+            for n in &row.notes {
+                let msg = &n.message;
+                let (class, icon) = match n.severity {
                     Severity::Issue => ("bad", "!"),
                     Severity::Note => ("warn", "~"),
                 };

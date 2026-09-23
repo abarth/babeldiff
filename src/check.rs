@@ -52,9 +52,82 @@ impl Marker {
     }
 }
 
+/// What a finding is about. Reviewers and agents can filter on it, and each
+/// maps to the part of the porting rubric it checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Category {
+    /// A comment lost, added or reworded.
+    Comment,
+    /// Error codes, error propagation, or success versus failure.
+    ErrorPath,
+    /// Locks taken or released.
+    Lock,
+    /// Branches, loops, returns and other control flow.
+    ControlFlow,
+    /// Calls one side makes and the other doesn't.
+    Call,
+    /// Assertions.
+    Assert,
+    /// Trace and debug printing.
+    Trace,
+    /// The same steps in a different order.
+    Order,
+    /// How the two sides were paired.
+    Pairing,
+}
+
+impl Category {
+    /// Short, stable name for output formats.
+    pub fn name(self) -> &'static str {
+        match self {
+            Category::Comment => "comment",
+            Category::ErrorPath => "error-path",
+            Category::Lock => "lock",
+            Category::ControlFlow => "control-flow",
+            Category::Call => "call",
+            Category::Assert => "assert",
+            Category::Trace => "trace",
+            Category::Order => "order",
+            Category::Pairing => "pairing",
+        }
+    }
+
+    /// The part of Zircon's C++ to Rust porting rubric the finding relates to.
+    pub fn rubric(self) -> &'static str {
+        match self {
+            Category::Comment => "comment parity (rubric 3.15, pitfall 22)",
+            Category::ErrorPath => "behavioral parity of error paths",
+            Category::Lock => "locking parity (rubric 3.4)",
+            Category::ControlFlow | Category::Call | Category::Order => "direct translation",
+            Category::Assert => "assertions (pitfall 23)",
+            Category::Trace => "trace parity (rubric 3.9, pitfall 16)",
+            Category::Pairing => "pairing",
+        }
+    }
+}
+
+/// A finding attached to a row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Note {
+    pub severity: Severity,
+    pub category: Category,
+    pub message: String,
+}
+
+impl Note {
+    pub fn new(severity: Severity, category: Category, message: impl Into<String>) -> Note {
+        Note {
+            severity,
+            category,
+            message: message.into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Finding {
     pub severity: Severity,
+    pub category: Category,
     pub cpp_line: Option<usize>,
     pub rust_line: Option<usize>,
     pub message: String,
@@ -65,13 +138,12 @@ pub struct Row {
     pub cpp: Option<usize>,
     pub rust: Option<usize>,
     pub marker: Marker,
-    pub notes: Vec<(Severity, String)>,
+    pub notes: Vec<Note>,
 }
 
 /// Builds the rows and findings for an aligned pair of functions.
 pub fn check(cpp: &Function, rust: &Function, pairs: &[Pair]) -> (Vec<Row>, Vec<Finding>) {
     let mut rows = Vec::new();
-    let mut findings = Vec::new();
     let unmatched_c: Vec<usize> = pairs
         .iter()
         .filter(|p| p.rust.is_none())
@@ -84,11 +156,11 @@ pub fn check(cpp: &Function, rust: &Function, pairs: &[Pair]) -> (Vec<Row>, Vec<
         .collect();
 
     for p in pairs {
-        let mut notes: Vec<(Severity, String)> = Vec::new();
+        let mut notes: Vec<Note> = Vec::new();
         let marker = match (p.cpp, p.rust) {
             (Some(i), Some(j)) => {
                 compare(&cpp.units[i], &rust.units[j], &mut notes);
-                if notes.iter().any(|(s, _)| *s == Severity::Issue) {
+                if notes.iter().any(|n| n.severity == Severity::Issue) {
                     Marker::Issue
                 } else if notes.is_empty() {
                     Marker::Same
@@ -100,15 +172,22 @@ pub fn check(cpp: &Function, rust: &Function, pairs: &[Pair]) -> (Vec<Row>, Vec<
                 let u = &cpp.units[i];
                 let moved =
                     find_moved(u, &rust.units, &unmatched_r).map(|j| rust.units[j].start_line);
-                notes.push(only_in(u, "C++", "Rust", moved));
+                if !u.features.plumbing {
+                    notes.push(only_in(u, "C++", "Rust", moved));
+                }
                 Marker::CppOnly
             }
             (None, Some(j)) => {
                 let u = &rust.units[j];
                 let moved =
                     find_moved(u, &cpp.units, &unmatched_c).map(|i| cpp.units[i].start_line);
-                // Safety comments are expected additions, not findings.
-                if !(u.kind == UnitKind::Comment && u.features.safety || u.features.lock_plumbing) {
+                // Safety comments and plumbing are expected additions, not
+                // findings.
+                let expected = u.kind == UnitKind::Comment && u.features.safety
+                    || u.features.lock_plumbing
+                    || u.features.plumbing
+                    || (new_doc(rust, j) && !has_doc(cpp));
+                if !expected {
                     notes.push(only_in(u, "Rust", "C++", moved));
                 }
                 Marker::RustOnly
@@ -123,23 +202,58 @@ pub fn check(cpp: &Function, rust: &Function, pairs: &[Pair]) -> (Vec<Row>, Vec<
         });
     }
     group_runs(&mut rows, cpp, rust);
-    for r in &rows {
-        for (sev, msg) in &r.notes {
+    let findings = findings_of(&rows, cpp, rust);
+    (rows, findings)
+}
+
+/// Whether the unit at `j` is part of the function's leading doc comment.
+fn new_doc(f: &Function, j: usize) -> bool {
+    f.units[j].kind == UnitKind::Comment
+        && f.units[j + 1..]
+            .iter()
+            .find(|u| u.kind != UnitKind::Comment)
+            .is_some_and(|u| u.kind == UnitKind::Signature)
+}
+
+/// Whether a function has a leading comment, on its definition or on its
+/// declaration.
+fn has_doc(f: &Function) -> bool {
+    f.units
+        .iter()
+        .take_while(|u| u.kind != UnitKind::Signature)
+        .any(|u| u.kind == UnitKind::Comment)
+}
+
+/// The findings of a list of rows, in row order.
+pub fn findings_of(rows: &[Row], cpp: &Function, rust: &Function) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for r in rows {
+        for n in &r.notes {
             findings.push(Finding {
-                severity: *sev,
+                severity: n.severity,
+                category: n.category,
                 cpp_line: r.cpp.map(|i| cpp.units[i].start_line),
                 rust_line: r.rust.map(|j| rust.units[j].start_line),
-                message: msg.clone(),
+                message: n.message.clone(),
             });
         }
     }
-    (rows, findings)
+    findings
 }
 
 /// Collapses runs of three or more consecutive one-sided rows into a single
 /// note on the first row, so a block of code with no counterpart reads as
-/// one finding rather than one per statement.
+/// one finding rather than one per statement. Comments are left out of the
+/// runs: each lost comment is its own finding, because it is what a
+/// reviewer has to carry over.
 fn group_runs(rows: &mut [Row], cpp: &Function, rust: &Function) {
+    let unit = |r: &Row, m: Marker| -> Option<&Unit> {
+        if m == Marker::CppOnly {
+            r.cpp.map(|k| &cpp.units[k])
+        } else {
+            r.rust.map(|k| &rust.units[k])
+        }
+    };
     let mut i = 0;
     while i < rows.len() {
         let m = rows[i].marker;
@@ -152,20 +266,24 @@ fn group_runs(rows: &mut [Row], cpp: &Function, rust: &Function) {
             j += 1;
         }
         // Rows with no note (expected additions such as safety comments)
-        // stay in the run but don't count toward it.
-        let noted: Vec<usize> = (i..j).filter(|&k| !rows[k].notes.is_empty()).collect();
+        // stay in the run but don't count toward it, and neither do
+        // comments or trace-only statements, which are reported alone.
+        let noted: Vec<usize> = (i..j)
+            .filter(|&k| {
+                !rows[k].notes.is_empty()
+                    && rows[k]
+                        .notes
+                        .iter()
+                        .all(|n| !matches!(n.category, Category::Comment | Category::Trace))
+            })
+            .collect();
         if noted.len() >= 3 {
-            let (f, side, other) = if m == Marker::CppOnly {
-                (cpp, "C++", "Rust")
+            let (side, other) = if m == Marker::CppOnly {
+                ("C++", "Rust")
             } else {
-                (rust, "Rust", "C++")
+                ("Rust", "C++")
             };
-            let units: Vec<&Unit> = noted
-                .iter()
-                .map(|&k| &rows[k])
-                .filter_map(|r| if m == Marker::CppOnly { r.cpp } else { r.rust })
-                .map(|k| &f.units[k])
-                .collect();
+            let units: Vec<&Unit> = noted.iter().filter_map(|&k| unit(&rows[k], m)).collect();
             let mut counts: Vec<(&'static str, usize)> = Vec::new();
             for u in &units {
                 let name = match u.kind {
@@ -177,11 +295,12 @@ fn group_runs(rows: &mut [Row], cpp: &Function, rust: &Function) {
                     None => counts.push((name, 1)),
                 }
             }
-            let sev = rows[i..j]
+            let worst = noted
                 .iter()
-                .flat_map(|r| r.notes.iter().map(|n| n.0))
-                .min()
-                .unwrap_or(Severity::Note);
+                .flat_map(|&k| rows[k].notes.iter())
+                .min_by_key(|n| (n.severity, n.category))
+                .map(|n| (n.severity, n.category))
+                .unwrap_or((Severity::Note, Category::ControlFlow));
             let first = units.first().map_or(0, |u| u.start_line);
             let last = units.last().map_or(0, |u| u.end_line);
             let what: Vec<String> = counts.iter().map(|(n, c)| format!("{c} {n}")).collect();
@@ -190,20 +309,34 @@ fn group_runs(rows: &mut [Row], cpp: &Function, rust: &Function) {
             } else {
                 format!("lines {first}-{last}")
             };
-            let msg = format!(
+            // Keep what each statement did: the calls and errors are what a
+            // reviewer checks for.
+            let mut did: Vec<String> = Vec::new();
+            for u in &units {
+                for c in u.features.calls.iter().chain(u.features.errors.iter()) {
+                    if !did.contains(c) {
+                        did.push(c.clone());
+                    }
+                }
+            }
+            let mut msg = format!(
                 "{span} only in {side}, with no {other} counterpart: {}",
                 what.join(", ")
             );
-            for r in &mut rows[i..j] {
-                r.notes.clear();
+            if !did.is_empty() {
+                did.truncate(8);
+                msg.push_str(&format!(" ({})", did.join(", ")));
             }
-            rows[noted[0]].notes.push((sev, msg));
+            for &k in &noted {
+                rows[k].notes.clear();
+            }
+            rows[noted[0]].notes.push(Note::new(worst.0, worst.1, msg));
         }
         i = j;
     }
 }
 
-fn find_moved(u: &Unit, others: &[Unit], candidates: &[usize]) -> Option<usize> {
+pub(crate) fn find_moved(u: &Unit, others: &[Unit], candidates: &[usize]) -> Option<usize> {
     let trivial = u.kind != UnitKind::Comment
         && u.features.calls.is_empty()
         && u.features.errors.is_empty()
@@ -219,21 +352,33 @@ fn find_moved(u: &Unit, others: &[Unit], candidates: &[usize]) -> Option<usize> 
         .map(|(j, _)| j)
 }
 
-/// A statement that only traces, prints or asserts.
-fn diagnostic_only(f: &crate::model::Features) -> bool {
-    f.calls
-        .iter()
-        .any(|c| matches!(c.as_str(), "trace" | "print" | "assert"))
+/// A statement that only traces or prints.
+fn trace_only(f: &crate::model::Features) -> bool {
+    !f.calls.is_empty()
+        && f
+            .calls
+            .iter()
+            .all(|c| matches!(c.as_str(), "trace" | "print"))
         && f.locks.is_empty()
         && f.errors.is_empty()
         && !f.propagates
         && !f.unlocks
 }
 
-fn only_in(u: &Unit, here: &str, there: &str, moved: Option<usize>) -> (Severity, String) {
+/// A statement that only asserts.
+fn assert_only(f: &crate::model::Features) -> bool {
+    f.calls.iter().any(|c| c == "assert")
+        && f.locks.is_empty()
+        && f.errors.is_empty()
+        && !f.propagates
+        && !f.unlocks
+}
+
+fn only_in(u: &Unit, here: &str, there: &str, moved: Option<usize>) -> Note {
     let f = &u.features;
     let what = match u.kind {
         UnitKind::Comment => "comment".to_string(),
+        UnitKind::Stmt if trace_only(f) => "trace/print statement".to_string(),
         UnitKind::Stmt => {
             let mut parts = Vec::new();
             if !f.locks.is_empty() {
@@ -260,26 +405,44 @@ fn only_in(u: &Unit, here: &str, there: &str, moved: Option<usize>) -> (Severity
         },
         k => k.name().to_string(),
     };
-    let significant = match u.kind {
+    let from_cpp = here == "C++";
+    let (significant, category) = match u.kind {
         // A comment lost in translation matters; an added one is worth a look.
-        UnitKind::Comment => here == "C++",
+        UnitKind::Comment => (from_cpp, Category::Comment),
         // Returning a plain value (often a tail expression) is how Rust ends
         // constructors and accessors; success and error returns still count.
-        UnitKind::Return => !matches!(f.ret, Some(Ret::Value) | None),
-        UnitKind::Stmt if diagnostic_only(f) => {
-            // Tracing differs freely between the two; a check the Rust adds
-            // is worth a look, but a check the Rust drops is an issue.
-            here == "C++" && f.calls.iter().any(|c| c == "assert")
-        }
+        UnitKind::Return => (
+            !matches!(f.ret, Some(Ret::Value) | None),
+            if matches!(f.ret, Some(Ret::Error(_)) | Some(Ret::Status)) {
+                Category::ErrorPath
+            } else {
+                Category::ControlFlow
+            },
+        ),
+        // The rubric asks for every trace statement to be ported; one the
+        // Rust adds is worth a look.
+        UnitKind::Stmt if trace_only(f) => (from_cpp, Category::Trace),
+        // A check the Rust adds is worth a look, but one it drops is an issue.
+        UnitKind::Stmt if assert_only(f) => (from_cpp, Category::Assert),
         UnitKind::Stmt => {
-            !f.calls.is_empty()
-                || !f.locks.is_empty()
-                || !f.errors.is_empty()
-                || f.propagates
-                || f.unlocks
+            let cat = if !f.locks.is_empty() || f.unlocks {
+                Category::Lock
+            } else if !f.errors.is_empty() || f.propagates {
+                Category::ErrorPath
+            } else {
+                Category::Call
+            };
+            (
+                !f.calls.is_empty()
+                    || !f.locks.is_empty()
+                    || !f.errors.is_empty()
+                    || f.propagates
+                    || f.unlocks,
+                cat,
+            )
         }
-        UnitKind::Signature => false,
-        _ => true,
+        UnitKind::Signature => (false, Category::ControlFlow),
+        _ => (true, Category::ControlFlow),
     };
     let sev = if significant {
         Severity::Issue
@@ -287,15 +450,19 @@ fn only_in(u: &Unit, here: &str, there: &str, moved: Option<usize>) -> (Severity
         Severity::Note
     };
     let mut msg = format!("{what} only in {here}");
+    let mut category = category;
     if let Some(line) = moved {
         msg.push_str(&format!(
             "; resembles {there} line {line}, so the order may differ"
         ));
+        if category != Category::Comment {
+            category = Category::Order;
+        }
     }
-    (sev, msg)
+    Note::new(sev, category, msg)
 }
 
-fn compare(a: &Unit, b: &Unit, notes: &mut Vec<(Severity, String)>) {
+fn compare(a: &Unit, b: &Unit, notes: &mut Vec<Note>) {
     let fa = &a.features;
     let fb = &b.features;
     if crate::align::is_handled_vs_propagated(a, b) {
@@ -304,25 +471,31 @@ fn compare(a: &Unit, b: &Unit, notes: &mut Vec<(Severity, String)>) {
         } else {
             "C++ handles this call's error in its own branch, but Rust propagates it"
         };
-        notes.push((Severity::Issue, msg.to_string()));
+        notes.push(Note::new(Severity::Issue, Category::ErrorPath, msg));
         return;
     }
-    if a.kind != b.kind {
-        notes.push((
+    if a.kind != b.kind && !equivalent_kinds(a.kind, b.kind) {
+        notes.push(Note::new(
             Severity::Note,
+            Category::ControlFlow,
             format!("C++ {} vs Rust {}", a.kind.name(), b.kind.name()),
         ));
     }
     if a.kind == UnitKind::Comment {
         if fa.comment != fb.comment {
-            notes.push((Severity::Note, comment_diff(&fa.comment, &fb.comment)));
+            notes.push(Note::new(
+                Severity::Note,
+                Category::Comment,
+                comment_diff(&fa.comment, &fb.comment),
+            ));
         }
         return;
     }
     match (&fa.ret, &fb.ret) {
         (Some(Ret::Error(x)), Some(Ret::Error(y))) if x != y => {
-            notes.push((
+            notes.push(Note::new(
                 Severity::Issue,
+                Category::ErrorPath,
                 format!("error code differs: C++ returns {x}, Rust returns {y}"),
             ));
         }
@@ -341,15 +514,20 @@ fn compare(a: &Unit, b: &Unit, notes: &mut Vec<(Severity, String)>) {
             } else {
                 Severity::Note
             };
-            notes.push((sev, format!("C++ returns {ra}, Rust returns {rb}")));
+            notes.push(Note::new(
+                sev,
+                Category::ErrorPath,
+                format!("C++ returns {ra}, Rust returns {rb}"),
+            ));
         }
         _ => {}
     }
     if fa.ret.is_none() || fb.ret.is_none() {
         let (ea, eb) = (sorted(&fa.errors), sorted(&fb.errors));
         if ea != eb {
-            notes.push((
+            notes.push(Note::new(
                 Severity::Issue,
+                Category::ErrorPath,
                 format!(
                     "error codes differ: C++ [{}], Rust [{}]",
                     ea.join(", "),
@@ -359,8 +537,9 @@ fn compare(a: &Unit, b: &Unit, notes: &mut Vec<(Severity, String)>) {
         }
     }
     if fa.locks != fb.locks {
-        notes.push((
+        notes.push(Note::new(
             Severity::Issue,
+            Category::Lock,
             format!(
                 "locks differ: C++ acquires [{}], Rust acquires [{}]",
                 fa.locks.join(", "),
@@ -368,32 +547,50 @@ fn compare(a: &Unit, b: &Unit, notes: &mut Vec<(Severity, String)>) {
             ),
         ));
     }
-    if fa.propagates != fb.propagates {
+    if fa.propagates != fb.propagates && !propagation_is_implied(a, b) {
         let (who, other) = if fa.propagates {
             ("C++", "Rust")
         } else {
             ("Rust", "C++")
         };
-        notes.push((
+        notes.push(Note::new(
             Severity::Issue,
+            Category::ErrorPath,
             format!("{who} propagates an error here but {other} does not"),
         ));
     }
     if fa.unlocks != fb.unlocks {
         let who = if fa.unlocks { "C++" } else { "Rust" };
-        notes.push((Severity::Note, format!("only {who} releases a lock here")));
+        notes.push(Note::new(
+            Severity::Note,
+            Category::Lock,
+            format!("only {who} releases a lock here"),
+        ));
     }
     if fa.asserts != fb.asserts {
         let who = if fa.asserts { "C++" } else { "Rust" };
-        notes.push((Severity::Note, format!("only {who} asserts here")));
+        notes.push(Note::new(
+            if fa.asserts {
+                Severity::Issue
+            } else {
+                Severity::Note
+            },
+            Category::Assert,
+            format!("only {who} asserts here"),
+        ));
+    }
+    if matches!(a.kind, UnitKind::If | UnitKind::ElseIf)
+        && matches!(b.kind, UnitKind::If | UnitKind::ElseIf)
+    {
+        condition_diff(fa, fb, notes);
     }
     let only_a: Vec<&String> = uniq(&fa.calls)
         .into_iter()
-        .filter(|c| !fb.calls.contains(c))
+        .filter(|c| !fb.calls.contains(c) && !name_matches(c, fb))
         .collect();
     let only_b: Vec<&String> = uniq(&fb.calls)
         .into_iter()
-        .filter(|c| !fa.calls.contains(c))
+        .filter(|c| !fa.calls.contains(c) && !name_matches(c, fa))
         .collect();
     if !only_a.is_empty() || !only_b.is_empty() {
         let mut parts = Vec::new();
@@ -403,10 +600,75 @@ fn compare(a: &Unit, b: &Unit, notes: &mut Vec<(Severity, String)>) {
         if !only_b.is_empty() {
             parts.push(format!("only Rust calls {}", join(&only_b)));
         }
-        notes.push((Severity::Note, parts.join("; ")));
+        notes.push(Note::new(Severity::Note, Category::Call, parts.join("; ")));
     }
 }
 
+/// Kinds that are the same step spelled differently: a C++ `if` that
+/// returns early and Rust's `let ... else`, or `else { if }` and `else if`.
+fn equivalent_kinds(a: UnitKind, b: UnitKind) -> bool {
+    matches!(
+        (a, b),
+        (UnitKind::If, UnitKind::ElseIf) | (UnitKind::ElseIf, UnitKind::If)
+    )
+}
+
+/// Whether a call on one side is a field or accessor on the other: C++
+/// `allocation()` and Rust `self.allocation`, or `set_key(k)` and `key_ = k`.
+fn name_matches(call: &str, other: &crate::model::Features) -> bool {
+    let bare = call
+        .strip_prefix("set_")
+        .or_else(|| call.strip_prefix("get_"))
+        .unwrap_or(call);
+    other.names.iter().any(|n| n == bare) || other.idents.iter().any(|n| n == bare)
+}
+
+/// One side propagates with `?` where the other returns the status it
+/// checked in the same unit, which is the same thing.
+fn propagation_is_implied(a: &Unit, b: &Unit) -> bool {
+    let returns_status = |u: &Unit| {
+        matches!(u.features.ret, Some(Ret::Status) | Some(Ret::Value)) && !u.features.calls.is_empty()
+    };
+    (a.features.propagates && returns_status(b)) || (b.features.propagates && returns_status(a))
+}
+
+/// Reports rejection conditions one side's `if` tests and the other's
+/// doesn't, conjunct by conjunct.
+fn condition_diff(fa: &crate::model::Features, fb: &crate::model::Features, notes: &mut Vec<Note>) {
+    if fa.conjuncts.is_empty() || fb.conjuncts.is_empty() {
+        return;
+    }
+    let matched = |x: &Vec<String>, ys: &[Vec<String>]| {
+        ys.iter()
+            .any(|y| crate::normalize::jaccard(x, y) >= 0.5 || x.iter().all(|w| y.contains(w)))
+    };
+    let only_a: Vec<String> = fa
+        .conjuncts
+        .iter()
+        .filter(|x| !x.is_empty() && !matched(x, &fb.conjuncts))
+        .map(|x| x.join(" "))
+        .collect();
+    let only_b: Vec<String> = fb
+        .conjuncts
+        .iter()
+        .filter(|x| !x.is_empty() && !matched(x, &fa.conjuncts))
+        .map(|x| x.join(" "))
+        .collect();
+    if !only_b.is_empty() {
+        notes.push(Note::new(
+            Severity::Issue,
+            Category::ControlFlow,
+            format!("Rust's condition adds a test of [{}]", only_b.join("; ")),
+        ));
+    }
+    if !only_a.is_empty() {
+        notes.push(Note::new(
+            Severity::Issue,
+            Category::ControlFlow,
+            format!("C++'s condition also tests [{}], which Rust's doesn't", only_a.join("; ")),
+        ));
+    }
+}
 fn sorted(v: &[String]) -> Vec<String> {
     let mut v = v.to_vec();
     v.sort();

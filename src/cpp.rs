@@ -593,6 +593,9 @@ impl<'a> Ctx<'a> {
             Some(c) => self.features(c, &[]),
             None => Features::default(),
         };
+        if let Some(c) = cond {
+            self.conjuncts(c, &mut f.conjuncts);
+        }
         let kind = if is_else_if {
             UnitKind::ElseIf
         } else {
@@ -652,6 +655,34 @@ impl<'a> Ctx<'a> {
                 None => {}
             }
         }
+    }
+
+    /// The names each top-level `&&` or `||` operand of a condition mentions.
+    fn conjuncts(&self, n: Node, out: &mut Vec<Vec<String>>) {
+        let n = match n.kind() {
+            "condition_clause" => match n.child_by_field_name("value") {
+                Some(v) => v,
+                None => return,
+            },
+            _ => n,
+        };
+        let n = strip_parens(n);
+        if n.kind() == "binary_expression" {
+            let op = n
+                .child_by_field_name("operator")
+                .map_or("", |o| self.text(o));
+            if matches!(op, "&&" | "||" | "and" | "or") {
+                if let (Some(l), Some(r)) = (
+                    n.child_by_field_name("left"),
+                    n.child_by_field_name("right"),
+                ) {
+                    self.conjuncts(l, out);
+                    self.conjuncts(r, out);
+                    return;
+                }
+            }
+        }
+        out.push(self.features(n, &[]).names);
     }
 
     /// Whether a unit's source mentions `name` as a whole word.

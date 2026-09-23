@@ -163,6 +163,8 @@ impl FeatureAcc {
             comment: Vec::new(),
             safety: false,
             lock_plumbing: false,
+            plumbing: false,
+            conjuncts: Vec::new(),
         }
     }
 }

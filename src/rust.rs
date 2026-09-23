@@ -475,6 +475,7 @@ impl<'a> Ctx<'a> {
         if let Some(c) = cond {
             let t = self.text(c);
             f.checks_error = t.contains(".is_err()") || t.trim_start().starts_with("let Err");
+            self.conjuncts(c, &mut f.conjuncts);
         }
         let kind = if is_else_if {
             UnitKind::ElseIf
@@ -507,6 +508,42 @@ impl<'a> Ctx<'a> {
                 None => {}
             }
         }
+    }
+
+    /// The names each top-level `&&` or `||` operand of a condition mentions.
+    fn conjuncts(&self, n: Node, out: &mut Vec<Vec<String>>) {
+        let mut n = n;
+        while n.kind() == "parenthesized_expression" {
+            match ts::named_children(n).into_iter().next() {
+                Some(c) => n = c,
+                None => break,
+            }
+        }
+        match n.kind() {
+            "binary_expression" => {
+                let op = n
+                    .child_by_field_name("operator")
+                    .map_or("", |o| self.text(o));
+                if matches!(op, "&&" | "||") {
+                    if let (Some(l), Some(r)) = (
+                        n.child_by_field_name("left"),
+                        n.child_by_field_name("right"),
+                    ) {
+                        self.conjuncts(l, out);
+                        self.conjuncts(r, out);
+                        return;
+                    }
+                }
+            }
+            "let_chain" => {
+                for c in ts::named_children(n) {
+                    self.conjuncts(c, out);
+                }
+                return;
+            }
+            _ => {}
+        }
+        out.push(self.features(n, &[]).names);
     }
 
     /// The `if` in `if ...`, `Err(if ...)` or `Ok(if ...)`.

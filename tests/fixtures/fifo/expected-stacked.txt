@@ -1,4 +1,4 @@
-babeldiff: 4 pairs, 6 issues, 17 notes; 0 C++ and 0 Rust functions unpaired
+babeldiff: 4 pairs, 9 issues, 2 notes; 0 C++ and 0 Rust functions unpaired
 legend: = same  ~ note  ! issue  < only in C++  > only in Rust
 
 ==== FifoDispatcher::WriteFromUser  <->  FifoDispatcher::write_from_user
@@ -6,7 +6,7 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
   Rust  zircon/kernel/object/fifo_dispatcher.rs:13-29
   via   C++ now calls FFI shim rust_fifo_dispatcher_write_from_user  zircon/kernel/object/fifo_dispatcher_ffi.rs:11-30
   note  C++ lines marked * are the declaration's comment in zircon/kernel/object/include/object/fifo_dispatcher.h
-  similarity 0.94, 1 issue, 1 note
+  similarity 0.94, 1 issue, 0 notes
 
 = C    17*  // Writes |count| elements of |elem_size| bytes from |ptr| into the peer.
   R     13  /// Writes `count` elements of `elem_size` bytes from `ptr` into the peer.
@@ -29,9 +29,8 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
 ! C     20      return ZX_ERR_PEER_CLOSED;
   R     26          return Err(Status::BAD_STATE);
         ^ ! error code differs: C++ returns PEER_CLOSED, Rust returns BAD_STATE
-~ C     22    return peer()->WriteSelfLocked(elem_size, ptr, count, actual);
+= C     22    return peer()->WriteSelfLocked(elem_size, ptr, count, actual);
   R     28      peer.write_self_locked(&guard, elem_size, ptr, count)
-        ^ ~ only C++ calls peer
 
   errors   DIFFERENT
            C++:  PEER_CLOSED
@@ -43,12 +42,11 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
   comments 2 C++ comments: 2 identical, 0 reworded, 0 missing in Rust
   findings
     ! fifo_dispatcher.cc:20 | fifo_dispatcher.rs:26  error code differs: C++ returns PEER_CLOSED, Rust returns BAD_STATE
-    ~ fifo_dispatcher.cc:22 | fifo_dispatcher.rs:28  only C++ calls peer
 
 ==== FifoDispatcher::WriteSelfLocked  <->  FifoDispatcher::write_self_locked
   C++   zircon/kernel/object/fifo_dispatcher.cc:25-82
   Rust  zircon/kernel/object/fifo_dispatcher.rs:31-87
-  similarity 0.92, 2 issues, 6 notes
+  similarity 0.92, 3 issues, 1 note
 
 = C     25  zx_status_t FifoDispatcher::WriteSelfLocked(size_t elem_size, user_in_ptr<const uint8_t> ptr,
   C     26                                              size_t count, size_t* actual) {
@@ -69,30 +67,26 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
   R     43      if count == 0 {
 = C     33      return ZX_ERR_OUT_OF_RANGE;
   R     44          return Err(Status::OUT_OF_RANGE);
-~ C     36    uint32_t old_head = head_;
+= C     36    uint32_t old_head = head_;
   R     47      let old_head = guard.head();
-        ^ ~ only Rust calls head
 = C     38    // Total number of available empty slots in the fifo.
   R     49      // Total number of available empty slots in the fifo.
-~ C     39    size_t avail = elem_count_ - (head_ - tail_);
+= C     39    size_t avail = elem_count_ - (head_ - tail_);
   R     50      let avail = (self.elem_count - guard.head().wrapping_sub(guard.tail())) as usize;
-        ^ ~ only Rust calls head, tail
 = C     41    if (avail == 0) {
   R     52      if avail == 0 {
 = C     42      return ZX_ERR_SHOULD_WAIT;
   R     53          return Err(Status::SHOULD_WAIT);
-~ C     45    bool was_empty = (head_ == tail_);
+= C     45    bool was_empty = (head_ == tail_);
   R     56      let was_empty = guard.head() == guard.tail();
-        ^ ~ only Rust calls head, tail
 = C     47    if (count > avail) {
   R     58      if count > avail {
 = C     48      count = avail;
   R     59          count = avail;
 = C     51    while (count > 0) {
   R     62      while count > 0 {
-~ C     52      uint32_t offset = (head_ % elem_count_);
+= C     52      uint32_t offset = (head_ % elem_count_);
   R     63          let offset = guard.head() % self.elem_count;
-        ^ ~ only Rust calls head
 = C     54      // Number of slots from target to end of fifo.
   R     65          // Number of slots from target to end of fifo.
 = C     55      size_t n = (elem_count_ - offset);
@@ -106,12 +100,13 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
   R     71          ptr.copy_array_from_user(self.data_mut(guard, offset, n))?;
         ^ ! C++ handles this call's error in its own branch, but Rust propagates it
 < C     62        // Roll back, in case this is the second copy.
-        ^ ! lines 62-64 only in C++, with no Rust counterpart: 1 comment, 1 statement, 1 return
+        ^ ! comment only in C++
 < C     63        head_ = old_head;
+        ^ ~ statement only in C++
 < C     64        return ZX_ERR_INVALID_ARGS;
-~ C     67      head_ += static_cast<uint32_t>(n);
+        ^ ! return of error INVALID_ARGS only in C++
+= C     67      head_ += static_cast<uint32_t>(n);
   R     73          guard.set_head(guard.head().wrapping_add(n as u32));
-        ^ ~ only Rust calls set_head, head
 = C     68      count -= n;
   R     74          count -= n;
 = C     69      ptr = ptr.byte_offset(n * elem_size_);
@@ -124,10 +119,9 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
   R     82      if self.is_full_locked(guard) {
 = C     77      UpdateStateLocked(ZX_FIFO_WRITABLE, 0u);
   R     83          self.update_state_locked(guard, ZX_FIFO_WRITABLE, 0);
-~ C     80    *actual = (head_ - old_head);
+= C     80    *actual = (head_ - old_head);
   C     81    return ZX_OK;
   R     86      Ok(guard.head().wrapping_sub(old_head) as usize)
-        ^ ~ only Rust calls head
 
   errors   DIFFERENT
            C++:  OUT_OF_RANGE, OUT_OF_RANGE, SHOULD_WAIT, INVALID_ARGS
@@ -137,20 +131,16 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
   comments 3 C++ comments: 2 identical, 0 reworded, 1 missing in Rust
   findings
     ! fifo_dispatcher.cc:60 | fifo_dispatcher.rs:71  C++ handles this call's error in its own branch, but Rust propagates it
-    ! fifo_dispatcher.cc:62 | -  lines 62-64 only in C++, with no Rust counterpart: 1 comment, 1 statement, 1 return
-    ~ fifo_dispatcher.cc:36 | fifo_dispatcher.rs:47  only Rust calls head
-    ~ fifo_dispatcher.cc:39 | fifo_dispatcher.rs:50  only Rust calls head, tail
-    ~ fifo_dispatcher.cc:45 | fifo_dispatcher.rs:56  only Rust calls head, tail
-    ~ fifo_dispatcher.cc:52 | fifo_dispatcher.rs:63  only Rust calls head
-    ~ fifo_dispatcher.cc:67 | fifo_dispatcher.rs:73  only Rust calls set_head, head
-    ~ fifo_dispatcher.cc:80 | fifo_dispatcher.rs:86  only Rust calls head
+    ! fifo_dispatcher.cc:62 | -  comment only in C++
+    ! fifo_dispatcher.cc:64 | -  return of error INVALID_ARGS only in C++
+    ~ fifo_dispatcher.cc:63 | -  statement only in C++
 
 ==== FifoDispatcher::ReadToUser  <->  FifoDispatcher::read_to_user
   C++   zircon/kernel/object/fifo_dispatcher.cc:84-139
   Rust  zircon/kernel/object/fifo_dispatcher.rs:89-153
   via   C++ now calls FFI shim rust_fifo_dispatcher_read_to_user  zircon/kernel/object/fifo_dispatcher_ffi.rs:32-51
   note  C++ lines marked * are the declaration's comment in zircon/kernel/object/include/object/fifo_dispatcher.h
-  similarity 0.93, 3 issues, 9 notes
+  similarity 0.93, 5 issues, 1 note
 
 = C    23*  // Reads up to |count| elements of |elem_size| bytes into |ptr|.
   R     89  /// Reads up to `count` elements of `elem_size` bytes into `ptr`.
@@ -178,9 +168,8 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
         ^ ! statement (acquires lock) only in C++; resembles Rust line 98, so the order may differ
 = C     97    // Total number of available entries to read from the fifo.
   R    107      // Total number of available entries to read from the fifo.
-~ C     98    size_t avail = (head_ - tail_);
+= C     98    size_t avail = (head_ - tail_);
   R    108      let avail = guard.head().wrapping_sub(guard.tail()) as usize;
-        ^ ~ only Rust calls head, tail
 = C    100    if (avail == 0) {
   R    110      if avail == 0 {
 ~ C    101      return peer() ? ZX_ERR_SHOULD_WAIT : ZX_ERR_PEER_CLOSED;
@@ -196,14 +185,12 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
   R    120      if count > avail {
 = C    107      count = avail;
   R    121          count = avail;
-~ C    110    uint32_t old_tail = tail_;
+= C    110    uint32_t old_tail = tail_;
   R    124      let old_tail = guard.tail();
-        ^ ~ only Rust calls tail
 = C    111    while (count > 0) {
   R    125      while count > 0 {
-~ C    112      uint32_t offset = (tail_ % elem_count_);
+= C    112      uint32_t offset = (tail_ % elem_count_);
   R    126          let offset = guard.tail() % self.elem_count;
-        ^ ~ only Rust calls tail
 = C    114      // Number of slots from target to end of fifo.
   R    128          // Number of slots from target to end of fifo.
 = C    115      size_t n = (elem_count_ - offset);
@@ -212,20 +199,18 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
   R    130          if n > count {
 = C    117        n = count;
   R    131              n = count;
-~ C    120      zx_status_t status = ptr.copy_array_to_user(&data_[offset * elem_size_], n * elem_size_);
+! C    120      zx_status_t status = ptr.copy_array_to_user(&data_[offset * elem_size_], n * elem_size_);
   C    121      if (status != ZX_OK) {
   R    134          if ptr.copy_array_to_user(self.data(&guard, offset, n)).is_err() {
-        ^ ~ only Rust calls data
+        ^ ! Rust's condition adds a test of [copy_array_to_user data offset ptr]
 = C    122        // Roll back, in case this is the second copy.
   R    135              // Roll back, in case this is the second copy.
-~ C    123        tail_ = old_tail;
+= C    123        tail_ = old_tail;
   R    136              guard.set_tail(old_tail);
-        ^ ~ only Rust calls set_tail
 = C    124        return ZX_ERR_INVALID_ARGS;
   R    137              return Err(Status::INVALID_ARGS);
-~ C    127      tail_ += static_cast<uint32_t>(n);
+= C    127      tail_ += static_cast<uint32_t>(n);
   R    140          guard.set_tail(guard.tail().wrapping_add(n as u32));
-        ^ ~ only Rust calls set_tail, tail
 = C    128      count -= n;
   R    141          count -= n;
 = C    129      ptr = ptr.byte_offset(n * elem_size_);
@@ -234,15 +219,14 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
   R    145      // If the fifo was full, it is now writable.
 > R    146      if was_full {
         ^ ! if only in Rust
-= C    133    if (was_full && peer()) {
+! C    133    if (was_full && peer()) {
   R    147          if let Some(peer) = self.peer(&guard) {
-~ C    134      peer()->UpdateStateLocked(0u, ZX_FIFO_WRITABLE);
+        ^ ! C++'s condition also tests [was_full], which Rust's doesn't
+= C    134      peer()->UpdateStateLocked(0u, ZX_FIFO_WRITABLE);
   R    148              peer.update_state_locked(&guard, 0, ZX_FIFO_WRITABLE);
-        ^ ~ only C++ calls peer
-~ C    137    *actual = (tail_ - old_tail);
+= C    137    *actual = (tail_ - old_tail);
   C    138    return ZX_OK;
   R    152      Ok(guard.tail().wrapping_sub(old_tail) as usize)
-        ^ ~ only Rust calls tail
 
   errors   same
            C++:  OUT_OF_RANGE, OUT_OF_RANGE, SHOULD_WAIT, PEER_CLOSED, INVALID_ARGS
@@ -255,36 +239,27 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
   findings
     ! - | fifo_dispatcher.rs:98  statement (acquires lock) only in Rust; resembles C++ line 95, so the order may differ
     ! fifo_dispatcher.cc:95 | -  statement (acquires lock) only in C++; resembles Rust line 98, so the order may differ
+    ! fifo_dispatcher.cc:120 | fifo_dispatcher.rs:134  Rust's condition adds a test of [copy_array_to_user data offset ptr]
     ! - | fifo_dispatcher.rs:146  if only in Rust
-    ~ fifo_dispatcher.cc:98 | fifo_dispatcher.rs:108  only Rust calls head, tail
+    ! fifo_dispatcher.cc:133 | fifo_dispatcher.rs:147  C++'s condition also tests [was_full], which Rust's doesn't
     ~ fifo_dispatcher.cc:101 | fifo_dispatcher.rs:111  only Rust calls is_some
-    ~ fifo_dispatcher.cc:110 | fifo_dispatcher.rs:124  only Rust calls tail
-    ~ fifo_dispatcher.cc:112 | fifo_dispatcher.rs:126  only Rust calls tail
-    ~ fifo_dispatcher.cc:120 | fifo_dispatcher.rs:134  only Rust calls data
-    ~ fifo_dispatcher.cc:123 | fifo_dispatcher.rs:136  only Rust calls set_tail
-    ~ fifo_dispatcher.cc:127 | fifo_dispatcher.rs:140  only Rust calls set_tail, tail
-    ~ fifo_dispatcher.cc:134 | fifo_dispatcher.rs:148  only C++ calls peer
-    ~ fifo_dispatcher.cc:137 | fifo_dispatcher.rs:152  only Rust calls tail
 
 ==== FifoDispatcher::IsFullLocked  <->  FifoDispatcher::is_full_locked
   C++   zircon/kernel/object/fifo_dispatcher.cc:141-141  (not changed by this diff)
   Rust  zircon/kernel/object/fifo_dispatcher.rs:155-158
   note  C++ lines marked * are the declaration's comment in zircon/kernel/object/include/object/fifo_dispatcher.h
-  similarity 0.98, 0 issues, 1 note
+  similarity 0.98, 0 issues, 0 notes
 
 = C    31*  // Returns true if the fifo has no room for another element.
   R    155  /// Returns true if the fifo has no room for another element.
 = C    141  bool FifoDispatcher::IsFullLocked() const { return head_ - tail_ == elem_count_; }
   R    156  fn is_full_locked(&self, guard: &StateLockGuard<'_>) -> bool {
-~ R    157      guard.head().wrapping_sub(guard.tail()) == self.elem_count
-        ^ ~ only Rust calls head, tail
+= R    157      guard.head().wrapping_sub(guard.tail()) == self.elem_count
 
   errors   same
   locks    same
   flow     return 1
   comments 1 C++ comment: 1 identical, 0 reworded, 0 missing in Rust
-  findings
-    ~ fifo_dispatcher.cc:141 | fifo_dispatcher.rs:157  only Rust calls head, tail
 
 ==== FFI shims
   rust_fifo_dispatcher_write_from_user -> FifoDispatcher::write_from_user  zircon/kernel/object/fifo_dispatcher_ffi.rs:11-30
