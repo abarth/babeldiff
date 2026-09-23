@@ -119,6 +119,8 @@ pub struct Report {
     /// not a forwarder into Rust, not an FFI declaration). Reviewers check
     /// these by hand.
     pub cpp_changes: Vec<crate::input::CppChange>,
+    /// Rubric lints over the changed files.
+    pub lints: Vec<crate::lint::Lint>,
 }
 
 impl Report {
@@ -141,6 +143,15 @@ impl Report {
             }
         }
         self.pairs.retain(|p| p.issues() > 0);
+        self.lints.retain(|l| l.severity == Severity::Issue);
+    }
+
+    /// Lints that are issues.
+    pub fn lint_issues(&self) -> usize {
+        self.lints
+            .iter()
+            .filter(|l| l.severity == Severity::Issue)
+            .count()
     }
 
     pub fn issues(&self) -> usize {

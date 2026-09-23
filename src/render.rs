@@ -59,6 +59,29 @@ pub fn render(report: &Report, opts: &RenderOptions) -> String {
             .collect();
         let _ = writeln!(out, "issues by kind: {}", parts.join(", "));
     }
+    if !report.lints.is_empty() {
+        let mut kinds: Vec<(crate::lint::LintKind, usize)> = Vec::new();
+        for l in &report.lints {
+            match kinds.iter_mut().find(|(k, _)| *k == l.kind) {
+                Some((_, n)) => *n += 1,
+                None => kinds.push((l.kind, 1)),
+            }
+        }
+        kinds.sort();
+        let parts: Vec<String> = kinds
+            .iter()
+            .map(|(k, n)| format!("{} {n}", k.name()))
+            .collect();
+        let _ = writeln!(
+            out,
+            "rubric lints: {} issue{}, {} note{} ({}); see the end of the report",
+            report.lint_issues(),
+            plural(report.lint_issues()),
+            report.lints.len() - report.lint_issues(),
+            plural(report.lints.len() - report.lint_issues()),
+            parts.join(", ")
+        );
+    }
     let _ = writeln!(
         out,
         "legend: = same  ~ note  ! issue  < only in C++  > only in Rust"
@@ -109,6 +132,24 @@ pub fn render(report: &Report, opts: &RenderOptions) -> String {
                 format!("  in {}", c.functions.join(", "))
             };
             let _ = writeln!(out, "  {span}{within}  {}", c.text);
+        }
+    }
+    if !report.lints.is_empty() {
+        out.push('\n');
+        let _ = writeln!(out, "==== Rubric lints");
+        for l in &report.lints {
+            let related = l.related.as_ref().map_or(String::new(), |(p, n)| {
+                format!("  (C++ at {}:{n})", short(p))
+            });
+            let _ = writeln!(
+                out,
+                "  {} {}:{}  [{}] {}{related}",
+                l.severity.marker(),
+                l.path,
+                l.line,
+                l.kind.name(),
+                l.message
+            );
         }
     }
     let shims: Vec<_> = report.shims.iter().collect();

@@ -1,5 +1,6 @@
 babeldiff: 7 pairs, 4 issues, 5 notes; 0 C++ and 0 Rust functions unpaired
 issues by kind: comment 1, error-path 1, control-flow 1, trace 1
+rubric lints: 3 issues, 0 notes (extern-signature 1, unsafe-safety 1, shim-logic 1); see the end of the report
 legend: = same  ~ note  ! issue  < only in C++  > only in Rust
 
 ==== sys_doorbell_ring  <->  sys_doorbell_ring
@@ -87,7 +88,7 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
 ==== DoorbellDispatcher::RingCount  <->  DoorbellDispatcher::ring_count
   C++   zircon/kernel/object/doorbell_dispatcher.cc:23-26
   Rust  zircon/kernel/object/doorbell_dispatcher.rs:47-51
-  via   C++ now calls FFI shim rust_doorbell_dispatcher_ring_count  zircon/kernel/object/doorbell_dispatcher_ffi.rs:19-22
+  via   C++ now calls FFI shim rust_doorbell_dispatcher_ring_count  zircon/kernel/object/doorbell_dispatcher_ffi.rs:23-26
   note  C++ lines marked * are the declaration's comment in zircon/kernel/object/include/object/doorbell_dispatcher.h
   similarity 1.00, 0 issues, 0 notes
 
@@ -128,7 +129,7 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
 ==== ChimeDoorbellDispatcher::Create  <->  ChimeDoorbellDispatcher::create
   C++   zircon/kernel/object/doorbell_dispatcher.cc:33-48
   Rust  zircon/kernel/object/doorbell_dispatcher.rs:60-67
-  via   C++ now calls FFI shim rust_chime_doorbell_dispatcher_create  zircon/kernel/object/doorbell_dispatcher_ffi.rs:24-44
+  via   C++ now calls FFI shim rust_chime_doorbell_dispatcher_create  zircon/kernel/object/doorbell_dispatcher_ffi.rs:28-48
   similarity 0.81, 0 issues, 1 note
 
 = C     34  zx_status_t ChimeDoorbellDispatcher::Create(uint32_t notes,
@@ -164,7 +165,7 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
 ==== ChimeDoorbellDispatcher::Ring  <->  DoorbellDispatcher::ring
   C++   zircon/kernel/object/doorbell_dispatcher.cc:52-63
   Rust  zircon/kernel/object/doorbell_dispatcher.rs:24-45
-  via   C++ now calls FFI shim rust_doorbell_dispatcher_ring  zircon/kernel/object/doorbell_dispatcher_ffi.rs:14-17
+  via   C++ now calls FFI shim rust_doorbell_dispatcher_ring  zircon/kernel/object/doorbell_dispatcher_ffi.rs:18-21
   also  C++ BuzzerDoorbellDispatcher::Ring  zircon/kernel/object/doorbell_dispatcher.cc:84-92  (override in a related class, folded into this Rust function)
   note  C++ lines marked * are the declaration's comment in zircon/kernel/object/include/object/doorbell_dispatcher.h
   similarity 0.84, 3 issues, 0 notes
@@ -234,7 +235,7 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
 ==== BuzzerDoorbellDispatcher::Create  <->  BuzzerDoorbellDispatcher::create
   C++   zircon/kernel/object/doorbell_dispatcher.cc:65-80
   Rust  zircon/kernel/object/doorbell_dispatcher.rs:71-81
-  via   C++ now calls FFI shim rust_buzzer_doorbell_dispatcher_create  zircon/kernel/object/doorbell_dispatcher_ffi.rs:46-66
+  via   C++ now calls FFI shim rust_buzzer_doorbell_dispatcher_create  zircon/kernel/object/doorbell_dispatcher_ffi.rs:50-69
   similarity 0.77, 1 issue, 1 note
 
 = C     66  zx_status_t BuzzerDoorbellDispatcher::Create(zx_duration_t length,
@@ -275,8 +276,13 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
 ==== C++ changed outside the port (stays C++; check by hand)
   zircon/kernel/object/doorbell_dispatcher.cc:24  in ChimeDoorbellDispatcher::ChimeDoorbellDispatcher  ChimeDoorbellDispatcher::ChimeDoorbellDispatcher(uint32_t notes) : notes_(notes + 1) {}
 
+==== Rubric lints
+  ! zircon/kernel/object/doorbell_dispatcher_ffi.cc:17  [shim-logic] FFI shim cpp_doorbell_dispatcher_log does more than forward: 1 branch (line 17)
+  ! zircon/kernel/object/doorbell_dispatcher_ffi.rs:15  [extern-signature] cpp_doorbell_dispatcher_log: parameter 2: C++ `uint32_t kind`, Rust `u64` (4-byte vs 8-byte value)  (C++ at doorbell_dispatcher_ffi.cc:15)
+  ! zircon/kernel/object/doorbell_dispatcher_ffi.rs:61  [unsafe-safety] unsafe block in rust_buzzer_doorbell_dispatcher_create without a // SAFETY: comment
+
 ==== FFI shims
-  rust_doorbell_dispatcher_ring -> DoorbellDispatcher::ring  zircon/kernel/object/doorbell_dispatcher_ffi.rs:14-17
-  rust_doorbell_dispatcher_ring_count -> DoorbellDispatcher::ring_count  zircon/kernel/object/doorbell_dispatcher_ffi.rs:19-22
-  rust_chime_doorbell_dispatcher_create -> ChimeDoorbellDispatcher::create  zircon/kernel/object/doorbell_dispatcher_ffi.rs:24-44
-  rust_buzzer_doorbell_dispatcher_create -> BuzzerDoorbellDispatcher::create  zircon/kernel/object/doorbell_dispatcher_ffi.rs:46-66
+  rust_doorbell_dispatcher_ring -> DoorbellDispatcher::ring  zircon/kernel/object/doorbell_dispatcher_ffi.rs:18-21
+  rust_doorbell_dispatcher_ring_count -> DoorbellDispatcher::ring_count  zircon/kernel/object/doorbell_dispatcher_ffi.rs:23-26
+  rust_chime_doorbell_dispatcher_create -> ChimeDoorbellDispatcher::create  zircon/kernel/object/doorbell_dispatcher_ffi.rs:28-48
+  rust_buzzer_doorbell_dispatcher_create -> BuzzerDoorbellDispatcher::create  zircon/kernel/object/doorbell_dispatcher_ffi.rs:50-69

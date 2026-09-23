@@ -39,7 +39,7 @@ pub fn render_html(report: &Report, opts: &HtmlOptions) -> String {
     let _ = writeln!(
         out,
         "<header class=\"top\">\n<div class=\"brand\">babeldiff</div>\
-         <div class=\"what\">{}</div>\n<div class=\"totals\">{}{}{}</div>\n\
+         <div class=\"what\">{}</div>\n<div class=\"totals\">{}{}{}{}</div>\n\
          <div class=\"controls\">\
          <label><input type=\"checkbox\" id=\"opt-fold\"> Fold matching rows</label>\
          <label><input type=\"checkbox\" id=\"opt-issues\"> Only functions with issues</label>\
@@ -52,6 +52,21 @@ pub fn render_html(report: &Report, opts: &HtmlOptions) -> String {
         ),
         chip("warn", &count(report.notes(), "note")),
         chip("plain", &count(report.pairs.len(), "function pair")),
+        if report.lints.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "<a href=\"#lints\">{}</a>",
+                chip(
+                    if report.lint_issues() == 0 {
+                        "warn"
+                    } else {
+                        "bad"
+                    },
+                    &count(report.lints.len(), "rubric lint")
+                )
+            )
+        },
     );
     out.push_str(KEYS_HELP);
 
@@ -113,6 +128,20 @@ fn render_nav(out: &mut String, report: &Report) {
         );
     }
     out.push_str("</ol>\n");
+    if !report.lints.is_empty() {
+        let _ = writeln!(
+            out,
+            "<a class=\"extra\" href=\"#lints\">Rubric lints ({})</a>",
+            report.lints.len()
+        );
+    }
+    if !report.cpp_changes.is_empty() {
+        let _ = writeln!(
+            out,
+            "<a class=\"extra\" href=\"#cpp-changes\">C++ changed outside the port ({})</a>",
+            report.cpp_changes.len()
+        );
+    }
     let unpaired = report.unmatched_cpp.len() + report.unmatched_rust.len();
     if unpaired > 0 {
         let _ = writeln!(
@@ -663,6 +692,61 @@ fn render_code(out: &mut String, id: &str, cpp: &Function, rust: &Function, rows
 }
 
 fn render_leftovers(out: &mut String, report: &Report) {
+    if !report.lints.is_empty() {
+        out.push_str(
+            "<section class=\"leftover\" id=\"lints\"><h2>Rubric lints</h2>\n\
+             <p>Checks of the changed files against the porting rubric that need no pairing: \
+             FFI declarations that disagree across the languages, <code>unsafe</code> without \
+             a safety comment, and FFI shims that do more than forward.</p><ul>\n",
+        );
+        for l in &report.lints {
+            let (class, mark) = match l.severity {
+                crate::check::Severity::Issue => ("n-bad", "!"),
+                crate::check::Severity::Note => ("n-warn", "~"),
+            };
+            let related = l.related.as_ref().map_or(String::new(), |(p, n)| {
+                format!(
+                    " <span class=\"loc\">C++ at {}</span>",
+                    esc(&format!("{p}:{n}"))
+                )
+            });
+            let _ = writeln!(
+                out,
+                "<li><b class=\"{class}\">{mark}</b> <span class=\"tag\">{}</span> {} \
+                 <span class=\"loc\">{}</span>{related}</li>",
+                esc(l.kind.name()),
+                esc(&l.message),
+                esc(&format!("{}:{}", l.path, l.line)),
+            );
+        }
+        out.push_str("</ul></section>\n");
+    }
+    if !report.cpp_changes.is_empty() {
+        out.push_str(
+            "<section class=\"leftover\" id=\"cpp-changes\"><h2>C++ changed outside the port</h2>\n\
+             <p>The change edits this C++, which stays C++. Nothing on the Rust side corresponds \
+             to it, so check each by hand.</p><ul>\n",
+        );
+        for c in &report.cpp_changes {
+            let span = if c.start_line == c.end_line {
+                format!("{}:{}", c.path, c.start_line)
+            } else {
+                format!("{}:{}-{}", c.path, c.start_line, c.end_line)
+            };
+            let within = if c.functions.is_empty() {
+                String::new()
+            } else {
+                format!(" in <code>{}</code>", esc(&c.functions.join(", ")))
+            };
+            let _ = writeln!(
+                out,
+                "<li><code>{}</code>{within} <span class=\"loc\">{}</span></li>",
+                esc(&c.text),
+                esc(&span)
+            );
+        }
+        out.push_str("</ul></section>\n");
+    }
     if !report.unmatched_cpp.is_empty() || !report.unmatched_rust.is_empty() {
         out.push_str(
             "<section class=\"leftover\" id=\"unpaired\"><h2>Unpaired functions</h2>\n\

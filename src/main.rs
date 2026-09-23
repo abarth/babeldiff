@@ -222,7 +222,7 @@ fn run(cli: &Cli) -> Result<usize, String> {
             let _ = std::io::stdout().write_all(text.as_bytes());
         }
     }
-    Ok(report.issues())
+    Ok(report.issues() + report.lint_issues())
 }
 
 /// The subject of a `git format-patch` file, without its `[PATCH]` tag.
