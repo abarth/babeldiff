@@ -171,6 +171,11 @@ pub fn call(name: &str) -> Option<String> {
     if n.is_empty() || NOISE_CALLS.contains(&n.as_str()) {
         return None;
     }
+    // Test checks: zxtest's `EXPECT_EQ` and `ASSERT_OK` are Rust's
+    // `assert_eq!` and `assert!`.
+    if (n.starts_with("expect_") || n.starts_with("assert_")) && n != "assert_held" {
+        return Some("assert".to_string());
+    }
     Some(alias(&n).to_string())
 }
 
@@ -210,6 +215,17 @@ pub fn is_mutating(name: &str) -> bool {
 }
 
 /// Maps equivalent C++ and Rust spellings onto one name.
+/// Calls that do the same thing but can't share a name everywhere, because
+/// one of them is too generic: `out.copy_to_user(v)` is `out.write(v)` on a
+/// user pointer, but not every `write` is a user copy. They are equivalent
+/// when both sides of an aligned pair make them.
+pub const EQUIVALENT_CALLS: &[(&str, &str)] = &[
+    ("write_user", "write"),
+    ("read_user", "read"),
+    ("down_cast_dispatcher", "downcast"),
+    ("down_cast_dispatcher", "downcast_ref"),
+];
+
 fn alias(n: &str) -> &str {
     match n {
         "debug_assert"

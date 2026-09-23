@@ -19,7 +19,8 @@ struct Cli {
     #[command(subcommand)]
     command: Cmd,
 
-    /// Output format: plain text, or a self-contained HTML page for people.
+    /// Output format: plain text, a self-contained HTML page for people, or
+    /// JSON for agents and scripts.
     #[arg(long, value_enum, default_value_t = FormatArg::Text, global = true)]
     format: FormatArg,
 
@@ -42,6 +43,10 @@ struct Cli {
     /// Print only the per-function summaries and findings.
     #[arg(long, global = true)]
     summary: bool,
+
+    /// Leave out notes, and pairs with no issues.
+    #[arg(long, global = true)]
+    issues_only: bool,
 
     /// Force a pairing, as CPP_NAME=RUST_NAME (qualified or unqualified). Repeatable.
     #[arg(long = "pair", value_name = "CPP=RUST", global = true)]
@@ -90,6 +95,7 @@ enum Cmd {
 enum FormatArg {
     Text,
     Html,
+    Json,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -178,13 +184,16 @@ fn run(cli: &Cli) -> Result<usize, String> {
             (ChangeSet::from_files(&loaded), Box::new(NoFinder), title)
         }
     };
-    let report = babeldiff::run_with(
+    let mut report = babeldiff::run_with(
         &cs,
         &analyze::Options::default(),
         finder.as_mut(),
         cli.min_changed,
         forced,
     );
+    if cli.issues_only {
+        report.retain_issues();
+    }
     let width = cli
         .width
         .or_else(|| std::env::var("COLUMNS").ok().and_then(|c| c.parse().ok()))
@@ -201,6 +210,7 @@ fn run(cli: &Cli) -> Result<usize, String> {
     let text = match cli.format {
         FormatArg::Text => render::render(&report, &opts),
         FormatArg::Html => html::render_html(&report, &html::HtmlOptions { title }),
+        FormatArg::Json => babeldiff::json::render_json(&report, &title),
     };
     match &cli.output {
         Some(path) => {

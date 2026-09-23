@@ -130,6 +130,9 @@ pub struct Finding {
     pub category: Category,
     pub cpp_line: Option<usize>,
     pub rust_line: Option<usize>,
+    /// The file of the C++ line when it isn't the function's own, such as a
+    /// doc comment in a header.
+    pub cpp_file: Option<String>,
     pub message: String,
 }
 
@@ -185,7 +188,13 @@ pub fn check_with(
                 let u = &cpp.units[i];
                 let moved =
                     find_moved(u, &rust.units, &unmatched_r).map(|j| rust.units[j].start_line);
-                if !u.features.plumbing && u.kind != UnitKind::Signature {
+                if u.kind == UnitKind::Comment && restates_signature(u, cpp) {
+                    notes.push(Note::new(
+                        Severity::Note,
+                        Category::Comment,
+                        "comment only in C++; it restates the function's name",
+                    ));
+                } else if !u.features.plumbing && u.kind != UnitKind::Signature {
                     notes.push(only_in(u, "C++", "Rust", moved));
                 }
                 Marker::CppOnly
@@ -248,6 +257,7 @@ pub fn findings_of(rows: &[Row], cpp: &Function, rust: &Function) -> Vec<Finding
                 category: n.category,
                 cpp_line: r.cpp.map(|i| cpp.units[i].start_line),
                 rust_line: r.rust.map(|j| rust.units[j].start_line),
+                cpp_file: r.cpp.and_then(|i| cpp.units[i].file.clone()),
                 message: n.message.clone(),
             });
         }
@@ -386,6 +396,31 @@ fn assert_only(f: &crate::model::Features) -> bool {
         && f.errors.is_empty()
         && !f.propagates
         && !f.unlocks
+}
+
+/// A comment that only names the function, such as `// zx_status_t
+/// zx_port_wait` above `sys_port_wait`, carries nothing a reader would miss.
+fn restates_signature(u: &Unit, f: &Function) -> bool {
+    // Comment words are identifiers with underscores removed.
+    const TYPE_WORDS: &[&str] = &["zxstatust", "void", "int", "bool", "static", "const"];
+    let strip = |w: &str| -> String {
+        let w = w.strip_prefix("zx").unwrap_or(w);
+        w.strip_prefix("sys").unwrap_or(w).to_string()
+    };
+    let name = strip(&crate::normalize::ident(&f.base).replace('_', ""));
+    let words = &u.features.comment;
+    if words.is_empty() || words.len() > 4 || name.is_empty() {
+        return false;
+    }
+    let mut named = false;
+    for w in words {
+        if strip(w) == name {
+            named = true;
+        } else if !TYPE_WORDS.contains(&w.as_str()) {
+            return false;
+        }
+    }
+    named
 }
 
 fn only_in(u: &Unit, here: &str, there: &str, moved: Option<usize>) -> Note {
@@ -593,14 +628,24 @@ fn compare(a: &Unit, b: &Unit, notes: &mut Vec<Note>) {
             format!("only {who} asserts here"),
         ));
     }
-    let only_a: Vec<&String> = uniq(&fa.calls)
+    let mut only_a: Vec<&String> = uniq(&fa.calls)
         .into_iter()
         .filter(|c| !fb.calls.contains(c) && !name_matches(c, fb))
         .collect();
-    let only_b: Vec<&String> = uniq(&fb.calls)
+    let mut only_b: Vec<&String> = uniq(&fb.calls)
         .into_iter()
         .filter(|c| !fa.calls.contains(c) && !name_matches(c, fa))
         .collect();
+    for (x, y) in crate::normalize::EQUIVALENT_CALLS {
+        let (i, j) = (
+            only_a.iter().position(|c| c.as_str() == *x),
+            only_b.iter().position(|c| c.as_str() == *y),
+        );
+        if let (Some(i), Some(j)) = (i, j) {
+            only_a.remove(i);
+            only_b.remove(j);
+        }
+    }
     if !only_a.is_empty() || !only_b.is_empty() {
         let mut parts = Vec::new();
         if !only_a.is_empty() {

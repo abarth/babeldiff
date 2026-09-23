@@ -13,7 +13,8 @@
 //!    FFI shims (`rust_<class>_<method>`) where it can, and [`align`] lines up
 //!    each pair's units.
 //! 4. [`check`] flags differences, [`render`] prints a side-by-side,
-//!    diff-style report, and [`html`] writes a self-contained HTML page.
+//!    diff-style report, [`html`] writes a self-contained HTML page, and
+//!    [`json`] writes findings for agents and scripts.
 //!
 //! ```
 //! use babeldiff::{analyze, input::ChangeSet, render};
@@ -35,6 +36,7 @@ pub mod extract;
 pub mod git;
 pub mod html;
 pub mod input;
+pub mod json;
 pub mod model;
 pub mod normalize;
 pub mod patch;
