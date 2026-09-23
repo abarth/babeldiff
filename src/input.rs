@@ -142,10 +142,11 @@ fn stays_cpp(v: &Version, functions: &[Function]) -> Vec<CppChange> {
     // A body that now only calls into Rust (and unwraps what comes back) is
     // the port's other half.
     let forwards = |f: &Function| {
-        f.calls.iter().any(|c| c.starts_with("rust_"))
-            && f.calls
-                .iter()
-                .all(|c| c.starts_with("rust_") || c == "uninitialized")
+        f.base.starts_with("cpp_")
+            || f.calls.iter().any(|c| c.starts_with("rust_"))
+                && f.calls
+                    .iter()
+                    .all(|c| c.starts_with("rust_") || c == "uninitialized")
     };
     let skip_fn: Vec<(usize, usize)> = functions
         .iter()
@@ -153,8 +154,13 @@ fn stays_cpp(v: &Version, functions: &[Function]) -> Vec<CppChange> {
         .map(|f| (f.start_line, f.end_line))
         .collect();
     static FFI: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r#"\b(?:rust|cpp)_\w+\s*\(|^extern\s+"C"|^#|^(?:class|struct)\s+\w+;$"#)
-            .unwrap()
+        regex::Regex::new(concat!(
+            r#"\b(?:rust|cpp)_\w+\b|^extern\s+"C"|^#|^(?:class|struct)\s+\w+;$|^__(?:BEGIN|END)_CDECLS"#,
+            // Layout constants and checks for state shared with Rust.
+            r#"|^static_assert\s*\(\s*(?:sizeof|alignof|offsetof)|\bk\w*(?:Size|Align|Alignment|Offset)\s*="#,
+            r#"|^// Copyright"#,
+        ))
+        .unwrap()
     });
     // Statements can span lines; an FFI declaration's continuation lines
     // are FFI too.
@@ -175,6 +181,12 @@ fn stays_cpp(v: &Version, functions: &[Function]) -> Vec<CppChange> {
         if FFI.is_match(t) {
             ffi[start..=n].fill(true);
         } else if ffi[start] && !begins {
+            ffi[n] = true;
+        }
+    }
+    // A comment directly above FFI plumbing is about the plumbing.
+    for n in (1..lines.len()).rev() {
+        if ffi[n + 1] && lines[n - 1].trim().starts_with("//") {
             ffi[n] = true;
         }
     }
