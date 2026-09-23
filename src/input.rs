@@ -173,9 +173,7 @@ fn stays_cpp(v: &Version, functions: &[Function]) -> Vec<CppChange> {
             start = n;
         }
         if FFI.is_match(t) {
-            for k in start..=n {
-                ffi[k] = true;
-            }
+            ffi[start..=n].fill(true);
         } else if ffi[start] && !begins {
             ffi[n] = true;
         }
