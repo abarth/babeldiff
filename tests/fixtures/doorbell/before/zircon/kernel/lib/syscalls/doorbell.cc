@@ -34,3 +34,19 @@ zx_status_t sys_doorbell_ring(zx_handle_t handle, uint32_t tone,
 
   return status;
 }
+
+// zx_status_t zx_doorbell_create
+zx_status_t sys_doorbell_create(uint32_t options, uint32_t arg, zx_handle_t* out) {
+  KernelHandle<DoorbellDispatcher> handle;
+  zx_rights_t rights;
+  zx_status_t status;
+  if (options & ZX_DOORBELL_BUZZER) {
+    status = BuzzerDoorbellDispatcher::Create(arg, &handle, &rights);
+  } else {
+    status = ChimeDoorbellDispatcher::Create(arg, &handle, &rights);
+  }
+  if (status != ZX_OK) {
+    return status;
+  }
+  return ProcessDispatcher::GetCurrent()->MakeAndAddHandle(ktl::move(handle), rights, out);
+}

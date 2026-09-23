@@ -7,10 +7,12 @@
 // Synthetic syscalls used to test babeldiff. They are not part of Zircon.
 
 use crate::object::dispatcher::Dispatcher;
-use crate::object::doorbell_dispatcher::DoorbellDispatcher;
+use crate::object::doorbell_dispatcher::{
+    BuzzerDoorbellDispatcher, ChimeDoorbellDispatcher, DoorbellDispatcher,
+};
 use crate::user_copy::UserOutPtr;
 use zx_status::Status;
-use zx_types::{HandleValue, ZX_RIGHT_SIGNAL};
+use zx_types::{zx_duration_t, HandleValue, ZX_DOORBELL_BUZZER, ZX_RIGHT_SIGNAL};
 
 const LOCAL_TRACE: bool = false;
 
@@ -26,5 +28,15 @@ pub fn sys_doorbell_ring(
     if !out_count.is_null() {
         out_count.write(doorbell.ring_count())?;
     }
+    Ok(())
+}
+
+pub fn sys_doorbell_create(options: u32, arg: u32, out: &mut HandleValue) -> Result<(), Status> {
+    let (handle, rights) = if options & ZX_DOORBELL_BUZZER != 0 {
+        BuzzerDoorbellDispatcher::create(arg as zx_duration_t)?
+    } else {
+        ChimeDoorbellDispatcher::create(arg)?
+    };
+    *out = handle.make_and_add_handle(rights)?;
     Ok(())
 }

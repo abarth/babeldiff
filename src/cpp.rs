@@ -253,6 +253,7 @@ impl<'a> Ctx<'a> {
         if returns_status {
             chain_status(&mut b.units, self.lines);
         }
+        branch_status(&mut b.units, self.lines);
 
         let end = ts::end_line(n);
         let mut calls: Vec<String> = b
@@ -975,6 +976,60 @@ fn chain_status(units: &mut [crate::model::Unit], lines: &[String]) {
     }
     for i in rets {
         units[i].features.ret = Some(Ret::Ok);
+    }
+}
+
+/// A status set in each branch and checked once after them:
+///
+/// ```text
+/// if (virt) { status = A(); } else { status = B(); }
+/// if (status != ZX_OK) { return status; }
+/// ```
+///
+/// is Rust's `if virt { a()? } else { b()? }`. The assignments propagate,
+/// and the lone check is bookkeeping.
+fn branch_status(units: &mut [crate::model::Unit], lines: &[String]) {
+    for p in 0..units.len() {
+        let u = &units[p];
+        if u.kind != UnitKind::Stmt || !u.features.propagates || !u.features.calls.is_empty() {
+            continue;
+        }
+        let text = lines.get(u.start_line - 1).map_or("", |l| l.trim());
+        let Some(var) = text
+            .strip_prefix("if")
+            .and_then(|c| propagation_var(c.trim().trim_end_matches('{').trim()))
+        else {
+            continue;
+        };
+        let assign = Regex::new(&format!(r"^{}\s*=[^=].*\w\s*\(", regex::escape(&var))).unwrap();
+        let depth = u.depth;
+        let mut found = Vec::new();
+        for k in (0..p).rev() {
+            let w = &units[k];
+            if w.depth < depth
+                || (w.depth == depth
+                    && !matches!(
+                        w.kind,
+                        UnitKind::If | UnitKind::ElseIf | UnitKind::Else | UnitKind::Comment
+                    ))
+            {
+                break;
+            }
+            let t = lines.get(w.start_line - 1).map_or("", |l| l.trim());
+            if w.depth > depth
+                && w.kind == UnitKind::Stmt
+                && assign.is_match(t)
+                && !w.features.calls.is_empty()
+            {
+                found.push(k);
+            }
+        }
+        if !found.is_empty() {
+            for k in found {
+                units[k].features.propagates = true;
+            }
+            units[p].features.plumbing = true;
+        }
     }
 }
 

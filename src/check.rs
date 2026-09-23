@@ -979,6 +979,7 @@ pub fn summarize(cpp: &Function, rust: &Function, rows: &[Row]) -> Summary {
     let errs = |f: &Function| -> Vec<String> {
         f.units
             .iter()
+            .filter(|u| !u.features.plumbing)
             .filter_map(|u| match (&u.features.ret, u.features.propagates) {
                 (Some(Ret::Error(e)), _) => Some(e.clone()),
                 // `ok_or(X)?` and `if (!x) return ZX_ERR_X;` return X.
