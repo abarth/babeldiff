@@ -105,6 +105,27 @@ pub struct Report {
 }
 
 impl Report {
+    /// Drops notes and the pairs left with no issues, for readers who only
+    /// want what needs fixing.
+    pub fn retain_issues(&mut self) {
+        let strip = |rows: &mut Vec<Row>, findings: &mut Vec<Finding>| {
+            for r in rows.iter_mut() {
+                r.notes.retain(|n| n.severity == Severity::Issue);
+                if r.marker == check::Marker::Note {
+                    r.marker = check::Marker::Same;
+                }
+            }
+            findings.retain(|f| f.severity == Severity::Issue);
+        };
+        for p in &mut self.pairs {
+            strip(&mut p.rows, &mut p.findings);
+            for o in &mut p.overrides {
+                strip(&mut o.rows, &mut o.findings);
+            }
+        }
+        self.pairs.retain(|p| p.issues() > 0);
+    }
+
     pub fn issues(&self) -> usize {
         self.pairs.iter().map(PairReport::issues).sum()
     }
@@ -497,9 +518,13 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
             if !(by_call || by_name) {
                 continue;
             }
+            // An exported Rust function that does the work itself, rather
+            // than forwarding, is the port.
             let target = match target {
+                Target::One(t) if score(c, shim).0 > score(c, t).0 => shim,
                 Target::One(t) => t,
                 Target::None => shim,
+                Target::Ambiguous(_) if body_len(shim) > 3 => shim,
                 // Leave it to the similarity pass rather than guess.
                 Target::Ambiguous(_) => continue,
             };

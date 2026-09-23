@@ -247,6 +247,10 @@ impl<'a> Ctx<'a> {
             }
         }
 
+        if returns_status {
+            chain_status(&mut b.units, &self.lines);
+        }
+
         let end = ts::end_line(n);
         let mut calls: Vec<String> = b
             .units
@@ -886,6 +890,72 @@ impl<'a> Ctx<'a> {
             .into_iter()
             .find(|c| !ts::is_comment(*c));
         expr.is_some_and(|e| ts::classify_return(self.text(e)) == Ret::Status)
+    }
+}
+
+/// Status chaining: `status = A(); if (status == ZX_OK) { status = B(); }
+/// return status;` passes each call's error on, as Rust's `a()?; b()?;
+/// Ok(())` does. When a status variable is used only that way, its
+/// assignments propagate, its `== ZX_OK` guards are bookkeeping, and the
+/// final `return status` is the success path.
+fn chain_status(units: &mut [crate::model::Unit], lines: &[String]) {
+    static RET: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^return\s+(\w+)\s*;").unwrap());
+    let text = |u: &crate::model::Unit| -> String {
+        (u.start_line..=u.end_line)
+            .filter_map(|l| lines.get(l - 1))
+            .map(|l| l.trim())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let Some(var) = units
+        .iter()
+        .rev()
+        .find(|u| u.kind == UnitKind::Return && u.depth == 1 && u.file.is_none())
+        .and_then(|u| RET.captures(&text(u)).map(|c| c[1].to_string()))
+    else {
+        return;
+    };
+    let v = regex::escape(&var);
+    let word = Regex::new(&format!(r"\b{v}\b")).unwrap();
+    let assign = Regex::new(&format!(r"^(?:zx_status_t\s+)?{v}\s*=[^=].*\w\s*\(")).unwrap();
+    let decl = Regex::new(&format!(r"^zx_status_t\s+{v}\s*(?:=\s*ZX_OK\s*)?;")).unwrap();
+    let guard = Regex::new(&format!(r"\b{v}\s*==\s*ZX_OK\b|\bZX_OK\s*==\s*{v}\b")).unwrap();
+    let ret = Regex::new(&format!(r"^return\s+{v}\s*;")).unwrap();
+    let mut assigns = Vec::new();
+    let mut guards = Vec::new();
+    let mut rets = Vec::new();
+    for (i, u) in units.iter().enumerate() {
+        if u.file.is_some() || u.kind == UnitKind::Comment {
+            continue;
+        }
+        let t = text(u);
+        if !word.is_match(&t) {
+            continue;
+        }
+        match u.kind {
+            UnitKind::Stmt if assign.is_match(&t) && !u.features.calls.is_empty() => assigns.push(i),
+            UnitKind::Stmt if decl.is_match(&t) => {}
+            UnitKind::If | UnitKind::ElseIf if guard.is_match(&t) => guards.push(i),
+            UnitKind::Return if ret.is_match(&t) => rets.push(i),
+            _ => return,
+        }
+    }
+    if assigns.is_empty() || (assigns.len() > 1 && guards.is_empty()) {
+        return;
+    }
+    for i in assigns {
+        units[i].features.propagates = true;
+    }
+    for i in guards {
+        let f = &mut units[i].features;
+        f.conjuncts.retain(|c| !guard.is_match(&c.text));
+        if f.conjuncts.is_empty() {
+            f.plumbing = true;
+        }
+    }
+    for i in rets {
+        units[i].features.ret = Some(Ret::Ok);
     }
 }
 
