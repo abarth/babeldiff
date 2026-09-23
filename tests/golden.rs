@@ -409,7 +409,7 @@ fn json_lists_findings_with_locations() {
     let report = doorbell_report("doorbell-json");
     let json = babeldiff::json::render_json(&report, "doorbell");
     assert!(json.starts_with("{\"version\":1,\"title\":\"doorbell\""));
-    assert!(json.contains("\"summary\":{\"pairs\":6,\"issues\":4,"));
+    assert!(json.contains("\"summary\":{\"pairs\":7,\"issues\":4,"));
     assert!(json.contains(
         "\"severity\":\"issue\",\"category\":\"error-path\",\"rubric\":\"behavioral parity of error paths\",\"message\":\"error codes differ: C++ [NO_MEMORY], Rust [NO_RESOURCES]\""
     ));

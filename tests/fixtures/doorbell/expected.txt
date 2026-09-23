@@ -1,22 +1,22 @@
-babeldiff: 6 pairs, 4 issues, 3 notes; 0 C++ and 0 Rust functions unpaired
+babeldiff: 7 pairs, 4 issues, 5 notes; 0 C++ and 0 Rust functions unpaired
 legend: = same  ~ note  ! issue  < only in C++  > only in Rust
 
 ==== sys_doorbell_ring  <->  sys_doorbell_ring
   C++   zircon/kernel/lib/syscalls/doorbell.cc:17-36
-  Rust  zircon/kernel/lib/syscalls/doorbell.rs:17-30
+  Rust  zircon/kernel/lib/syscalls/doorbell.rs:19-32
   similarity 0.79, 0 issues, 1 note
 
 < C     17  // zx_status_t zx_doorbell_ring
         ^ ~ comment only in C++; it restates the function's name
 = C     18  zx_status_t sys_doorbell_ring(zx_handle_t handle, uint32_t tone,
   C     19                                user_out_ptr<uint64_t> out_count) {
-  R     17  pub fn sys_doorbell_ring(
-  R     18      handle: HandleValue,
-  R     19      tone: u32,
-  R     20      out_count: UserOutPtr<u64>,
-  R     21  ) -> Result<(), Status> {
+  R     19  pub fn sys_doorbell_ring(
+  R     20      handle: HandleValue,
+  R     21      tone: u32,
+  R     22      out_count: UserOutPtr<u64>,
+  R     23  ) -> Result<(), Status> {
 = C     20    LTRACEF("handle %x tone %u\n", handle, tone);
-  R     22      ltracef!("handle {:?} tone {}\n", handle, tone);
+  R     24      ltracef!("handle {:?} tone {}\n", handle, tone);
 < C     22    zx_status_t status;
 < C     23    auto up = ProcessDispatcher::GetCurrent();
 < C     24    fbl::RefPtr<DoorbellDispatcher> doorbell;
@@ -24,15 +24,15 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
   C     26    if (status != ZX_OK) {
   C     27      return status;
   C     28    }
-  R     24      let doorbell = Dispatcher::get_with_rights::<DoorbellDispatcher>(handle, ZX_RIGHT_SIGNAL)?;
+  R     26      let doorbell = Dispatcher::get_with_rights::<DoorbellDispatcher>(handle, ZX_RIGHT_SIGNAL)?;
 = C     30    status = doorbell->Ring(tone);
-  R     25      doorbell.ring(tone)?;
+  R     27      doorbell.ring(tone)?;
 = C     31    if (status == ZX_OK && out_count) {
-  R     26      if !out_count.is_null() {
+  R     28      if !out_count.is_null() {
 = C     32      status = out_count.copy_to_user(doorbell->RingCount());
-  R     27          out_count.write(doorbell.ring_count())?;
+  R     29          out_count.write(doorbell.ring_count())?;
 = C     35    return status;
-  R     29      Ok(())
+  R     31      Ok(())
 
   errors   same
            C++:  ?, ?, ?
@@ -42,6 +42,44 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
   comments 1 C++ comment: 0 identical, 0 reworded, 1 missing in Rust
   findings
     ~ doorbell.cc:17 | -  comment only in C++; it restates the function's name
+
+==== sys_doorbell_create  <->  sys_doorbell_create
+  C++   zircon/kernel/lib/syscalls/doorbell.cc:38-52
+  Rust  zircon/kernel/lib/syscalls/doorbell.rs:34-42
+  similarity 0.73, 0 issues, 2 notes
+
+< C     38  // zx_status_t zx_doorbell_create
+        ^ ~ comment only in C++; it restates the function's name
+= C     39  zx_status_t sys_doorbell_create(uint32_t options, uint32_t arg, zx_handle_t* out) {
+  R     34  pub fn sys_doorbell_create(options: u32, arg: u32, out: &mut HandleValue) -> Result<(), Status> {
+= C     40    KernelHandle<DoorbellDispatcher> handle;
+  R     35      let (handle, rights) = if options & ZX_DOORBELL_BUZZER != 0 {
+< C     41    zx_rights_t rights;
+< C     42    zx_status_t status;
+= C     43    if (options & ZX_DOORBELL_BUZZER) {
+= C     44      status = BuzzerDoorbellDispatcher::Create(arg, &handle, &rights);
+  R     36          BuzzerDoorbellDispatcher::create(arg as zx_duration_t)?
+= C     45    } else {
+  R     37      } else {
+= C     46      status = ChimeDoorbellDispatcher::Create(arg, &handle, &rights);
+  R     38          ChimeDoorbellDispatcher::create(arg)?
+< C     48    if (status != ZX_OK) {
+  C     49      return status;
+  C     50    }
+~ C     51    return ProcessDispatcher::GetCurrent()->MakeAndAddHandle(ktl::move(handle), rights, out);
+  R     40      *out = handle.make_and_add_handle(rights)?;
+  R     41      Ok(())
+        ^ ~ only C++ calls get_current
+
+  errors   same
+           C++:  ?, ?
+           Rust: ?, ?
+  locks    same
+  flow     if 1, else 1, return 1
+  comments 1 C++ comment: 0 identical, 0 reworded, 1 missing in Rust
+  findings
+    ~ doorbell.cc:38 | -  comment only in C++; it restates the function's name
+    ~ doorbell.cc:51 | doorbell.rs:40  only C++ calls get_current
 
 ==== DoorbellDispatcher::RingCount  <->  DoorbellDispatcher::ring_count
   C++   zircon/kernel/object/doorbell_dispatcher.cc:23-26
