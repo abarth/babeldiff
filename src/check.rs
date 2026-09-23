@@ -143,6 +143,18 @@ pub struct Row {
 
 /// Builds the rows and findings for an aligned pair of functions.
 pub fn check(cpp: &Function, rust: &Function, pairs: &[Pair]) -> (Vec<Row>, Vec<Finding>) {
+    check_with(cpp, rust, pairs, &[])
+}
+
+/// Like [`check`], where the Rust units in `claimed` are accounted for
+/// elsewhere (by a C++ override folded into the same function) and are not
+/// reported as only in Rust.
+pub fn check_with(
+    cpp: &Function,
+    rust: &Function,
+    pairs: &[Pair],
+    claimed: &[usize],
+) -> (Vec<Row>, Vec<Finding>) {
     let mut rows = Vec::new();
     let unmatched_c: Vec<usize> = pairs
         .iter()
@@ -160,6 +172,7 @@ pub fn check(cpp: &Function, rust: &Function, pairs: &[Pair]) -> (Vec<Row>, Vec<
         let marker = match (p.cpp, p.rust) {
             (Some(i), Some(j)) => {
                 compare(&cpp.units[i], &rust.units[j], &mut notes);
+                condition_diff(&cpp.units[i], &rust.units[j], cpp, rust, &mut notes);
                 if notes.iter().any(|n| n.severity == Severity::Issue) {
                     Marker::Issue
                 } else if notes.is_empty() {
@@ -172,7 +185,7 @@ pub fn check(cpp: &Function, rust: &Function, pairs: &[Pair]) -> (Vec<Row>, Vec<
                 let u = &cpp.units[i];
                 let moved =
                     find_moved(u, &rust.units, &unmatched_r).map(|j| rust.units[j].start_line);
-                if !u.features.plumbing {
+                if !u.features.plumbing && u.kind != UnitKind::Signature {
                     notes.push(only_in(u, "C++", "Rust", moved));
                 }
                 Marker::CppOnly
@@ -183,7 +196,8 @@ pub fn check(cpp: &Function, rust: &Function, pairs: &[Pair]) -> (Vec<Row>, Vec<
                     find_moved(u, &cpp.units, &unmatched_c).map(|i| cpp.units[i].start_line);
                 // Safety comments and plumbing are expected additions, not
                 // findings.
-                let expected = u.kind == UnitKind::Comment && u.features.safety
+                let expected = claimed.contains(&j)
+                    || u.kind == UnitKind::Comment && u.features.safety
                     || u.features.lock_plumbing
                     || u.features.plumbing
                     || (new_doc(rust, j) && !has_doc(cpp));
@@ -579,11 +593,6 @@ fn compare(a: &Unit, b: &Unit, notes: &mut Vec<Note>) {
             format!("only {who} asserts here"),
         ));
     }
-    if matches!(a.kind, UnitKind::If | UnitKind::ElseIf)
-        && matches!(b.kind, UnitKind::If | UnitKind::ElseIf)
-    {
-        condition_diff(fa, fb, notes);
-    }
     let only_a: Vec<&String> = uniq(&fa.calls)
         .into_iter()
         .filter(|c| !fb.calls.contains(c) && !name_matches(c, fb))
@@ -619,8 +628,9 @@ fn name_matches(call: &str, other: &crate::model::Features) -> bool {
     let bare = call
         .strip_prefix("set_")
         .or_else(|| call.strip_prefix("get_"))
-        .unwrap_or(call);
-    other.names.iter().any(|n| n == bare) || other.idents.iter().any(|n| n == bare)
+        .unwrap_or(call)
+        .replace('_', "");
+    other.names.iter().any(|n| *n == bare) || other.idents.iter().any(|n| *n == bare)
 }
 
 /// One side propagates with `?` where the other returns the status it
@@ -632,43 +642,67 @@ fn propagation_is_implied(a: &Unit, b: &Unit) -> bool {
     (a.features.propagates && returns_status(b)) || (b.features.propagates && returns_status(a))
 }
 
-/// Reports rejection conditions one side's `if` tests and the other's
-/// doesn't, conjunct by conjunct.
-fn condition_diff(fa: &crate::model::Features, fb: &crate::model::Features, notes: &mut Vec<Note>) {
+/// Every condition operand a function tests.
+fn all_conjuncts(f: &Function) -> Vec<&crate::model::Conjunct> {
+    f.units
+        .iter()
+        .flat_map(|u| u.features.conjuncts.iter())
+        .collect()
+}
+
+/// Reports tests one side's `if` makes and the other's doesn't, operand by
+/// operand. A test the other function makes in some other condition (a
+/// C++ `if (a && b)` split into nested Rust `if`s) doesn't count.
+fn condition_diff(a: &Unit, b: &Unit, cpp: &Function, rust: &Function, notes: &mut Vec<Note>) {
+    let conds = |u: &Unit| matches!(u.kind, UnitKind::If | UnitKind::ElseIf);
+    let (fa, fb) = (&a.features, &b.features);
+    if !conds(a) || !conds(b) || fa.checks_error || fb.checks_error {
+        return;
+    }
     if fa.conjuncts.is_empty() || fb.conjuncts.is_empty() {
         return;
     }
-    let matched = |x: &Vec<String>, ys: &[Vec<String>]| {
-        ys.iter()
-            .any(|y| crate::normalize::jaccard(x, y) >= 0.5 || x.iter().all(|w| y.contains(w)))
+    // Status tests (`status != ZX_OK`) have no names left once noise is
+    // dropped; they are compared as error checks instead.
+    if fa.conjuncts.iter().chain(&fb.conjuncts).any(|c| c.names.is_empty()) {
+        return;
+    }
+    let same = |x: &crate::model::Conjunct, y: &crate::model::Conjunct| {
+        crate::normalize::jaccard(&x.names, &y.names) >= 0.5
+            || x.names.iter().all(|w| y.names.contains(w))
+            || y.names.iter().all(|w| x.names.contains(w))
     };
-    let only_a: Vec<String> = fa
-        .conjuncts
-        .iter()
-        .filter(|x| !x.is_empty() && !matched(x, &fb.conjuncts))
-        .map(|x| x.join(" "))
-        .collect();
-    let only_b: Vec<String> = fb
-        .conjuncts
-        .iter()
-        .filter(|x| !x.is_empty() && !matched(x, &fa.conjuncts))
-        .map(|x| x.join(" "))
-        .collect();
+    let (all_a, all_b) = (all_conjuncts(cpp), all_conjuncts(rust));
+    let missing = |xs: &[crate::model::Conjunct], ys: &[crate::model::Conjunct], all: &[&crate::model::Conjunct]| -> Vec<String> {
+        xs.iter()
+            .filter(|x| !ys.iter().any(|y| same(x, y)) && !all.iter().any(|y| same(x, y)))
+            .map(|x| x.text.clone())
+            .collect()
+    };
+    let only_b = missing(&fb.conjuncts, &fa.conjuncts, &all_a);
+    let only_a = missing(&fa.conjuncts, &fb.conjuncts, &all_b);
     if !only_b.is_empty() {
         notes.push(Note::new(
             Severity::Issue,
             Category::ControlFlow,
-            format!("Rust's condition adds a test of [{}]", only_b.join("; ")),
+            format!(
+                "Rust's condition adds a test that C++ doesn't make: {}",
+                only_b.join("; ")
+            ),
         ));
     }
     if !only_a.is_empty() {
         notes.push(Note::new(
             Severity::Issue,
             Category::ControlFlow,
-            format!("C++'s condition also tests [{}], which Rust's doesn't", only_a.join("; ")),
+            format!(
+                "C++'s condition tests {}, which the Rust doesn't",
+                only_a.join("; ")
+            ),
         ));
     }
 }
+
 fn sorted(v: &[String]) -> Vec<String> {
     let mut v = v.to_vec();
     v.sort();

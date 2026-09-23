@@ -162,6 +162,13 @@ impl<'a> Ctx<'a> {
             .collect();
         calls.sort();
         calls.dedup();
+        let mut qcalls: Vec<String> = b
+            .units
+            .iter()
+            .flat_map(|u| u.features.qcalls.clone())
+            .collect();
+        qcalls.sort();
+        qcalls.dedup();
         let name = match class {
             Some(c) => format!("{c}::{base}"),
             None => base.clone(),
@@ -177,6 +184,7 @@ impl<'a> Ctx<'a> {
             lines: self.lines[first - 1..end.min(self.lines.len())].to_vec(),
             units: b.units,
             calls,
+            qcalls,
             is_ffi,
         })
     }
@@ -431,6 +439,17 @@ impl<'a> Ctx<'a> {
             }
         }
         self.plain(n, depth, b);
+        if let Some(last) = b.units.last_mut() {
+            if last.start_line == line
+                && last.kind == UnitKind::Stmt
+                && last.features.errors.is_empty()
+                && last.features.locks.is_empty()
+                && !last.features.propagates
+                && value.is_none_or(|v| is_pure_or_accessor(v, self.src))
+            {
+                last.features.plumbing = true;
+            }
+        }
     }
 
     fn if_expression(
@@ -511,7 +530,7 @@ impl<'a> Ctx<'a> {
     }
 
     /// The names each top-level `&&` or `||` operand of a condition mentions.
-    fn conjuncts(&self, n: Node, out: &mut Vec<Vec<String>>) {
+    fn conjuncts(&self, n: Node, out: &mut Vec<crate::model::Conjunct>) {
         let mut n = n;
         while n.kind() == "parenthesized_expression" {
             match ts::named_children(n).into_iter().next() {
@@ -543,7 +562,10 @@ impl<'a> Ctx<'a> {
             }
             _ => {}
         }
-        out.push(self.features(n, &[]).names);
+        out.push(crate::model::Conjunct {
+            text: self.text(n).split_whitespace().collect::<Vec<_>>().join(" "),
+            names: self.features(n, &[]).names,
+        });
     }
 
     /// The `if` in `if ...`, `Err(if ...)` or `Ok(if ...)`.
@@ -627,6 +649,54 @@ impl<'a> Ctx<'a> {
                 }
             }
         }
+    }
+}
+
+/// An initializer with no effect of its own: a value read with no calls
+/// (`*fields.timestamp`, `unsafe { &*self.dispatcher }`), or a call of a
+/// zero-argument accessor (`self.state()`).
+fn is_pure_or_accessor(v: Node, src: &[u8]) -> bool {
+    fn calls<'t>(n: Node<'t>, out: &mut Vec<Node<'t>>) {
+        if matches!(n.kind(), "call_expression" | "macro_invocation" | "try_expression") {
+            out.push(n);
+        }
+        for c in ts::named_children(n) {
+            calls(c, out);
+        }
+    }
+    let mut v = v;
+    loop {
+        match v.kind() {
+            "parenthesized_expression" | "unsafe_block" | "block" | "reference_expression"
+            | "unary_expression" => {
+                let inner: Vec<Node> = ts::named_children(v)
+                    .into_iter()
+                    .filter(|c| !ts::is_comment(*c) && c.kind() != "mutable_specifier")
+                    .collect();
+                match inner.as_slice() {
+                    [one] if v.kind() != "block" || one.kind().ends_with("expression") || one.kind() == "field_expression" || one.kind() == "identifier" => v = *one,
+                    [one] if v.kind() == "block" && one.kind() == "expression_statement" => v = *one,
+                    _ => break,
+                }
+            }
+            _ => break,
+        }
+    }
+    let mut found = Vec::new();
+    calls(v, &mut found);
+    match found.as_slice() {
+        [] => true,
+        [c] if c.id() == v.id() && c.kind() == "call_expression" => {
+            let no_args = c
+                .child_by_field_name("arguments")
+                .is_some_and(|a| ts::named_children(a).iter().all(|x| ts::is_comment(*x)));
+            let name = c
+                .child_by_field_name("function")
+                .map(|f| ts::text(f, src))
+                .unwrap_or("");
+            no_args && !crate::normalize::is_mutating(name)
+        }
+        _ => false,
     }
 }
 

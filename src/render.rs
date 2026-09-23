@@ -1,7 +1,7 @@
 //! Plain-text output, in the spirit of `diff -y`.
 
 use crate::analyze::{CppOrigin, Link, PairReport, Report};
-use crate::check::{Marker, Severity};
+use crate::check::{Marker, Row};
 use crate::model::{Function, Unit};
 use std::fmt::Write;
 
@@ -138,6 +138,14 @@ fn render_pair(out: &mut String, p: &PairReport, opts: &RenderOptions) {
         }
         Link::Similarity => {}
     }
+    for o in &p.overrides {
+        let _ = writeln!(
+            out,
+            "  also  C++ {}  {}  (override in a related class, folded into this Rust function)",
+            o.cpp.name,
+            o.cpp.location()
+        );
+    }
     if let Some(f) = &p.forwarder {
         let _ = writeln!(
             out,
@@ -169,7 +177,11 @@ fn render_pair(out: &mut String, p: &PairReport, opts: &RenderOptions) {
 
     if !opts.summary_only {
         out.push('\n');
-        render_rows(out, p, opts);
+        render_rows(out, &p.cpp, &p.rust, &p.rows, opts);
+        for o in &p.overrides {
+            let _ = writeln!(out, "\n  ---- override {}  <->  {}", o.cpp.name, p.rust.name);
+            render_rows(out, &o.cpp, &p.rust, &o.rows, opts);
+        }
     }
 
     out.push('\n');
@@ -227,14 +239,23 @@ fn render_pair(out: &mut String, p: &PairReport, opts: &RenderOptions) {
         s.comments_changed,
         s.comments_total - s.comments_same - s.comments_changed
     );
-    let mut findings: Vec<_> = p.findings.iter().collect();
-    findings.sort_by_key(|f| f.severity);
+    let mut findings: Vec<(&Function, &crate::check::Finding)> = p
+        .findings
+        .iter()
+        .map(|f| (&p.cpp, f))
+        .chain(
+            p.overrides
+                .iter()
+                .flat_map(|o| o.findings.iter().map(move |f| (&o.cpp, f))),
+        )
+        .collect();
+    findings.sort_by_key(|(_, f)| f.severity);
     if !findings.is_empty() {
         let _ = writeln!(out, "  findings");
-        for f in findings {
+        for (cf, f) in findings {
             let c = f
                 .cpp_line
-                .map_or("-".to_string(), |l| format!("{}:{}", short(&p.cpp.path), l));
+                .map_or("-".to_string(), |l| format!("{}:{}", short(&cf.path), l));
             let r = f.rust_line.map_or("-".to_string(), |l| {
                 format!("{}:{}", short(&p.rust.path), l)
             });
@@ -298,34 +319,33 @@ fn signature_indent(f: &Function) -> usize {
         .unwrap_or(0)
 }
 
-fn render_rows(out: &mut String, p: &PairReport, opts: &RenderOptions) {
-    let (ci, ri) = (signature_indent(&p.cpp), signature_indent(&p.rust));
+fn render_rows(out: &mut String, cpp: &Function, rust: &Function, rows: &[Row], opts: &RenderOptions) {
+    let (ci, ri) = (signature_indent(cpp), signature_indent(rust));
     let (mut last_c, mut last_r) = (0usize, 0usize);
     let visible: Vec<bool> = match opts.context {
-        None => vec![true; p.rows.len()],
+        None => vec![true; rows.len()],
         Some(k) => {
-            let marked: Vec<usize> = p
-                .rows
+            let marked: Vec<usize> = rows
                 .iter()
                 .enumerate()
                 .filter(|(_, r)| r.marker != Marker::Same)
                 .map(|(i, _)| i)
                 .collect();
-            (0..p.rows.len())
+            (0..rows.len())
                 .map(|i| marked.iter().any(|&m| m.abs_diff(i) <= k))
                 .collect()
         }
     };
     let half = opts.width.saturating_sub(16) / 2;
     let mut skipped = false;
-    for (idx, row) in p.rows.iter().enumerate() {
+    for (idx, row) in rows.iter().enumerate() {
         let c = row
             .cpp
-            .map(|i| unit_lines(&p.cpp, &p.cpp.units[i], &mut last_c, ci))
+            .map(|i| unit_lines(cpp, &cpp.units[i], &mut last_c, ci))
             .unwrap_or_default();
         let r = row
             .rust
-            .map(|j| unit_lines(&p.rust, &p.rust.units[j], &mut last_r, ri))
+            .map(|j| unit_lines(rust, &rust.units[j], &mut last_r, ri))
             .unwrap_or_default();
         if !visible[idx] {
             skipped = true;

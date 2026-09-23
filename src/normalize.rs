@@ -106,6 +106,18 @@ const NOISE_CALLS: &[&str] = &[
     "iter_mut",
     "into_iter",
     "guard",
+    // Option and pointer tests, which the other language writes as a
+    // truthiness test or a null comparison.
+    "is_some",
+    "is_none",
+    "is_null",
+    "has_value",
+    // `zx::error(s)` / `zx::ok(v)` are C++'s `Err(s)` / `Ok(v)`.
+    "error",
+    "success",
+    // Zircon's handle table is how C++ reaches a handle's dispatcher; Rust
+    // looks the handle up in one call.
+    "handle_table",
 ];
 
 /// Normalizes the name of a called function, method or macro. Returns `None`
@@ -119,6 +131,17 @@ pub fn call(name: &str) -> Option<String> {
         .filter(|s| !s.trim().is_empty());
     let last = segs.next().unwrap_or(&name);
     let mut n = ident(last);
+    // `Type::get(...)` looks up a Type, like C++'s `GetType(...)`.
+    if n == "get" {
+        if let Some(ty) = name
+            .rsplit("::")
+            .nth(1)
+            .map(str::trim)
+            .filter(|s| s.starts_with(|c: char| c.is_ascii_uppercase()))
+        {
+            return Some(alias(&format!("get_{}", ident(ty))).to_string());
+        }
+    }
     // `Foo::new(...)` constructs a Foo, like C++ `Foo foo{...}`.
     if matches!(
         n.as_str(),
@@ -149,6 +172,41 @@ pub fn call(name: &str) -> Option<String> {
         return None;
     }
     Some(alias(&n).to_string())
+}
+
+/// A call through a type path as `type::method` (`Foo::Create` and
+/// `Foo::create` both give `foo::create`), or `None` for other calls.
+pub fn qualified_call(name: &str) -> Option<String> {
+    let name = strip_generics(name.trim().trim_end_matches('!'));
+    let segs: Vec<&str> = name.split("::").map(str::trim).collect();
+    if segs.len() < 2 {
+        return None;
+    }
+    let (ty, m) = (segs[segs.len() - 2], segs[segs.len() - 1]);
+    if !ty.starts_with(|c: char| c.is_ascii_uppercase()) || m.is_empty() {
+        return None;
+    }
+    Some(format!("{}::{}", ident(ty), ident(m)))
+}
+
+/// Whether a zero-argument call is likely to change state, so binding its
+/// result is not mere bookkeeping.
+pub fn is_mutating(name: &str) -> bool {
+    let last = name
+        .rsplit(['.', ':', '>'])
+        .next()
+        .unwrap_or(name)
+        .trim_end_matches('!');
+    let w = ident(last);
+    const VERBS: &[&str] = &[
+        "take", "pop", "reset", "release", "clear", "lock", "unlock", "acquire", "cancel", "drain",
+        "next", "commit", "create", "alloc", "allocate", "new", "make", "destroy", "close", "open",
+        "start", "stop", "wait", "signal", "trigger", "ack", "flush", "sync", "leak", "detach",
+        "swap", "replace", "remove", "insert", "push", "increment", "decrement", "bind", "unbind",
+        "init", "initialize", "try", "fetch", "read", "write", "update", "set", "run", "join",
+        "enable", "disable", "mask", "unmask", "register", "unregister", "adopt", "into",
+    ];
+    words(&w).first().is_some_and(|first| VERBS.contains(&first.as_str()))
 }
 
 /// Maps equivalent C++ and Rust spellings onto one name.
@@ -185,7 +243,24 @@ fn alias(n: &str) -> &str {
         "pop_back" | "pop" => "pop",
         "push_front" => "push_front",
         "pop_front" => "pop_front",
-        "reset" | "take" => "take",
+        "reset" | "take" | "swap" => "take",
+        "exchange" | "replace" => "replace",
+        // Volatile device memory access.
+        "mmio_read8" | "mmio_read16" | "mmio_read32" | "mmio_read64" | "readb" | "readw"
+        | "readl" | "readq" | "read_volatile" => "mmio_read",
+        "mmio_write8" | "mmio_write16" | "mmio_write32" | "mmio_write64" | "writeb" | "writew"
+        | "writel" | "writeq" | "write_volatile" => "mmio_write",
+        // Zircon's handle lookups: `up->handle_table().GetDispatcherWithRights(...)`
+        // and `Dispatcher::get_with_rights::<T>(...)`.
+        "get_dispatcher_with_rights" | "get_with_rights" => "get_with_rights",
+        "get_dispatcher" => "get_dispatcher",
+        // User memory: `out.copy_to_user(v)` and `out.write(v)`.
+        "copy_to_user" | "copy_array_to_user" => "write_user",
+        "copy_from_user" | "copy_array_from_user" => "read_user",
+        "add_overflow" | "checked_add" => "checked_add",
+        "sub_overflow" | "checked_sub" => "checked_sub",
+        "mul_overflow" | "checked_mul" => "checked_mul",
+        "adopt_ref" | "make_ref_counted" => "adopt_ref",
         "release" | "unlock" | "drop" => "release",
         other => other,
     }

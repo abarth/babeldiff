@@ -83,6 +83,8 @@ pub struct FeatureAcc {
     /// Names of called functions as written, so they are not also counted
     /// as identifiers.
     pub callees: Vec<String>,
+    /// Calls through a type path, as `type::method` (`Foo::create`).
+    pub qcalls: Vec<String>,
 }
 
 impl FeatureAcc {
@@ -92,6 +94,9 @@ impl FeatureAcc {
             .push(normalize::ident(last.trim_end_matches('!')));
         if let Some(c) = normalize::call(name) {
             self.calls.push(c);
+        }
+        if let Some(q) = normalize::qualified_call(name) {
+            self.qcalls.push(q);
         }
     }
 
@@ -136,14 +141,17 @@ impl FeatureAcc {
             calls.retain(|c| !LOCK_CALLS.contains(&c.as_str()) && !c.contains("lock"));
             idents.retain(|i| !i.contains("lock"));
         }
+        // Names are compared without underscores, so a C++ enumerator
+        // `NEEDACK` matches the Rust variant `NeedAck`.
         let mut names: Vec<String> = calls
             .iter()
             .chain(idents.iter())
             .map(|n| {
                 let n = n.strip_prefix("set_").unwrap_or(n);
-                n.strip_prefix("get_").unwrap_or(n).to_string()
+                n.strip_prefix("get_").unwrap_or(n).replace('_', "")
             })
             .collect();
+        let idents: Vec<String> = idents.iter().map(|i| i.replace('_', "")).collect();
         names.sort();
         names.dedup();
         let asserts = calls.iter().any(|c| c == "assert");
@@ -165,6 +173,7 @@ impl FeatureAcc {
             lock_plumbing: false,
             plumbing: false,
             conjuncts: Vec::new(),
+            qcalls: self.qcalls,
         }
     }
 }

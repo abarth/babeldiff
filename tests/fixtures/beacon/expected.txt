@@ -1,11 +1,11 @@
-babeldiff: 7 pairs, 0 issues, 4 notes; 0 C++ and 0 Rust functions unpaired
+babeldiff: 7 pairs, 0 issues, 3 notes; 0 C++ and 0 Rust functions unpaired
 legend: = same  ~ note  ! issue  < only in C++  > only in Rust
 
 ==== BeaconDispatcher::Subscribe  <->  BeaconDispatcher::subscribe
   C++   zircon/kernel/object/beacon_dispatcher.cc:41-55
   Rust  zircon/kernel/object/beacon_dispatcher.rs:20-38
   via   C++ now calls FFI shim rust_beacon_dispatcher_subscribe  zircon/kernel/object/beacon_dispatcher_ffi.rs:10-27
-  similarity 0.78, 0 issues, 2 notes
+  similarity 0.78, 0 issues, 1 note
 
                                                                                 >     20 /// Adds `key` to the subscribers and returns its index.
                                                                                 >     22 /// Returns ZX_ERR_NO_RESOURCES if the beacon already has the maximum n…
@@ -18,7 +18,6 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
     48     if (subscribers_[i] == key) {                                        =     30         if guard.subscribers[i as usize] == key {
     49       return ZX_ERR_ALREADY_EXISTS;                                      =     31             return Err(Status::ALREADY_EXISTS);
                                                                                 >     34     let index = guard.subscriber_count;
-        ^ ~ statement only in Rust
     52   subscribers_[subscriber_count_] = key;                                 =     35     guard.subscribers[index as usize] = key;
                                                                                 >     36     guard.subscriber_count += 1;
         ^ ~ statement only in Rust
@@ -34,7 +33,6 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
   flow     if 2, loop 1, return 3
   comments 1 C++ comment: 1 identical, 0 reworded, 0 missing in Rust
   findings
-    ~ - | beacon_dispatcher.rs:34  statement only in Rust
     ~ - | beacon_dispatcher.rs:36  statement only in Rust
 
 ==== BeaconDispatcher::Unsubscribe  <->  BeaconDispatcher::unsubscribe
