@@ -502,6 +502,8 @@ fn lantern_finds_the_planted_mistakes() {
             "call C++ calls the helper copy_color at 3 places (lines 44, 45, 46); the Rust never calls it, so its code is repeated inline",
             "call C++ macro COPY_WICKS is expanded inline in the Rust; keep it as a macro (macro_rules!) and use it where the C++ does",
             "call C++ macro COPY_WICKS is expanded inline in the Rust; keep it as a macro (macro_rules!) and use it where the C++ does",
+            "comment doc comment added in Rust where the C++ function has none; a conversion adds no comments other than SAFETY",
+            "comment doc comment added in Rust where the C++ function has none; a conversion adds no comments other than SAFETY",
             "error-path Rust adds a check `lantern.is_null() || out.is_null()`, returning INVALID_ARGS, that the C++ doesn't make",
             "pairing the change defines read_brightness twice, here and at zircon/kernel/arch/toy/src/lantern.rs:8, and the copies differ; both are compared with the C++, and callers may reach either",
             "value C++ sets LANTERN_BRIGHT_MASK here, and the Rust doesn't",

@@ -101,7 +101,7 @@ new file mode 100644
 index 0000000..3cc1117
 --- /dev/null
 +++ b/zircon/kernel/object/beacon_dispatcher.rs
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,93 @@
 +// Copyright 2026 The Fuchsia Authors
 +//
 +// Use of this source code is governed by a MIT-style
@@ -121,9 +121,6 @@ index 0000000..3cc1117
 +const BURST_LENGTH: u64 = 3;
 +
 +impl BeaconDispatcher {
-+    /// Adds `key` to the subscribers and returns its index.
-+    ///
-+    /// Returns ZX_ERR_NO_RESOURCES if the beacon already has the maximum number of subscribers.
 +    pub fn subscribe(&self, key: u64) -> Result<u32, Status> {
 +        ksync::lock!(let mut guard = self.lock());
 +        if guard.subscriber_count >= MAX_SUBSCRIBERS {
@@ -141,7 +138,6 @@ index 0000000..3cc1117
 +        Ok(index)
 +    }
 +
-+    /// Removes `key` from the subscribers.
 +    pub fn unsubscribe(&self, key: u64) -> Result<(), Status> {
 +        ksync::lock!(let mut guard = self.lock());
 +        for i in 0..guard.subscriber_count {
@@ -156,7 +152,6 @@ index 0000000..3cc1117
 +        Err(Status::NOT_FOUND)
 +    }
 +
-+    /// Flashes the beacon in `mode`, waking every subscriber.
 +    pub fn flash(&self, mode: u32) -> Result<(), Status> {
 +        Self::check_mode(mode)?;
 +        ksync::lock!(let mut guard = self.lock());
@@ -173,8 +168,6 @@ index 0000000..3cc1117
 +        if mode <= ZX_BEACON_MODE_MAX { Ok(()) } else { Err(Status::INVALID_ARGS) }
 +    }
 +
-+    /// Returns the key of the subscriber at `index`.
-+    ///
 +    /// # Safety
 +    ///
 +    /// Nothing here is unsafe; the section exists to test that babeldiff
@@ -185,7 +178,6 @@ index 0000000..3cc1117
 +        Ok(*key)
 +    }
 +
-+    /// Returns how many times the beacon has flashed.
 +    pub fn flash_count(&self) -> u64 {
 +        ksync::lock!(let guard = self.lock.lock());
 +        let token = guard.token();
