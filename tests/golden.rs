@@ -307,6 +307,14 @@ fn html_report_is_self_contained() {
     // Source text is escaped.
     assert!(!html.contains("<const"));
     assert!(html.contains("&lt;<span class=\"kw\">const</span>"));
+    // Each code block names its files and functions, so that a line
+    // comment can say where it points.
+    let p = &report.pairs[0];
+    assert!(html.contains(&format!(
+        "<div class=\"code\" data-cp=\"{}\" data-rp=\"{}\"",
+        p.cpp.path, p.rust.path
+    )));
+    assert!(html.contains("id=\"comments-text\""));
 }
 
 #[test]
@@ -634,4 +642,31 @@ fn conditional_compilation_must_stay_conditional() {
     let cfg = "pub fn lamp_on(lamp: &mut Lamp) {\n    lamp.power(true);\n    #[cfg(sanitize = \"safestack\")]\n    lamp.reset_shadow(lamp.shadow_top());\n    #[cfg(not(sanitize = \"safestack\"))]\n    lamp.reset();\n    lamp.glow();\n}\n";
     let issues = only_issues(LAMP_ON_CPP, cfg);
     assert!(issues.is_empty(), "{issues:?}");
+}
+
+fn all_findings(cpp: &str, rust: &str) -> Vec<String> {
+    let cs = ChangeSet::from_files(&[
+        ("lamp.cc".into(), cpp.into()),
+        ("lamp.rs".into(), rust.into()),
+    ]);
+    let report = babeldiff::run(&cs, &Options::default(), &mut NoFinder);
+    assert_eq!(report.pairs.len(), 1);
+    report.pairs[0]
+        .findings
+        .iter()
+        .map(|f| f.message.clone())
+        .collect()
+}
+
+#[test]
+fn static_assert_matches_a_const_assert() {
+    let cpp = "int lamp_pages(Lamp* lamp) {\n  static_assert(kLampSize == 3 * kPageSize);\n  return lamp->pages();\n}\n";
+    let rust = "pub fn lamp_pages(lamp: &Lamp) -> i32 {\n    const {\n        assert!(LAMP_SIZE == 3 * PAGE_SIZE);\n    }\n    lamp.pages()\n}\n";
+    let found = all_findings(cpp, rust);
+    assert!(!found.iter().any(|m| m.contains("assert")), "{found:?}");
+
+    // Dropping the assertion is still reported.
+    let dropped = "pub fn lamp_pages(lamp: &Lamp) -> i32 {\n    lamp.pages()\n}\n";
+    let found = all_findings(cpp, dropped);
+    assert!(found.iter().any(|m| m.contains("assert")), "{found:?}");
 }

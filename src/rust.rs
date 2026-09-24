@@ -194,6 +194,8 @@ impl<'a> Ctx<'a> {
     fn collect(&self, n: Node, acc: &mut FeatureAcc, skip: &[Node]) {
         static MACRO_CALL: LazyLock<Regex> =
             LazyLock::new(|| Regex::new(r"\b([A-Za-z_]\w*)\s*(?:::\s*<[^>()]*>)?\s*\(").unwrap());
+        static STRING: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r#""(?:[^"\\]|\\.)*""#).unwrap());
         if skip.iter().any(|s| s.id() == n.id()) {
             return;
         }
@@ -211,7 +213,10 @@ impl<'a> Ctx<'a> {
                     .into_iter()
                     .filter(|c| c.kind() == "token_tree")
                 {
+                    // Words in a message string (`"copy_(to|from)_user ..."`)
+                    // are not calls.
                     let t = ts::text_without(tt, self.src, skip);
+                    let t = STRING.replace_all(&t, "\"\"");
                     for c in MACRO_CALL.captures_iter(&t) {
                         acc.call(&c[1]);
                     }
