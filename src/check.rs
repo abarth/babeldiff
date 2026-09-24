@@ -501,13 +501,14 @@ fn conditional_compilation(rows: &mut [Row], cpp: &Function, rust: &Function) {
         }
     };
     // Rust that mentions the condition's names outside any cfg: the stub
-    // or run-time test the `#if` became.
-    let mention = |u: &Unit| -> Option<(usize, String)> {
+    // or run-time test the `#if` became. The one nearest `near` (the Rust
+    // line reached so far) wins.
+    let mention = |u: &Unit, near: usize| -> Option<(usize, String)> {
         let words: Vec<&String> = u.features.idents.iter().filter(|w| w.len() >= 4).collect();
         rust.units
             .iter()
             .filter(|v| v.kind != UnitKind::Cfg && v.kind != UnitKind::Comment)
-            .find_map(|v| {
+            .filter_map(|v| {
                 let t = directive(rust, v);
                 let flat = t.replace('_', "").to_ascii_lowercase();
                 words
@@ -515,8 +516,13 @@ fn conditional_compilation(rows: &mut [Row], cpp: &Function, rust: &Function) {
                     .any(|w| flat.contains(w.as_str()))
                     .then_some((v.start_line, t))
             })
+            .min_by_key(|(line, _)| line.abs_diff(near))
     };
+    let mut near = rust.start_line;
     for r in rows.iter_mut() {
+        if let Some(j) = r.rust {
+            near = rust.units[j].start_line;
+        }
         let cu = r.cpp.map(|k| (k, &cpp.units[k]));
         let ru = r.rust.map(|k| &rust.units[k]);
         match (cu, ru) {
@@ -533,7 +539,7 @@ fn conditional_compilation(rows: &mut [Row], cpp: &Function, rust: &Function) {
                         "C++ compiles {} only when `{d}`; the Rust has no `#[cfg]` or `cfg!` for it, so it runs that code unconditionally or not at all",
                         span(u, k)
                     );
-                    if let Some((line, text)) = mention(u) {
+                    if let Some((line, text)) = mention(u, near) {
                         let text: String = text.chars().take(60).collect();
                         msg.push_str(&format!(
                             "; Rust line {line} (`{text}`) is not a compile-time condition"
