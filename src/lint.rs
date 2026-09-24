@@ -9,6 +9,9 @@
 //! - `shim-logic`: an FFI shim (`rust_*` export or `cpp_*` helper) that
 //!   branches or loops instead of only forwarding and converting results.
 //!   Every function in an `_ffi.cc` file counts as a shim.
+//! - `mangled-symbol`: Rust that declares, calls or defines a C++ function
+//!   by its mangled symbol (`_ZN6Thread...`) instead of going through a
+//!   `cpp_*` helper or `rust_*` export.
 
 use crate::check::Severity;
 use crate::input::{ChangeSet, Version};
@@ -28,6 +31,7 @@ pub enum LintKind {
     Provenance,
     InventedLifetime,
     UnsafeDensity,
+    MangledSymbol,
 }
 
 impl LintKind {
@@ -41,6 +45,7 @@ impl LintKind {
             LintKind::Provenance => "provenance-comment",
             LintKind::InventedLifetime => "invented-lifetime",
             LintKind::UnsafeDensity => "unsafe-density",
+            LintKind::MangledSymbol => "mangled-symbol",
         }
     }
 
@@ -54,6 +59,9 @@ impl LintKind {
             LintKind::Provenance => "no comments about where the code was ported from",
             LintKind::InventedLifetime => "references borrow from what they point into",
             LintKind::UnsafeDensity => "safe facades instead of unsafe code at each use",
+            LintKind::MangledSymbol => {
+                "C++ and Rust call each other through cpp_ and rust_ FFI functions"
+            }
         }
     }
 }
@@ -76,6 +84,7 @@ pub fn lint(cs: &ChangeSet) -> Vec<Lint> {
     for v in &cs.rust_new {
         out.extend(unsafe_safety(v));
         out.extend(provenance(v));
+        out.extend(mangled_symbols(v));
     }
     out.extend(rust_function_lints(cs));
     out.extend(shim_logic(cs));
@@ -859,6 +868,138 @@ fn provenance(v: &Version) -> Vec<Lint> {
 }
 
 // ---------------------------------------------------------------------------
+// mangled C++ symbols
+
+/// An Itanium C++ mangled name: `_Z` and then a nested name, a length or a
+/// special name.
+static MANGLED: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b_Z[NLSTZGD0-9][A-Za-z0-9_$.]*").unwrap());
+
+/// Readable form of a mangled name, or the name itself.
+fn demangle(sym: &str) -> String {
+    cpp_demangle::Symbol::new(sym)
+        .ok()
+        .and_then(|s| s.demangle().ok())
+        .unwrap_or_else(|| sym.to_string())
+}
+
+/// Rust that binds to a C++ function by its mangled name: an `extern`
+/// declaration named `_Z...` or given `#[link_name = "_Z..."]` (Rust
+/// calling C++), or a definition named `_Z...` or given
+/// `#[export_name = "_Z..."]` (Rust standing in for a C++ function). Both
+/// skip the `cpp_`/`rust_` FFI layer, so nothing checks the two sides
+/// agree, and they break as soon as the C++ signature changes.
+fn mangled_symbols(v: &Version) -> Vec<Lint> {
+    let lines: Vec<&str> = v.text.lines().collect();
+    let code = |l: &str| code_part(l).to_string();
+    let mut seen: BTreeSet<(bool, String)> = BTreeSet::new();
+    let mut out = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let n = i + 1;
+        let text = code(line);
+        let t = text.trim();
+        if t.is_empty() || !touched(v, n..=n) {
+            continue;
+        }
+        // (symbol, exported, name the Rust code uses for it)
+        let found: Option<(String, bool, String)> = if t.starts_with("#[") {
+            let attr = |key: &str| {
+                let at = t.find(key)?;
+                let m = MANGLED.find(&t[at..])?;
+                Some(m.as_str().to_string())
+            };
+            let item = || -> String {
+                lines[i + 1..]
+                    .iter()
+                    .map(|l| code(l))
+                    .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with("#["))
+                    .and_then(|l| {
+                        let after = l.split_once("fn ")?.1;
+                        Some(
+                            after
+                                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                                .next()?
+                                .to_string(),
+                        )
+                    })
+                    .unwrap_or_default()
+            };
+            if let Some(sym) = attr("link_name") {
+                Some((sym, false, item()))
+            } else {
+                attr("export_name").map(|sym| (sym, true, item()))
+            }
+        } else if let Some(after) = t.split_once("fn ").map(|(_, a)| a) {
+            MANGLED.find(after).filter(|m| m.start() == 0).map(|m| {
+                // A body makes it a definition; a `;` a declaration.
+                let rest: String = std::iter::once(t.to_string())
+                    .chain(lines[i + 1..].iter().take(12).map(|l| code(l)))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let body = rest.find('{');
+                let semi = rest.find(';');
+                let exported = match (body, semi) {
+                    (Some(b), Some(s)) => b < s,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                (m.as_str().to_string(), exported, m.as_str().to_string())
+            })
+        } else {
+            None
+        };
+        let Some((sym, exported, local)) = found else {
+            continue;
+        };
+        if !seen.insert((exported, sym.clone())) {
+            continue;
+        }
+        let readable = demangle(&sym);
+        let message = if exported {
+            format!(
+                "Rust defines C++ `{readable}` under its mangled symbol `{sym}`; export a `rust_*` function instead and call it from C++"
+            )
+        } else {
+            let calls: Vec<String> = if local.is_empty() {
+                Vec::new()
+            } else {
+                let word = Regex::new(&format!(r"\b{}\s*\(", regex::escape(&local))).unwrap();
+                lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, l)| {
+                        let c = code(l);
+                        word.is_match(&c) && !c.contains("fn ") && *j != i
+                    })
+                    .map(|(j, _)| (j + 1).to_string())
+                    .collect()
+            };
+            let used = match calls.len() {
+                0 => String::new(),
+                1 => format!(" (called at line {})", calls[0]),
+                _ => format!(
+                    " (called at lines {}{})",
+                    calls.iter().take(6).cloned().collect::<Vec<_>>().join(", "),
+                    if calls.len() > 6 { ", ..." } else { "" }
+                ),
+            };
+            format!(
+                "Rust calls C++ `{readable}` through its mangled symbol `{sym}`{used}; call a `cpp_*` FFI function declared in a C++ header instead"
+            )
+        };
+        out.push(Lint {
+            kind: LintKind::MangledSymbol,
+            severity: Severity::Issue,
+            path: v.path.clone(),
+            line: n,
+            message,
+            related: None,
+        });
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // unsafe without SAFETY
 
 fn unsafe_safety(v: &Version) -> Vec<Lint> {
@@ -1184,6 +1325,30 @@ mod tests {
         assert_eq!(l.len(), 1, "{l:?}");
         assert_eq!(l[0].line, 6);
         assert!(l[0].message.contains("`arch.buffer`"), "{}", l[0].message);
+    }
+
+    #[test]
+    fn mangled_symbols_are_reported() {
+        let v = version(
+            "foo.rs",
+            "unsafe extern \"C\" {\n    fn _ZNK4Lamp10brightnessEv(this: *const c_void) -> u32;\n    #[link_name = \"_Z9lamp_initv\"]\n    fn lamp_init();\n    fn cpp_lamp_off(lamp: *mut c_void);\n}\n\n/// Mirrors `_ZN4Lamp2onEv`.\n#[unsafe(export_name = \"_Z8lamp_dimj\")]\npub extern \"C\" fn lamp_dim(level: u32) {}\n\nfn use_it(l: *const c_void) -> u32 {\n    unsafe { lamp_init() };\n    unsafe { _ZNK4Lamp10brightnessEv(l) }\n}\n",
+        );
+        let l = mangled_symbols(&v);
+        let got: Vec<(usize, &str)> = l.iter().map(|l| (l.line, l.message.as_str())).collect();
+        assert_eq!(l.len(), 3, "{got:?}");
+        assert_eq!(l[0].line, 2);
+        assert!(
+            l[0].message.contains("`Lamp::brightness() const`")
+                && l[0].message.contains("called at line 14"),
+            "{}",
+            l[0].message
+        );
+        assert_eq!(l[1].line, 3);
+        assert!(l[1].message.contains("`lamp_init()`") && l[1].message.contains("line 13"));
+        assert_eq!(l[2].line, 9);
+        assert!(l[2]
+            .message
+            .starts_with("Rust defines C++ `lamp_dim(unsigned int)`"));
     }
 
     #[test]
