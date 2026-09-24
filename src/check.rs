@@ -1832,6 +1832,15 @@ fn mask_op(code: &str, c: &Constant) -> Option<&'static str> {
     ))
     .ok()?;
     let m = re.captures(code)?;
+    // `& !(A | B)` clears B as well as A.
+    let group = regex::Regex::new(&format!(
+        r"&=?\s*[!~]\s*\([^()]*\b{}\b",
+        regex::escape(&c.name)
+    ))
+    .ok()?;
+    if group.is_match(code) {
+        return Some("clears");
+    }
     let op = m.get(1).or(m.get(3)).map_or("", |o| o.as_str());
     Some(match (op.chars().next(), m.get(2).is_some()) {
         (Some('&'), true) => "clears",
@@ -1952,7 +1961,8 @@ fn one_sided(
     side: &str,
     vc: &ValueCtx,
 ) -> Option<Note> {
-    if vc.moved(c) {
+    // A C++ value found in a function the Rust calls moved there.
+    if side == "C++" && vc.moved(c) {
         return None;
     }
     let other_side = if side == "C++" { "Rust" } else { "C++" };

@@ -133,9 +133,8 @@ pub fn placement(pairs: &[PairReport]) -> (Vec<Placement>, Vec<Lint>) {
         // FFI glue on either side (`cpp_*` shims, `rust_*` trampolines)
         // is not ported code, and a weak pairing by similarity is too
         // unsure to count as a move.
-        let key = |b: &str| normalize::ident(b);
-        let glue =
-            p.cpp.base.starts_with("cpp_") || p.rust.base.starts_with("rust_") || p.rust.is_ffi;
+        let key = |b: &str| normalize::call(b).unwrap_or_else(|| normalize::ident(b));
+        let glue = p.cpp.base.starts_with("cpp_") || p.rust.base.starts_with("rust_");
         let unsure =
             p.link == Link::Similarity && p.score < SURE && key(&p.cpp.base) != key(&p.rust.base);
         if glue || unsure {

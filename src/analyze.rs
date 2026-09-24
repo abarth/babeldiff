@@ -1228,16 +1228,24 @@ fn structure_checks(
             // `write_percpu_u32`), a compiler intrinsic (`__wfi`), or a
             // shorthand the function defines for itself.
             let words = normalize::words(raw);
-            let fn_port = words.len() >= 2
-                && reach
-                    .iter()
-                    .any(|d| normalize::words(d).starts_with(&words[..2]));
+            let fn_port = words.len() >= 2 && {
+                // Every word but a generic last one (`FIELD`), or all of
+                // them: `riscv64_csr_read` is not a port of
+                // `RISCV64_CSR_CLEAR`.
+                let (last, head) = words.split_last().unwrap();
+                let generic = matches!(last.as_str(), "field" | "value" | "var" | "member" | "reg");
+                p.rust.calls.iter().any(|d| {
+                    let dw = normalize::words(d);
+                    head.iter().all(|w| dw.contains(w)) && (generic || dw.contains(last))
+                })
+            };
             let local = p
                 .cpp
                 .lines
                 .iter()
                 .any(|l| l.trim_start().starts_with("#") && l.contains(raw.as_str()));
-            if rust_calls(m) || fn_port || local || raw.starts_with("__") {
+            let direct = p.rust.calls.iter().any(|d| check::call_like(m, d));
+            if direct || fn_port || local || raw.starts_with("__") {
                 continue;
             }
             // Only a macro used as a statement of its own, like a function
@@ -1262,7 +1270,15 @@ fn structure_checks(
                 check::Note::new(
                     Severity::Issue,
                     check::Category::Call,
-                    format!("C++ macro {raw} is expanded inline in the Rust; keep it as a macro (macro_rules!) and use it where the C++ does"),
+                    match by_name.get(m).and_then(|v| v.first()) {
+                        Some(f) => format!(
+                            "C++ macro {raw} is expanded inline in the Rust, though Rust has {} ({}:{}); call it where the C++ uses the macro",
+                            f.base,
+                            file_name(&f.path),
+                            f.start_line
+                        ),
+                        None => format!("C++ macro {raw} is expanded inline in the Rust; keep it as a macro (macro_rules!) and use it where the C++ does"),
+                    },
                 ),
             ));
             demoted.extend(uses.iter().map(|&k| (k, why.clone())));
