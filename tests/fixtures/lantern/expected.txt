@@ -276,10 +276,10 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
   > Rust glow_level  zircon/kernel/arch/toy/src/glow.rs:28-33
 
 ==== File placement
-  lantern.cc -> lantern.rs (5), glow.rs (1, unexpected)
+  lantern.cc -> lantern.rs (6), glow.rs (1, unexpected)
 
 ==== Rubric lints
-  ! zircon/kernel/arch/toy/lantern.cc:1  [file-placement] lantern.cc was split across 2 Rust files: lantern.rs (5), glow.rs (1, not named after it); convert each C++ file into one Rust file
+  ! zircon/kernel/arch/toy/lantern.cc:1  [file-placement] lantern.cc was split across 2 Rust files: lantern.rs (6), glow.rs (1, not named after it); convert each C++ file into one Rust file
   ! zircon/kernel/arch/toy/src/glow.rs:31  [invented-lifetime] a reference is made from `buf_ptr`, a raw pointer into `lantern.buffer` (line 29), so its lifetime is invented rather than borrowed from `lantern.buffer`; borrow `lantern.buffer` instead
   ! zircon/kernel/arch/toy/src/lantern.rs:4  [provenance-comment] 2 comments say where the code was ported from (lines 4, 44), such as "Ported from `zircon/kernel/arch/toy/lantern.cc`."; drop them, since they stop being relevant once the change lands
 
