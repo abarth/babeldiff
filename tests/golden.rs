@@ -506,7 +506,7 @@ fn lantern_finds_the_planted_mistakes() {
             "pairing the change defines read_brightness twice, here and at zircon/kernel/arch/toy/src/lantern.rs:8, and the copies differ; both are compared with the C++, and callers may reach either",
             "value C++ sets LANTERN_BRIGHT_MASK here, and the Rust doesn't",
             "value Rust also clears LANTERN_FLAGS_RESUME, which the C++ doesn't",
-            "value only Rust uses LANTERN_OFF_MASK; the C++ function never mentions it",
+            "value only Rust uses LANTERN_OFF_MASK (0x700); the C++ function never mentions it",
         ]
     );
     // Both copies of read_brightness are compared with the C++.
@@ -534,7 +534,7 @@ fn lantern_finds_the_planted_mistakes() {
         lints,
         [
             ("lantern.cc", 1, "file-placement"),
-            ("glow.rs", 28, "invented-lifetime"),
+            ("glow.rs", 31, "invented-lifetime"),
             ("lantern.rs", 4, "provenance-comment"),
         ]
     );

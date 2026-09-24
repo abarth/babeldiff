@@ -172,6 +172,8 @@ pub struct Context<'a> {
     /// helpers the change added, and other Rust functions. C++ found there
     /// was moved, not dropped.
     pub elsewhere: &'a [&'a Function],
+    /// Constants the changed files define.
+    pub values: Option<&'a crate::values::Values>,
 }
 
 /// Like [`check`], with more to go on.
@@ -194,6 +196,7 @@ pub fn check_with(
         a == b
     };
     let (cpp_names, rust_names) = (Tokens::of(cpp), Tokens::of(rust));
+    let vc = ValueCtx::new(ctx);
     let mut rows = Vec::new();
     let unmatched_c: Vec<usize> = pairs
         .iter()
@@ -234,6 +237,7 @@ pub fn check_with(
                         &cpp_names,
                         &rust_names,
                         explained,
+                        &vc,
                         &mut notes,
                     );
                 }
@@ -278,7 +282,7 @@ pub fn check_with(
                     let n = soften_balanced(n, u, flow_balanced(u.kind));
                     notes.push(soften_moved(n, u, ctx.elsewhere));
                 }
-                one_sided_constant(&unit_text(cpp, u), u, "C++", &rust_names, &mut notes);
+                one_sided_constant(&unit_text(cpp, u), u, "C++", &rust_names, &vc, &mut notes);
                 Marker::CppOnly
             }
             (None, Some(j)) => {
@@ -307,7 +311,7 @@ pub fn check_with(
                 // value the C++ may not have.
                 let lost_value = !claimed.contains(&j) && u.kind != UnitKind::Comment;
                 if lost_value {
-                    one_sided_constant(&unit_text(rust, u), u, "Rust", &cpp_names, &mut notes);
+                    one_sided_constant(&unit_text(rust, u), u, "Rust", &cpp_names, &vc, &mut notes);
                 }
                 Marker::RustOnly
             }
@@ -324,6 +328,7 @@ pub fn check_with(
     switch_as_if_chain(&mut rows, cpp, rust);
     merged_checks(&mut rows, cpp, rust);
     assert_semantics(&mut rows, cpp, rust);
+    dedupe_values(&mut rows);
     group_runs(&mut rows, cpp, rust);
     let findings = refresh(&mut rows, cpp, rust);
     (rows, findings)
@@ -1663,7 +1668,7 @@ struct Constant {
 fn constants(text: &str) -> Vec<Constant> {
     static CONST: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
-            r"\b([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+|[A-Z]{3,}[0-9]*|k[A-Z][A-Za-z0-9]*)\b(\s*[(!])?",
+            r"\b([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+|[A-Z]{3,}[0-9]*|k[A-Z][A-Za-z0-9]*)\b(\s*[(!]|<)?",
         )
         .unwrap()
     });
@@ -1836,58 +1841,199 @@ fn mask_op(code: &str, c: &Constant) -> Option<&'static str> {
     })
 }
 
+/// What a value check knows beyond the two functions: the constants the
+/// changed files define, and the functions the Rust calls, where a value
+/// may have moved.
+struct ValueCtx<'a> {
+    values: Option<&'a crate::values::Values>,
+    elsewhere: Vec<Tokens>,
+}
+
+impl ValueCtx<'_> {
+    fn new<'a>(ctx: &Context<'a>) -> ValueCtx<'a> {
+        ValueCtx {
+            values: ctx.values,
+            elsewhere: ctx.elsewhere.iter().map(|f| Tokens::of(f)).collect(),
+        }
+    }
+
+    fn value(&self, c: &Constant) -> Option<u64> {
+        self.values?.value(&c.name)
+    }
+
+    fn canonical(&self, c: &Constant) -> String {
+        self.values
+            .map_or_else(|| c.name.clone(), |v| v.canonical(&c.name))
+    }
+
+    fn defined(&self, c: &Constant) -> bool {
+        self.values.is_some_and(|v| v.defined(&c.name))
+    }
+
+    /// Whether the constant appears in a function the Rust calls, so it
+    /// moved rather than went missing.
+    fn moved(&self, c: &Constant) -> bool {
+        self.elsewhere.iter().any(|t| t.has(c))
+    }
+
+    /// Whether two constants stand for the same thing: one aliases the
+    /// other, or both evaluate to the same number.
+    fn same(&self, a: &Constant, b: &Constant) -> bool {
+        a.words.ends_with(&b.words)
+            || b.words.ends_with(&a.words)
+            || self.canonical(a) == self.canonical(b)
+            || self.value(a).is_some() && self.value(a) == self.value(b)
+    }
+
+    /// The constants in a unit's code that are values: not statics, not
+    /// macros used as statements (`PANIC_UNIMPLEMENTED;`), and not in an
+    /// assertion, which is compared as one.
+    fn constants(&self, text: &str) -> Vec<Constant> {
+        let code = code_only(text);
+        let t = code.trim_start();
+        let assert = [
+            "ASSERT",
+            "DEBUG_ASSERT",
+            "ZX_ASSERT",
+            "ZX_DEBUG_ASSERT",
+            "assert",
+        ]
+        .iter()
+        .any(|a| t.starts_with(a))
+            || t.starts_with("debug_assert");
+        if assert {
+            return Vec::new();
+        }
+        constants(text)
+            .into_iter()
+            .filter(|c| !self.values.is_some_and(|v| v.is_static(&c.name)))
+            .filter(|c| {
+                let stmt = t.trim_end().trim_end_matches(';').trim_end();
+                !(stmt == c.name || stmt.ends_with(&format!("::{}", c.name)))
+            })
+            .collect()
+    }
+}
+
+/// Whether `code` extracts a bit field with the constant (`(v & MASK) >>
+/// SHIFT`), which Rust often writes as an accessor.
+fn extracts_field(code: &str, c: &Constant) -> bool {
+    let re = regex::Regex::new(&format!(
+        r"&\s*{0}\s*\)\s*>>|>>\s*{0}\b|>>[^&|;]*\)\s*&\s*{0}\b",
+        regex::escape(&c.name)
+    ));
+    re.is_ok_and(|re| re.is_match(code))
+}
+
+fn show(v: u64) -> String {
+    if v > 9 {
+        format!("{v:#x}")
+    } else {
+        v.to_string()
+    }
+}
+
+/// A constant with its value, when it is known: `X86_DR7_MASK (0x700)`.
+fn with_value(c: &Constant, vc: &ValueCtx) -> String {
+    match vc.value(c) {
+        Some(v) => format!("{} ({})", c.name, show(v)),
+        None => c.name.clone(),
+    }
+}
+
+/// How one constant on only one side is reported. A mask or flag
+/// operation is an issue, and so is a constant the change's own files
+/// define; a constant from elsewhere (a header, which may name the same
+/// value differently) is a note.
+fn one_sided(
+    c: &Constant,
+    code: &str,
+    other_literals: &[u128],
+    side: &str,
+    vc: &ValueCtx,
+) -> Option<Note> {
+    if vc.moved(c) {
+        return None;
+    }
+    let other_side = if side == "C++" { "Rust" } else { "C++" };
+    if let Some(op) = mask_op(code, c) {
+        let msg = if side == "C++" {
+            format!("C++ {op} {} here, and the Rust doesn't", c.name)
+        } else {
+            format!("Rust also {op} {}, which the C++ doesn't", c.name)
+        };
+        let severity = if extracts_field(code, c) {
+            Severity::Note
+        } else {
+            Severity::Issue
+        };
+        return Some(Note::new(severity, Category::Value, msg));
+    }
+    let literal = vc
+        .value(c)
+        .is_some_and(|v| other_literals.contains(&u128::from(v)));
+    let severity = if vc.defined(c) && !literal {
+        Severity::Issue
+    } else {
+        Severity::Note
+    };
+    Some(Note::new(
+        severity,
+        Category::Value,
+        format!(
+            "only {side} uses {}; the {other_side} function never mentions it",
+            with_value(c, vc)
+        ),
+    ))
+}
+
 /// Reports named constants, flags and masks on only one side of an aligned
 /// pair of units, when the other function never mentions them: `C++ writes
 /// 0, Rust writes X86_DR7_MASK`, or `Rust also clears X86_FLAGS_RF`.
+/// Constants are compared by value where the changed files define them, so
+/// a renamed constant is not a difference.
+#[allow(clippy::too_many_arguments)]
 fn value_diff(
     a: &str,
     b: &str,
     cpp_names: &Tokens,
     rust_names: &Tokens,
     explained: bool,
+    vc: &ValueCtx,
     notes: &mut Vec<Note>,
 ) {
-    let (ca, cb) = (constants(a), constants(b));
+    let (ca, cb) = (vc.constants(a), vc.constants(b));
     let only_a: Vec<&Constant> = ca
         .iter()
-        .filter(|c| {
-            !cb.iter()
-                .any(|d| d.words.ends_with(&c.words) || c.words.ends_with(&d.words))
-        })
+        .filter(|c| !cb.iter().any(|d| vc.same(c, d)))
         .filter(|c| !rust_names.has(c))
         .collect();
     let only_b: Vec<&Constant> = cb
         .iter()
-        .filter(|c| {
-            !ca.iter()
-                .any(|d| d.words.ends_with(&c.words) || c.words.ends_with(&d.words))
-        })
+        .filter(|c| !ca.iter().any(|d| vc.same(c, d)))
         .filter(|c| !cpp_names.has(c))
         .collect();
     if only_a.is_empty() && only_b.is_empty() {
         return;
     }
     let (la, lb) = (literals(a), literals(b));
-    let lit_only = |x: &[u128], y: &[u128]| -> Vec<String> {
-        x.iter()
-            .filter(|v| !y.contains(v))
-            .map(|v| {
-                if *v > 9 {
-                    format!("{v:#x}")
-                } else {
-                    v.to_string()
-                }
-            })
-            .collect()
+    let lit_only = |x: &[u128], y: &[u128]| -> Vec<u128> {
+        x.iter().filter(|v| !y.contains(v)).copied().collect()
     };
     let (lit_a, lit_b) = (lit_only(&la, &lb), lit_only(&lb, &la));
-    let names = |v: &[&Constant]| {
+    let shown = |v: &[u128]| {
         v.iter()
-            .map(|c| c.name.as_str())
+            .map(|&v| u64::try_from(v).map_or_else(|_| v.to_string(), show))
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let (code_a, code_b) = (code_only(a), code_only(b));
+    let names = |v: &[&Constant]| {
+        v.iter()
+            .map(|c| with_value(c, vc))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let (code_a, code_b) = (masks_only(&code_only(a)), masks_only(&code_only(b)));
     if explained {
         let masked = only_a.iter().any(|c| mask_op(&code_a, c).is_some())
             || only_b.iter().any(|c| mask_op(&code_b, c).is_some());
@@ -1895,10 +2041,22 @@ fn value_diff(
             return;
         }
     }
-    // One constant replaced by another.
+    let values = |v: &[&Constant]| -> Option<Vec<u64>> {
+        let mut out: Vec<u64> = v.iter().map(|c| vc.value(c)).collect::<Option<_>>()?;
+        out.sort();
+        out.dedup();
+        Some(out)
+    };
+    // One constant replaced by another: a difference when both are known
+    // to stand for different numbers.
     if !only_a.is_empty() && !only_b.is_empty() {
+        let severity = match (values(&only_a), values(&only_b)) {
+            (Some(x), Some(y)) if x == y => return,
+            (Some(_), Some(_)) => Severity::Issue,
+            _ => Severity::Note,
+        };
         notes.push(Note::new(
-            Severity::Issue,
+            severity,
             Category::Value,
             format!(
                 "C++ uses {} where Rust uses {}",
@@ -1908,79 +2066,131 @@ fn value_diff(
         ));
         return;
     }
-    // A literal and a constant may well be the same value.
+    // A literal and a constant: the same number spelled two ways, or a
+    // different number.
+    let literal_vs = |lits: &[u128], consts: &[&Constant]| -> Option<Severity> {
+        let v = values(consts)?;
+        if v.iter().any(|x| lits.contains(&u128::from(*x))) {
+            None
+        } else {
+            Some(Severity::Issue)
+        }
+    };
     if !only_b.is_empty() && !lit_a.is_empty() {
+        let severity = match values(&only_b) {
+            Some(_) => match literal_vs(&lit_a, &only_b) {
+                Some(s) => s,
+                None => return,
+            },
+            None => Severity::Note,
+        };
         notes.push(Note::new(
-            Severity::Note,
+            severity,
             Category::Value,
             format!(
                 "C++ uses {} where Rust uses {}",
-                lit_a.join(", "),
+                shown(&lit_a),
                 names(&only_b)
             ),
         ));
         return;
     }
     if !only_a.is_empty() && !lit_b.is_empty() {
+        let severity = literal_vs(&lit_b, &only_a).unwrap_or(Severity::Note);
         notes.push(Note::new(
-            Severity::Note,
+            severity,
             Category::Value,
             format!(
                 "C++ uses {} where Rust uses {}",
                 names(&only_a),
-                lit_b.join(", ")
+                shown(&lit_b)
             ),
         ));
         return;
     }
     for c in &only_a {
-        let msg = match mask_op(&code_a, c) {
-            Some(op) => format!("C++ {op} {} here, and the Rust doesn't", c.name),
-            None => format!(
-                "only C++ uses {} here; the Rust function never mentions it",
-                c.name
-            ),
-        };
-        notes.push(Note::new(Severity::Issue, Category::Value, msg));
+        notes.extend(one_sided(c, &code_a, &lb, "C++", vc));
     }
     for c in &only_b {
-        let msg = match mask_op(&code_b, c) {
-            Some(op) => format!("Rust also {op} {}, which the C++ doesn't", c.name),
-            None => format!(
-                "only Rust uses {} here; the C++ function never mentions it",
-                c.name
-            ),
-        };
-        notes.push(Note::new(Severity::Issue, Category::Value, msg));
+        notes.extend(one_sided(c, &code_b, &la, "Rust", vc));
     }
+}
+
+/// Code with the logical operators `||` and `&&` spelled out, so they are
+/// not read as masks.
+fn masks_only(code: &str) -> String {
+    code.replace("||", " or ").replace("&&", " and ")
 }
 
 /// A statement on one side only that uses a constant the other function
 /// never mentions: the value is new or lost, whatever else the statement
 /// does.
-fn one_sided_constant(text: &str, u: &Unit, side: &str, other: &Tokens, notes: &mut Vec<Note>) {
+fn one_sided_constant(
+    text: &str,
+    u: &Unit,
+    side: &str,
+    other: &Tokens,
+    vc: &ValueCtx,
+    notes: &mut Vec<Note>,
+) {
     if !matches!(u.kind, UnitKind::Stmt | UnitKind::Return)
         || notes.iter().any(|n| n.severity == Severity::Issue)
     {
         return;
     }
-    let missing: Vec<String> = constants(text)
+    let code = masks_only(&code_only(text));
+    let found: Vec<Note> = vc
+        .constants(text)
         .into_iter()
         .filter(|c| !other.has(c))
-        .map(|c| c.name)
+        .filter_map(|c| one_sided(&c, &code, &[], side, vc))
         .collect();
-    if missing.is_empty() {
+    // One note per statement: a mask operation if there is one, else one
+    // note naming every constant, as severe as the most severe.
+    if let Some(n) = found.iter().find(|n| !n.message.starts_with("only ")) {
+        notes.push(n.clone());
         return;
     }
-    let other_side = if side == "C++" { "Rust" } else { "C++" };
+    let Some(first) = found.first() else {
+        return;
+    };
+    let names: Vec<&str> = found
+        .iter()
+        .filter_map(|n| {
+            n.message
+                .strip_prefix(&format!("only {side} uses "))
+                .and_then(|m| m.split(';').next())
+        })
+        .collect();
+    let rest = first.message.split_once(';').map_or("", |(_, r)| r);
+    let severity = if found.iter().any(|n| n.severity == Severity::Issue) {
+        Severity::Issue
+    } else {
+        Severity::Note
+    };
     notes.push(Note::new(
-        Severity::Issue,
+        severity,
         Category::Value,
-        format!(
-            "only {side} uses {}; the {other_side} function never mentions it",
-            missing.join(", ")
-        ),
+        format!("only {side} uses {};{rest}", names.join(", ")),
     ));
+}
+
+/// The same value finding on several rows of one function says one thing:
+/// keep the first.
+fn dedupe_values(rows: &mut [Row]) {
+    let mut seen: Vec<String> = Vec::new();
+    for r in rows.iter_mut() {
+        r.notes.retain(|n| {
+            if n.category != Category::Value || n.severity != Severity::Issue {
+                return true;
+            }
+            if seen.contains(&n.message) {
+                return false;
+            }
+            seen.push(n.message.clone());
+            true
+        });
+    }
 }
 
 /// Rank of a memory ordering, weakest first. Acquire and release are

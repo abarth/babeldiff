@@ -715,6 +715,16 @@ fn invented_lifetime(v: &Version, f: &Function) -> Vec<Lint> {
         LazyLock::new(|| Regex::new(r"\blet\s+(?:mut\s+)?([a-z_]\w*)\s*(?::[^=]*)?=(.*)").unwrap());
     static DEREF: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"&\s*(?:mut\s+)?\*\s*\(?\s*([a-z_]\w*)\b").unwrap());
+    // Code that reaches everything through one base pointer on purpose,
+    // because other raw aliases (`NonNull`s stored elsewhere) must stay
+    // valid, says so; a borrow there would invalidate those aliases.
+    let all = f.lines.join("\n").to_ascii_lowercase();
+    if ["stacked borrows", "provenance", "nonnull"]
+        .iter()
+        .any(|k| all.contains(k))
+    {
+        return Vec::new();
+    }
     // Pointer name -> the place it came from, and the line.
     let mut derived: Vec<(String, String, usize)> = Vec::new();
     let mut out = Vec::new();
@@ -803,7 +813,14 @@ fn provenance(v: &Version) -> Vec<Lint> {
         if comment.contains("SAFETY") || !touched(v, n..=n) {
             continue;
         }
-        if PROVENANCE.is_match(comment) {
+        // A TODO or a keep-in-sync note about C++ that still exists stays
+        // relevant after the change.
+        let lower = comment.to_ascii_lowercase();
+        let live = comment.contains("TODO")
+            || ["keep in sync", "kept in sync", "must match", "must agree"]
+                .iter()
+                .any(|k| lower.contains(k));
+        if !live && PROVENANCE.is_match(comment) {
             let text = comment
                 .trim_start_matches('/')
                 .trim_start_matches('!')

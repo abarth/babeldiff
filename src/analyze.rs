@@ -211,6 +211,8 @@ pub struct Inputs {
     pub cpp_changed_paths: Vec<String>,
     /// Function-like macros the old C++ defines, as written.
     pub cpp_macros: Vec<String>,
+    /// Constants the changed files define.
+    pub values: crate::values::Values,
 }
 
 #[derive(Clone, Debug)]
@@ -511,6 +513,7 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
         cpp_helpers,
         cpp_changed_paths,
         cpp_macros,
+        values,
     } = inputs;
     let mut cpp = cpp;
     mark_comments_in_untouched_cpp(&mut cpp, &cpp_changed_paths, finder);
@@ -833,6 +836,7 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
             CppOrigin::Changed,
             ovs,
             &elsewhere(&rust_pool[ri]),
+            &values,
         );
         pair.rationale = why;
         pair.forwarder = forwarders
@@ -893,6 +897,7 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
             CppOrigin::Unchanged,
             Vec::new(),
             &elsewhere(r),
+            &values,
         );
         pair.rationale = format!(
             "found in the repository, not in the change (score {:.2})",
@@ -935,6 +940,7 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
             CppOrigin::Changed,
             Vec::new(),
             &ew,
+            &values,
         );
         pair.rationale = format!(
             "same name; the change left this Rust function alone (score {:.2})",
@@ -983,6 +989,7 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
                     p.origin.clone(),
                     Vec::new(),
                     &ew,
+                    &values,
                 );
                 pair.rationale = format!(
                     "{}; {} only forwards to this function",
@@ -1006,6 +1013,7 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
             p.origin.clone(),
             Vec::new(),
             &ew,
+            &values,
         );
         let other = format!("{}:{}", p.rust.path, p.rust.start_line);
         pair.rationale = format!(
@@ -1036,7 +1044,7 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
     }
     report.pairs.extend(extra);
 
-    structure_checks(&mut report.pairs, &cpp, &cpp_macros);
+    structure_checks(&mut report.pairs, &cpp, &cpp_macros, &universe);
     for p in &mut report.pairs {
         let n = crate::lint::unsafe_blocks(&p.rust);
         if n >= UNSAFE_PAIR_MIN {
@@ -1139,14 +1147,19 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
 ///   called at several places that the Rust never calls, so its code is
 ///   repeated inline;
 /// - a converted C++ helper called once whose port the Rust doesn't call.
-fn structure_checks(pairs: &mut [PairReport], cpp: &[Function], macros: &[String]) {
+fn structure_checks(
+    pairs: &mut [PairReport],
+    cpp: &[Function],
+    macros: &[String],
+    universe: &[Function],
+) {
     static LAMBDA: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"\bauto\s+([A-Za-z_]\w*)\s*=\s*(?:\[|$)").unwrap()
     });
     let key = |base: &str| normalize::call(base).unwrap_or_else(|| normalize::ident(base));
     let macros: Vec<(String, String)> = macros.iter().map(|m| (key(m), m.clone())).collect();
     // Converted C++ functions, by call name, with where their ports are.
-    let mut ports: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let mut ports: HashMap<String, Vec<(Option<String>, String, String)>> = HashMap::new();
     // Their classes: a call `Create()` in a method of `Foo` is taken to mean
     // a free function or `Foo::Create`, not another class's `Create`.
     // Only helpers in the same C++ file count: a local helper the Rust
@@ -1162,13 +1175,45 @@ fn structure_checks(pairs: &mut [PairReport], cpp: &[Function], macros: &[String
     }
     for p in pairs.iter() {
         ports.entry(key(&p.cpp.base)).or_default().push((
+            class_key(&p.cpp),
             key(&p.rust.base),
             format!("{}:{}", file_name(&p.rust.path), p.rust.start_line),
         ));
     }
+    // A call to a class's name constructs it; it is not a helper.
+    let class_names: HashSet<String> = cpp.iter().filter_map(class_key).collect();
+    // Rust functions by call name, to follow the Rust through a wrapper to
+    // a helper's port.
+    let mut by_name: HashMap<String, Vec<&Function>> = HashMap::new();
+    for f in universe {
+        by_name.entry(key(&f.base)).or_default().push(f);
+    }
     for p in pairs.iter_mut() {
+        // A Rust function the change left alone didn't inline anything.
+        if p.rationale.contains("left this Rust function alone") {
+            continue;
+        }
         let own = key(&p.cpp.base);
-        let rust_calls = |h: &str| p.rust.calls.iter().any(|d| check::call_like(h, d));
+        // What the Rust calls, directly or through up to two other Rust
+        // functions.
+        let mut reach: Vec<String> = p.rust.calls.clone();
+        let mut frontier: Vec<String> = p.rust.calls.clone();
+        for _ in 0..2 {
+            let mut next = Vec::new();
+            for c in &frontier {
+                for f in by_name.get(c).into_iter().flatten() {
+                    for d in &f.calls {
+                        if !reach.contains(d) {
+                            reach.push(d.clone());
+                            next.push(d.clone());
+                        }
+                    }
+                }
+            }
+            frontier = next;
+        }
+        let rust_calls = |h: &str| reach.iter().any(|d| check::call_like(h, d));
+        let rust_text = normalize::words(&p.rust.lines.join(" "));
         let lambdas: Vec<String> = p
             .cpp
             .lines
@@ -1179,7 +1224,20 @@ fn structure_checks(pairs: &mut [PairReport], cpp: &[Function], macros: &[String
         let mut demoted: Vec<(usize, String)> = Vec::new();
         // Macros.
         for (m, raw) in &macros {
-            if rust_calls(m) {
+            // A macro with a function port (`WRITE_PERCPU_FIELD` as
+            // `write_percpu_u32`), a compiler intrinsic (`__wfi`), or a
+            // shorthand the function defines for itself.
+            let words = normalize::words(raw);
+            let fn_port = words.len() >= 2
+                && reach
+                    .iter()
+                    .any(|d| normalize::words(d).starts_with(&words[..2]));
+            let local = p
+                .cpp
+                .lines
+                .iter()
+                .any(|l| l.trim_start().starts_with("#") && l.contains(raw.as_str()));
+            if rust_calls(m) || fn_port || local || raw.starts_with("__") {
                 continue;
             }
             // Only a macro used as a statement of its own, like a function
@@ -1218,7 +1276,8 @@ fn structure_checks(pairs: &mut [PairReport], cpp: &[Function], macros: &[String
                         (k.is_none() || *k == class_key(&p.cpp)) && *path == p.cpp.path
                     })
                 });
-                let noise = matches!(c.as_str(), "assert" | "trace" | "print");
+                let noise =
+                    matches!(c.as_str(), "assert" | "trace" | "print") || class_names.contains(c);
                 let known = !noise && (lambdas.contains(c) || mine);
                 if known && *c != own && !helpers.contains(c) && !macros.iter().any(|(m, _)| m == c)
                 {
@@ -1227,13 +1286,30 @@ fn structure_checks(pairs: &mut [PairReport], cpp: &[Function], macros: &[String
             }
         }
         for h in helpers {
-            let ported: Vec<&(String, String)> = ports
+            let cls = class_key(&p.cpp);
+            let ported: Vec<&(Option<String>, String, String)> = ports
                 .get(&h)
-                .map(|v| v.iter().collect())
+                .map(|v| {
+                    v.iter()
+                        .filter(|(k, _, _)| k.is_none() || *k == cls)
+                        .collect()
+                })
                 .unwrap_or_default();
-            if rust_calls(&h) || ported.iter().any(|(r, _)| rust_calls(r)) {
+            if rust_calls(&h) || ported.iter().any(|(_, r, _)| rust_calls(r)) {
                 continue;
             }
+            // Calls on another object (`a.Update()`, `b.Update()`) are not a
+            // local helper; nor is a call inside a trace statement, which the
+            // Rust may drop with the trace.
+            let receiver = |line: &str| {
+                let re = regex::Regex::new(&format!(
+                    r"(\w+)\s*(?:\.|->)\s*\w*\b{}\s*\(",
+                    regex::escape(&h)
+                ));
+                re.ok()
+                    .and_then(|re| re.captures(line).map(|c| c[1].to_string()))
+                    .filter(|r| r != "this")
+            };
             let uses: Vec<usize> = (0..p.rows.len())
                 .filter(|&k| {
                     p.rows[k].cpp.is_some_and(|i| {
@@ -1241,9 +1317,27 @@ fn structure_checks(pairs: &mut [PairReport], cpp: &[Function], macros: &[String
                         u.kind != UnitKind::Signature && u.features.calls.contains(&h)
                         // The lambda's own definition.
                         && !LAMBDA.is_match(p.cpp.line(u.start_line))
+                        && !u.features.calls.iter().any(|c| c == "trace" || c == "print")
                     })
                 })
                 .collect();
+            let on_objects = uses.iter().any(|&k| {
+                p.rows[k]
+                    .cpp
+                    .is_some_and(|i| receiver(p.cpp.line(p.cpp.units[i].start_line)).is_some())
+            });
+            if on_objects {
+                continue;
+            }
+            // The Rust has the helper's code in its place only if it does
+            // what the helper does: makes its calls, or names most of what
+            // it names. Otherwise the helper's work was done another way.
+            let body = helper_body(&h, &p.cpp, cpp);
+            let Some(body) = body else { continue };
+            let copied = copied_into(&body, &reach, &rust_text);
+            if copied.is_none() {
+                continue;
+            }
             let lines: Vec<String> = uses
                 .iter()
                 .filter_map(|&k| p.rows[k].cpp.map(|i| p.cpp.units[i].start_line.to_string()))
@@ -1253,7 +1347,7 @@ fn structure_checks(pairs: &mut [PairReport], cpp: &[Function], macros: &[String
                 // Where the Rust has a statement in its place; a C++ line
                 // with no Rust counterpart is reported as such already.
                 [only] if !ported.is_empty() && p.rows[*only].rust.is_some() => {
-                    let (_, at) = ported[0];
+                    let (_, _, at) = ported[0];
                     notes.push((
                         *only,
                         check::Note::new(
@@ -1309,6 +1403,86 @@ fn structure_checks(pairs: &mut [PairReport], cpp: &[Function], macros: &[String
         let refreshed = check::refresh(&mut p.rows, &p.cpp, &p.rust);
         p.findings = kept.into_iter().chain(refreshed).collect();
     }
+}
+
+/// The code of a helper `h` a C++ function calls: a lambda it defines,
+/// or a function of the change. `None` for a helper too small to be worth
+/// keeping (one statement that makes no calls, like a getter).
+fn helper_body(h: &str, f: &Function, cpp: &[Function]) -> Option<String> {
+    let key = |base: &str| normalize::call(base).unwrap_or_else(|| normalize::ident(base));
+    let text = if let Some(start) = f.lines.iter().position(|l| {
+        let t = l.trim_start();
+        t.starts_with("auto ")
+            && t.contains('=')
+            && key(t[5..].split('=').next().unwrap_or("").trim()) == h
+    }) {
+        let mut depth = 0i32;
+        let mut out = Vec::new();
+        for l in &f.lines[start..] {
+            out.push(l.as_str());
+            depth += l.matches('{').count() as i32 - l.matches('}').count() as i32;
+            if depth <= 0 && l.contains('}') {
+                break;
+            }
+        }
+        out.join("\n")
+    } else {
+        let g = cpp.iter().find(|g| key(&g.base) == h && g.path == f.path)?;
+        g.lines.join("\n")
+    };
+    let statements = text.matches(';').count();
+    let calls = text.matches('(').count();
+    (statements > 1 || calls > 1).then_some(text)
+}
+
+/// How much of a helper's code the Rust has in its place: the helper's
+/// calls it makes, or the helper's words it uses. `None` when too little
+/// to call the helper inlined.
+fn copied_into(body: &str, rust_calls: &[String], rust_words: &[String]) -> Option<f64> {
+    static CALL: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\b([A-Za-z_]\w*)\s*\(").unwrap());
+    const KEYWORDS: &[&str] = &[
+        "if",
+        "for",
+        "while",
+        "switch",
+        "return",
+        "sizeof",
+        "auto",
+        "const",
+        "static",
+        "cast",
+        "reinterpret",
+        "uint",
+        "int",
+        "size",
+        "void",
+        "bool",
+        "true",
+        "false",
+        "nullptr",
+        "this",
+    ];
+    let calls: Vec<String> = CALL
+        .captures_iter(body)
+        .filter_map(|c| normalize::call(&c[1]))
+        .filter(|c| !KEYWORDS.contains(&c.as_str()))
+        .collect();
+    let made = calls
+        .iter()
+        .filter(|c| rust_calls.iter().any(|d| check::call_like(c, d)))
+        .count();
+    let words: Vec<String> = normalize::words(body)
+        .into_iter()
+        .filter(|w| w.len() > 2 && !KEYWORDS.contains(&w.as_str()))
+        .collect();
+    let named = words.iter().filter(|w| rust_words.contains(w)).count();
+    let share = if words.is_empty() {
+        0.0
+    } else {
+        named as f64 / words.len() as f64
+    };
+    (made * 2 >= calls.len().max(1) || share >= 0.6).then_some(share)
 }
 
 fn file_name(path: &str) -> &str {
@@ -1407,7 +1581,9 @@ fn forwards_to(a: &Function, b: &Function, universe: &[Function]) -> bool {
     let thin = |f: &Function| body_len(f) <= 3;
     let key = |f: &Function| normalize::call(&f.base).unwrap_or_else(|| normalize::ident(&f.base));
     let target = key(b);
-    thin(a)
+    // An arch-generic facade picks an implementation per `cfg`.
+    let facade = a.lines.iter().any(|l| l.contains("cfg")) && body_len(a) <= 10;
+    (thin(a) || facade && a.calls.contains(&target))
         && (a.calls.contains(&target)
             || universe.iter().any(|m| {
                 thin(m)
@@ -1520,6 +1696,7 @@ fn build_pair(
     origin: CppOrigin,
     overrides: Vec<Function>,
     elsewhere: &[&Function],
+    values: &crate::values::Values,
 ) -> PairReport {
     let (s, pairs) = score(&cpp, &rust);
     let ov_refs: Vec<&Function> = overrides.iter().collect();
@@ -1547,6 +1724,7 @@ fn build_pair(
     let ctx = check::Context {
         claimed: &claimed,
         elsewhere,
+        values: Some(values),
     };
     let (rows, findings) = check::check_with(&cpp, &rust, &pairs, &ctx);
     let mut summary = check::summarize(&cpp, &rust, &rows);
@@ -1557,6 +1735,7 @@ fn build_pair(
             let ctx = check::Context {
                 claimed: &[],
                 elsewhere,
+                values: Some(values),
             };
             let (mut rows, mut ov_findings) = check::check_with(&o, &rust, &pairs, &ctx);
             // Code the override shares with the primary has been reported

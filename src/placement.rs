@@ -4,7 +4,7 @@
 //! Rust files, or a function moved into an unrelated file, makes that
 //! harder and is reported as a `file-placement` lint.
 
-use crate::analyze::{CppOrigin, PairReport};
+use crate::analyze::{CppOrigin, Link, PairReport};
 use crate::check::Severity;
 use crate::lint::{Lint, LintKind};
 use crate::normalize;
@@ -117,6 +117,9 @@ fn same_first_word(a: &str, b: &str) -> bool {
     w.len() >= 3 && w == first(b)
 }
 
+/// A pairing by similarity below this score doesn't count as a move.
+const SURE: f64 = 0.6;
+
 /// Maps each C++ file to the Rust files its paired functions went to, and
 /// reports splits and unexpected destinations.
 pub fn placement(pairs: &[PairReport]) -> (Vec<Placement>, Vec<Lint>) {
@@ -125,6 +128,17 @@ pub fn placement(pairs: &[PairReport]) -> (Vec<Placement>, Vec<Lint>) {
         // C++ the change didn't touch has its own place already; a second
         // copy of a Rust function says nothing about where the port went.
         if p.origin != CppOrigin::Changed || p.duplicate_of.is_some() {
+            continue;
+        }
+        // FFI glue on either side (`cpp_*` shims, `rust_*` trampolines)
+        // is not ported code, and a weak pairing by similarity is too
+        // unsure to count as a move.
+        let key = |b: &str| normalize::ident(b);
+        let glue =
+            p.cpp.base.starts_with("cpp_") || p.rust.base.starts_with("rust_") || p.rust.is_ffi;
+        let unsure =
+            p.link == Link::Similarity && p.score < SURE && key(&p.cpp.base) != key(&p.rust.base);
+        if glue || unsure {
             continue;
         }
         let cpp_path = &p.cpp.path;
@@ -221,6 +235,12 @@ pub fn placement(pairs: &[PairReport]) -> (Vec<Placement>, Vec<Lint>) {
             });
             continue;
         }
+        // Tests may move next to the code they test.
+        let severity = if is_test_file(&pl.cpp_path) {
+            Severity::Note
+        } else {
+            Severity::Issue
+        };
         for t in homes.iter().filter(|t| !t.expected) {
             let names: Vec<&str> = t.functions.iter().map(|(n, _)| n.as_str()).collect();
             let shown = if names.len() > 4 {
@@ -230,7 +250,7 @@ pub fn placement(pairs: &[PairReport]) -> (Vec<Placement>, Vec<Lint>) {
             };
             lints.push(Lint {
                 kind: LintKind::FilePlacement,
-                severity: Severity::Issue,
+                severity,
                 path: t.rust_path.clone(),
                 line: t.functions.iter().map(|(_, l)| *l).min().unwrap_or(1),
                 message: format!(
