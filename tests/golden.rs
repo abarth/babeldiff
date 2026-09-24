@@ -556,3 +556,24 @@ fn lantern_finds_the_planted_mistakes() {
         [("lantern.cc", vec![("lantern.rs", true), ("glow.rs", false)])]
     );
 }
+
+#[test]
+fn chain_lock_callback_lines_up_with_a_guard() {
+    let cpp = "zx_status_t lamp_get(Lamp* lamp, uint32_t* out) {\n  SingleChainLockGuard guard{IrqSaveOption, lamp->get_lock(), CLT_TAG(\"lamp_get\")};\n  // Only a lit lamp has a color.\n  if (!lamp->lit()) {\n    return ZX_ERR_BAD_STATE;\n  }\n  *out = lamp->color();\n  return ZX_OK;\n}\n";
+    let rust = "pub unsafe fn lamp_get(lamp: *mut Lamp, out: &mut u32) -> zx_status_t {\n    // SAFETY: `lamp` is valid.\n    unsafe {\n        lamp::with_chain_lock(lamp, |lamp| {\n            // Only a lit lamp has a color.\n            if !lamp::lit(lamp) {\n                return ZX_ERR_BAD_STATE;\n            }\n            *out = lamp::color(lamp);\n            ZX_OK\n        })\n    }\n}\n";
+    let cs = ChangeSet::from_files(&[
+        ("lamp.cc".into(), cpp.into()),
+        ("lamp.rs".into(), rust.into()),
+    ]);
+    let report = babeldiff::run(&cs, &Options::default(), &mut NoFinder);
+    assert_eq!(report.pairs.len(), 1);
+    let p = &report.pairs[0];
+    let issues: Vec<&str> = p
+        .findings
+        .iter()
+        .filter(|f| f.severity == Severity::Issue)
+        .map(|f| f.message.as_str())
+        .collect();
+    assert!(issues.is_empty(), "{issues:?}");
+    assert_eq!(p.summary.cpp_locks, p.summary.rust_locks);
+}
