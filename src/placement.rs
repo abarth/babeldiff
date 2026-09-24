@@ -109,6 +109,23 @@ fn is_test_file(path: &str) -> bool {
     test_subject(&s) != s || s.starts_with("test_") || s == "tests"
 }
 
+/// Whether a Rust file is named for the object its functions handle:
+/// `clock.rs` holds `sys_clock_*`, along with helpers that moved with them,
+/// and `thread_dispatcher.rs` holds `ThreadDispatcher` methods.
+/// A part named after the C++ file (`mp_ipi.rs` for `mp.cc`) is a split
+/// by topic, not by object.
+fn by_object(cpp_path: &str, t: &Target) -> bool {
+    let file = normalize::words(&stem(&t.rust_path));
+    let cpp = normalize::words(&test_subject(&stem(cpp_path)));
+    !file.is_empty()
+        && !cpp.iter().any(|w| file.contains(w))
+        && t.functions.iter().any(|(name, _)| {
+            // `ThreadDispatcher::GetExceptionReport` counts for its class.
+            let words = normalize::words(&name.replace("::", "_"));
+            file.iter().all(|w| words.contains(w))
+        })
+}
+
 /// `exceptions_c` and `exceptions_pf`, or `vmx_cpu_state` and `vmx_cpu`:
 /// parts of one file that was split, rather than an unrelated file.
 fn same_first_word(a: &str, b: &str) -> bool {
@@ -198,10 +215,12 @@ pub fn placement(pairs: &[PairReport]) -> (Vec<Placement>, Vec<Lint>) {
     for pl in &out {
         // A companion `foo_ffi.rs` holds the shims for `foo.rs`; test files
         // go wherever the tests of the code they test go.
+        // A file split by the object each function handles (`task.cc`'s
+        // `sys_process_*` into `process.rs`) keeps each part easy to find.
         let homes: Vec<&Target> = pl
             .targets
             .iter()
-            .filter(|t| !stem_is_ffi(&t.rust_path))
+            .filter(|t| !stem_is_ffi(&t.rust_path) && !by_object(&pl.cpp_path, t))
             .collect();
         if homes.len() >= 2 && !is_test_file(&pl.cpp_path) {
             let parts: Vec<String> = homes
@@ -298,6 +317,21 @@ pub fn placement(pairs: &[PairReport]) -> (Vec<Placement>, Vec<Lint>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splits_by_object_are_accepted() {
+        let t = |path: &str, names: &[&str]| Target {
+            rust_path: path.into(),
+            functions: names.iter().map(|n| (n.to_string(), 1)).collect(),
+            expected: false,
+        };
+        let clock = t("syscalls/clock.rs", &["sys_clock_create", "copy_out"]);
+        assert!(by_object("syscalls/zircon.cc", &clock));
+        let state = t("x86/debugger_state.rs", &["arch_get_single_step"]);
+        assert!(!by_object("x86/debugger.cc", &state));
+        let ipi = t("x86/mp_ipi.rs", &["arch_mp_send_ipi"]);
+        assert!(!by_object("x86/mp.cc", &ipi));
+    }
 
     #[test]
     fn expected_destinations() {
