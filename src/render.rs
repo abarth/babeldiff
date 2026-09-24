@@ -36,11 +36,20 @@ impl Default for RenderOptions {
     }
 }
 
+/// Whether any C++ file went somewhere other than one Rust file named after
+/// it, which is when the file mapping is worth showing.
+pub fn placement_notable(report: &Report) -> bool {
+    report
+        .placement
+        .iter()
+        .any(|p| p.targets.len() > 1 || p.targets.iter().any(|t| !t.expected))
+}
+
 pub fn render(report: &Report, opts: &RenderOptions) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "babeldiff: {} pair{}, {} issue{}, {} note{}; {} C++ and {} Rust function{} unpaired",
+        "babeldiff: {} pair{}, {} issue{}, {} note{}; {} C++ and {} Rust function{} unpaired{}",
         report.pairs.len(),
         plural(report.pairs.len()),
         report.issues(),
@@ -50,6 +59,15 @@ pub fn render(report: &Report, opts: &RenderOptions) -> String {
         report.unmatched_cpp.len(),
         report.unmatched_rust.len(),
         plural(report.unmatched_rust.len()),
+        if report.rust_tests.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", plus {} Rust test{}",
+                report.rust_tests.len(),
+                plural(report.rust_tests.len())
+            )
+        },
     );
     let by_cat = crate::analyze::issues_by_category(report);
     if !by_cat.is_empty() {
@@ -97,6 +115,19 @@ pub fn render(report: &Report, opts: &RenderOptions) -> String {
             let _ = writeln!(out, "  < C++  {}  {}", f.name, f.location());
         }
         for f in &report.unmatched_rust {
+            let callers = report.callers(f);
+            let helper = if callers.is_empty() {
+                String::new()
+            } else {
+                format!("  (helper for {})", callers.join(", "))
+            };
+            let _ = writeln!(out, "  > Rust {}  {}{helper}", f.name, f.location());
+        }
+    }
+    if !report.rust_tests.is_empty() {
+        out.push('\n');
+        let _ = writeln!(out, "==== Rust tests with no C++ counterpart");
+        for f in &report.rust_tests {
             let _ = writeln!(out, "  > Rust {}  {}", f.name, f.location());
         }
     }
@@ -132,6 +163,25 @@ pub fn render(report: &Report, opts: &RenderOptions) -> String {
                 format!("  in {}", c.functions.join(", "))
             };
             let _ = writeln!(out, "  {span}{within}  {}", c.text);
+        }
+    }
+    if placement_notable(report) {
+        out.push('\n');
+        let _ = writeln!(out, "==== File placement");
+        for pl in &report.placement {
+            let parts: Vec<String> = pl
+                .targets
+                .iter()
+                .map(|t| {
+                    format!(
+                        "{} ({}{})",
+                        short(&t.rust_path),
+                        t.functions.len(),
+                        if t.expected { "" } else { ", unexpected" }
+                    )
+                })
+                .collect();
+            let _ = writeln!(out, "  {} -> {}", short(&pl.cpp_path), parts.join(", "));
         }
     }
     if !report.lints.is_empty() {

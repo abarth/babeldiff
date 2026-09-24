@@ -133,6 +133,7 @@ impl<'a> Ctx<'a> {
             .is_some_and(|t| self.text(t).trim() != "()");
         let fcx = FnCtx { returns_value };
         self.block(body, 1, true, fcx, &mut b);
+        relocate_closures(&mut b.units, self.lines);
         let ends_ok_unit = b.units.last().is_some_and(|u| {
             let text: String = (u.start_line..=u.end_line)
                 .filter_map(|l| self.lines.get(l - 1))
@@ -710,6 +711,57 @@ fn is_pure_or_accessor(v: Node, src: &[u8]) -> bool {
             no_args && !crate::normalize::is_mutating(name)
         }
         _ => false,
+    }
+}
+
+/// A closure bound to a name (`let f = |t| { ... };`) and later passed to
+/// a function that takes a lock around it (`with_chain_lock(t, f)`) runs
+/// its body under that lock, where the C++ has a guard on the stack and
+/// the same statements in place. The lock is credited to the closure's
+/// `let`, so the guard lines up there and the body follows it.
+fn relocate_closures(units: &mut [Unit], lines: &[String]) {
+    static LET_CLOSURE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\blet\s+(?:mut\s+)?([A-Za-z_]\w*)\s*(?::[^=]*)?=\s*(?:move\s+)?\|").unwrap()
+    });
+    let text = |u: &Unit| -> String {
+        (u.start_line..=u.end_line)
+            .filter_map(|l| lines.get(l - 1))
+            .map(|l| l.trim())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    for i in 0..units.len() {
+        if units[i].kind != UnitKind::Stmt {
+            continue;
+        }
+        let Some(name) = LET_CLOSURE
+            .captures(&text(&units[i]))
+            .map(|c| c[1].to_string())
+        else {
+            continue;
+        };
+        let depth = units[i].depth;
+        let mut end = i + 1;
+        while end < units.len() && units[end].depth > depth {
+            end += 1;
+        }
+        if end == i + 1 {
+            continue;
+        }
+        let used = Regex::new(&format!(
+            r"[(,]\s*(?:&\s*(?:mut\s+)?)?{}\s*[),]",
+            regex::escape(&name)
+        ))
+        .unwrap();
+        let user = (end..units.len()).find(|&k| {
+            units[k].kind != UnitKind::Comment
+                && !units[k].features.locks.is_empty()
+                && used.is_match(&text(&units[k]))
+        });
+        if let Some(k) = user {
+            let locks = std::mem::take(&mut units[k].features.locks);
+            units[i].features.locks.extend(locks);
+        }
     }
 }
 

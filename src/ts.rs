@@ -124,6 +124,23 @@ impl FeatureAcc {
             Lang::Rust => rust_locks(&self.text),
         };
         let mut calls = self.calls;
+        // Inline assembly: the registers and instructions in the template
+        // are what the statement does, and Rust's operand keywords
+        // (`in(reg)`, `options(...)`) are not calls.
+        if ASM.is_match(&self.text) {
+            calls.retain(|c| !ASM_OPERANDS.contains(&c.as_str()));
+            if !calls.iter().any(|c| c == "asm") {
+                calls.push("asm".to_string());
+            }
+            for lit in ASM_STR.captures_iter(&self.text) {
+                for w in ASM_WORD.captures_iter(&lit[1]) {
+                    let w = w[1].to_ascii_lowercase();
+                    if !idents.contains(&w) {
+                        idents.push(w);
+                    }
+                }
+            }
+        }
         if !locks.is_empty() {
             // Acquisitions are compared as locks, not calls.
             const LOCK_CALLS: &[&str] = &[
@@ -179,6 +196,27 @@ impl FeatureAcc {
     }
 }
 
+static ASM: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\basm!\s*\(|\b__asm__\b|\basm\s+(?:volatile\s*)?\(|\basm\s*\(").unwrap()
+});
+static ASM_STR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""((?:[^"\\]|\\.)*)""#).unwrap());
+/// Words in an assembly template, without operand placeholders (`%0`,
+/// `{}`, `{val}`).
+static ASM_WORD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:^|[^%{\w])%{0,2}([A-Za-z][A-Za-z0-9]*)\b").unwrap());
+const ASM_OPERANDS: &[&str] = &[
+    "in",
+    "out",
+    "inout",
+    "lateout",
+    "inlateout",
+    "options",
+    "reg",
+    "sym",
+    "const",
+    "clobber_abi",
+];
+
 static CPP_GUARD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"\b(\w*Guard|AutoLock|AutoSpinLock\w*|lock_guard|unique_lock|scoped_lock|shared_lock)\s*(<(?:[^<>]|<[^<>]*>)*>)?\s+\w+\s*(?:[{(]\s*([^;]*?)\s*[})])?\s*;",
@@ -193,6 +231,12 @@ static RUST_LOCK_CALL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"([A-Za-z_][\w]*(?:\s*(?:\.|::)\s*[A-Za-z_]\w*(?:\(\))?)*)\s*\.\s*(lock|lock_irqsave|lock_irq|try_lock|read_lock|write_lock|lock_read|lock_write|acquire|lock_[a-z]\w*)\s*\(")
         .unwrap()
 });
+static RUST_WITH_LOCK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\bwith_(?:chain_)?lock(?:_irqsave|_irq)?\s*\(\s*&?(?:mut\s+)?([A-Za-z_][\w.]*)\s*,",
+    )
+    .unwrap()
+});
 static RUST_GUARD_NEW: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\b(\w*Guard)\s*(?:::\s*<[^>]*>)?\s*::\s*new\s*\(\s*([^,)]*)").unwrap()
 });
@@ -202,8 +246,20 @@ fn cpp_locks(text: &str) -> Vec<String> {
     for c in CPP_GUARD.captures_iter(text) {
         let ty = &c[1];
         let targs = c.get(2).map_or("", |m| m.as_str());
-        let arg = c.get(3).map_or("", |m| m.as_str());
-        let arg = arg.split(',').next().unwrap_or("").trim();
+        let args = c.get(3).map_or("", |m| m.as_str());
+        // Chain-lock guards take options and a tag besides the lock:
+        // `SingleChainLockGuard guard{IrqSaveOption, thread->get_lock(),
+        // CLT_TAG("...")}`.
+        let arg = args
+            .split(',')
+            .map(str::trim)
+            .find(|a| !a.ends_with("Option") && !a.starts_with("CLT_TAG") && !a.starts_with('"'))
+            .unwrap_or("");
+        let arg = arg
+            .strip_suffix("get_lock()")
+            .map(|r| r.trim_end_matches("->").trim_end_matches('.'))
+            .filter(|r| !r.is_empty())
+            .unwrap_or(arg);
         let name = if arg.is_empty() {
             guard_type_name(ty)
         } else {
@@ -243,6 +299,10 @@ fn rust_locks(text: &str) -> Vec<String> {
             "{}{mode}",
             normalize::lock_key(&c[1], Some(method))
         ));
+    }
+    // A lock taken for the length of a callback: `with_chain_lock(thread, f)`.
+    for c in RUST_WITH_LOCK.captures_iter(text) {
+        out.push(normalize::lock_key(c[1].trim(), None));
     }
     for c in RUST_GUARD_NEW.captures_iter(text) {
         let arg = c[2].trim();

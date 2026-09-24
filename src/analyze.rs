@@ -48,6 +48,9 @@ pub struct PairReport {
     pub overrides: Vec<OverrideReport>,
     /// Why the pair was chosen, for readers who need to judge it.
     pub rationale: String,
+    /// For a second Rust definition of an already paired function, where
+    /// the first one is.
+    pub duplicate_of: Option<(String, usize)>,
 }
 
 /// A C++ override folded into the Rust function of a pair.
@@ -114,6 +117,9 @@ pub struct Report {
     /// with the helper's name. They wrap C++ rather than convert it.
     pub rust_facades: Vec<(Function, String)>,
     pub unmatched_rust: Vec<Function>,
+    /// Rust tests with no C++ counterpart, kept apart from the other
+    /// unpaired Rust.
+    pub rust_tests: Vec<Function>,
     pub shims: Vec<Shim>,
     /// C++ the change modified that is not part of the port (not removed,
     /// not a forwarder into Rust, not an FFI declaration). Reviewers check
@@ -121,6 +127,8 @@ pub struct Report {
     pub cpp_changes: Vec<crate::input::CppChange>,
     /// Rubric lints over the changed files.
     pub lints: Vec<crate::lint::Lint>,
+    /// Which Rust files each C++ file's functions went to.
+    pub placement: Vec<crate::placement::Placement>,
 }
 
 impl Report {
@@ -157,6 +165,21 @@ impl Report {
     pub fn issues(&self) -> usize {
         self.pairs.iter().map(PairReport::issues).sum()
     }
+
+    /// The paired Rust functions that call an unpaired Rust function, for
+    /// showing it as a helper of the code it serves.
+    pub fn callers(&self, f: &Function) -> Vec<&str> {
+        let key = normalize::call(&f.base).unwrap_or_else(|| normalize::ident(&f.base));
+        let mut v: Vec<&str> = self
+            .pairs
+            .iter()
+            .filter(|p| p.rust.name != f.name && p.rust.calls.contains(&key))
+            .map(|p| p.rust.name.as_str())
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    }
     pub fn notes(&self) -> usize {
         self.pairs.iter().map(PairReport::notes).sum()
     }
@@ -186,6 +209,8 @@ pub struct Inputs {
     pub cpp_helpers: Vec<Function>,
     /// Every C++ file the change touched.
     pub cpp_changed_paths: Vec<String>,
+    /// Function-like macros the old C++ defines, as written.
+    pub cpp_macros: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -470,6 +495,9 @@ fn override_key(f: &Function) -> String {
     name_words(f).join("_")
 }
 
+/// A pair with at least this many unsafe blocks gets a note.
+const UNSAFE_PAIR_MIN: usize = 3;
+
 /// Runs the analysis.
 pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Report {
     let Inputs {
@@ -482,6 +510,7 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
         cpp_changes,
         cpp_helpers,
         cpp_changed_paths,
+        cpp_macros,
     } = inputs;
     let mut cpp = cpp;
     mark_comments_in_untouched_cpp(&mut cpp, &cpp_changed_paths, finder);
@@ -914,6 +943,116 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
         report.pairs.push(pair);
     }
 
+    // 8. A second Rust definition of a function already paired: the change
+    //    defines it twice (in two modules), and callers may use either
+    //    copy, so each is compared with the C++. A thin copy that only
+    //    forwards to the other is a wrapper, not a duplicate; when the pair
+    //    holds the wrapper, the copy doing the work takes its place.
+    let cfg_gated = |f: &Function| {
+        f.lines
+            .iter()
+            .take_while(|l| !l.contains("fn "))
+            .any(|l| l.trim_start().starts_with("#[cfg"))
+    };
+    let mut extra = Vec::new();
+    for ri in 0..rust_pool.len() {
+        let r = rust_pool[ri].clone();
+        if rust_used[ri] || cfg_gated(&r) {
+            continue;
+        }
+        let Some(pi) = report.pairs.iter().position(|p| {
+            p.rust.path != r.path
+                && p.rust.base == r.base
+                && class_key(&p.rust) == class_key(&r)
+                && !cfg_gated(&p.rust)
+        }) else {
+            continue;
+        };
+        let p = &report.pairs[pi];
+        if forwards_to(&r, &p.rust, &universe) {
+            continue;
+        }
+        if forwards_to(&p.rust, &r, &universe) {
+            if score(&p.cpp, &r).0 >= opts.min_score {
+                rust_used[ri] = true;
+                let ew = elsewhere(&r);
+                let mut pair = build_pair(
+                    p.cpp.clone(),
+                    r,
+                    p.link.clone(),
+                    p.origin.clone(),
+                    Vec::new(),
+                    &ew,
+                );
+                pair.rationale = format!(
+                    "{}; {} only forwards to this function",
+                    p.rationale, p.rust.name
+                );
+                pair.forwarder = Some(p.rust.clone());
+                report.pairs[pi] = pair;
+            }
+            continue;
+        }
+        let (s, _) = score(&p.cpp, &r);
+        if s < opts.min_score {
+            continue;
+        }
+        rust_used[ri] = true;
+        let ew = elsewhere(&r);
+        let mut pair = build_pair(
+            p.cpp.clone(),
+            r.clone(),
+            Link::Similarity,
+            p.origin.clone(),
+            Vec::new(),
+            &ew,
+        );
+        let other = format!("{}:{}", p.rust.path, p.rust.start_line);
+        pair.rationale = format!(
+            "a second Rust definition of {}; the first is at {other} (score {:.2})",
+            r.name, pair.score
+        );
+        pair.duplicate_of = Some((p.rust.path.clone(), p.rust.start_line));
+        let same = body_code(&r) == body_code(&p.rust);
+        pair.findings.insert(
+            0,
+            Finding {
+                severity: if same { Severity::Note } else { Severity::Issue },
+                category: check::Category::Pairing,
+                cpp_line: None,
+                rust_line: Some(r.start_line),
+                cpp_file: None,
+                message: if same {
+                    format!("the change defines {} twice, here and at {other}; the copies are the same", r.name)
+                } else {
+                    format!(
+                        "the change defines {} twice, here and at {other}, and the copies differ; both are compared with the C++, and callers may reach either",
+                        r.name
+                    )
+                },
+            },
+        );
+        extra.push(pair);
+    }
+    report.pairs.extend(extra);
+
+    structure_checks(&mut report.pairs, &cpp, &cpp_macros);
+    for p in &mut report.pairs {
+        let n = crate::lint::unsafe_blocks(&p.rust);
+        if n >= UNSAFE_PAIR_MIN {
+            p.findings.push(Finding {
+                severity: Severity::Note,
+                category: check::Category::Unsafe,
+                cpp_line: None,
+                rust_line: Some(p.rust.start_line),
+                cpp_file: None,
+                message: format!(
+                    "Rust adds {n} unsafe blocks where the C++ needs none; a safe facade for what they reach into would keep it closer to the C++"
+                ),
+            });
+        }
+    }
+
     report.pairs.sort_by(|a, b| {
         (a.cpp.path.as_str(), a.cpp.start_line).cmp(&(b.cpp.path.as_str(), b.cpp.start_line))
     });
@@ -943,7 +1082,22 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
         std::mem::take(&mut report.unmatched_rust)
             .into_iter()
             .partition(|f| body_len(f) <= 3 && f.calls.iter().any(|c| c.starts_with("cpp_")));
+    let (tests, unmatched): (Vec<Function>, Vec<Function>) =
+        unmatched.into_iter().partition(is_rust_test);
     report.unmatched_rust = unmatched;
+    report.rust_tests = tests;
+    // Helpers of paired functions first, so they read as part of the port.
+    let helper: Vec<bool> = report
+        .unmatched_rust
+        .iter()
+        .map(|f| !report.callers(f).is_empty())
+        .collect();
+    let mut tagged: Vec<(bool, Function)> = helper
+        .into_iter()
+        .zip(std::mem::take(&mut report.unmatched_rust))
+        .collect();
+    tagged.sort_by_key(|(h, _)| !*h);
+    report.unmatched_rust = tagged.into_iter().map(|(_, f)| f).collect();
     report.rust_facades = facades
         .into_iter()
         .map(|f| {
@@ -979,6 +1133,188 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
     report
 }
 
+/// Checks that the Rust keeps the C++'s structure, which needs every pair:
+/// - a C++ function-like macro expanded inline instead of kept as a macro;
+/// - a C++ helper (a function the change converts, or a local lambda)
+///   called at several places that the Rust never calls, so its code is
+///   repeated inline;
+/// - a converted C++ helper called once whose port the Rust doesn't call.
+fn structure_checks(pairs: &mut [PairReport], cpp: &[Function], macros: &[String]) {
+    static LAMBDA: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\bauto\s+([A-Za-z_]\w*)\s*=\s*(?:\[|$)").unwrap()
+    });
+    let key = |base: &str| normalize::call(base).unwrap_or_else(|| normalize::ident(base));
+    let macros: Vec<(String, String)> = macros.iter().map(|m| (key(m), m.clone())).collect();
+    // Converted C++ functions, by call name, with where their ports are.
+    let mut ports: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    // Their classes: a call `Create()` in a method of `Foo` is taken to mean
+    // a free function or `Foo::Create`, not another class's `Create`.
+    // Only helpers in the same C++ file count: a local helper the Rust
+    // stops using is a change of structure, while code from elsewhere may
+    // have its own Rust route.
+    let mut classes: HashMap<String, Vec<(Option<String>, String)>> = HashMap::new();
+    for f in cpp {
+        ports.entry(key(&f.base)).or_default();
+        classes
+            .entry(key(&f.base))
+            .or_default()
+            .push((class_key(f), f.path.clone()));
+    }
+    for p in pairs.iter() {
+        ports.entry(key(&p.cpp.base)).or_default().push((
+            key(&p.rust.base),
+            format!("{}:{}", file_name(&p.rust.path), p.rust.start_line),
+        ));
+    }
+    for p in pairs.iter_mut() {
+        let own = key(&p.cpp.base);
+        let rust_calls = |h: &str| p.rust.calls.iter().any(|d| check::call_like(h, d));
+        let lambdas: Vec<String> = p
+            .cpp
+            .lines
+            .iter()
+            .filter_map(|l| LAMBDA.captures(l).map(|c| key(&c[1])))
+            .collect();
+        let mut notes: Vec<(usize, check::Note)> = Vec::new();
+        let mut demoted: Vec<(usize, String)> = Vec::new();
+        // Macros.
+        for (m, raw) in &macros {
+            if rust_calls(m) {
+                continue;
+            }
+            // Only a macro used as a statement of its own, like a function
+            // call; one inside an expression may well be a Rust `const`.
+            let uses: Vec<usize> = (0..p.rows.len())
+                .filter(|&k| {
+                    p.rows[k].cpp.is_some_and(|i| {
+                        let u = &p.cpp.units[i];
+                        u.kind == UnitKind::Stmt
+                            && u.features.calls.contains(m)
+                            && p.cpp
+                                .line(u.start_line)
+                                .trim_start()
+                                .starts_with(raw.as_str())
+                    })
+                })
+                .collect();
+            let Some(&first) = uses.first() else { continue };
+            let why = format!("the C++ macro {raw} is expanded inline");
+            notes.push((
+                first,
+                check::Note::new(
+                    Severity::Issue,
+                    check::Category::Call,
+                    format!("C++ macro {raw} is expanded inline in the Rust; keep it as a macro (macro_rules!) and use it where the C++ does"),
+                ),
+            ));
+            demoted.extend(uses.iter().map(|&k| (k, why.clone())));
+        }
+        // Helpers.
+        let mut helpers: Vec<String> = Vec::new();
+        for u in &p.cpp.units {
+            for c in &u.features.calls {
+                let mine = classes.get(c).is_some_and(|v| {
+                    v.iter().any(|(k, path)| {
+                        (k.is_none() || *k == class_key(&p.cpp)) && *path == p.cpp.path
+                    })
+                });
+                let noise = matches!(c.as_str(), "assert" | "trace" | "print");
+                let known = !noise && (lambdas.contains(c) || mine);
+                if known && *c != own && !helpers.contains(c) && !macros.iter().any(|(m, _)| m == c)
+                {
+                    helpers.push(c.clone());
+                }
+            }
+        }
+        for h in helpers {
+            let ported: Vec<&(String, String)> = ports
+                .get(&h)
+                .map(|v| v.iter().collect())
+                .unwrap_or_default();
+            if rust_calls(&h) || ported.iter().any(|(r, _)| rust_calls(r)) {
+                continue;
+            }
+            let uses: Vec<usize> = (0..p.rows.len())
+                .filter(|&k| {
+                    p.rows[k].cpp.is_some_and(|i| {
+                        let u = &p.cpp.units[i];
+                        u.kind != UnitKind::Signature && u.features.calls.contains(&h)
+                        // The lambda's own definition.
+                        && !LAMBDA.is_match(p.cpp.line(u.start_line))
+                    })
+                })
+                .collect();
+            let lines: Vec<String> = uses
+                .iter()
+                .filter_map(|&k| p.rows[k].cpp.map(|i| p.cpp.units[i].start_line.to_string()))
+                .collect();
+            match uses.as_slice() {
+                [] => {}
+                // Where the Rust has a statement in its place; a C++ line
+                // with no Rust counterpart is reported as such already.
+                [only] if !ported.is_empty() && p.rows[*only].rust.is_some() => {
+                    let (_, at) = ported[0];
+                    notes.push((
+                        *only,
+                        check::Note::new(
+                            Severity::Issue,
+                            check::Category::Call,
+                            format!("C++ calls {h}, which the change ports to Rust ({at}); the Rust here doesn't call it, so its code was inlined or dropped"),
+                        ),
+                    ));
+                }
+                [_] => {}
+                [first, ..] => {
+                    let why = format!("the C++ helper {h} is inlined");
+                    notes.push((
+                        *first,
+                        check::Note::new(
+                            Severity::Issue,
+                            check::Category::Call,
+                            format!(
+                                "C++ calls the helper {h} at {} places (lines {}); the Rust never calls it{}, so its code is repeated inline",
+                                uses.len(),
+                                lines.join(", "),
+                                if ported.is_empty() { "" } else { " or its port" }
+                            ),
+                        ),
+                    ));
+                    demoted.extend(uses.iter().map(|&k| (k, why.clone())));
+                }
+            }
+        }
+        if notes.is_empty() {
+            continue;
+        }
+        for (k, why) in demoted {
+            for n in &mut p.rows[k].notes {
+                if n.severity == Severity::Issue
+                    && n.category != check::Category::Comment
+                    && n.category != check::Category::Value
+                {
+                    n.severity = Severity::Note;
+                    n.message = format!("{}; {why}", n.message);
+                }
+            }
+        }
+        for (k, n) in notes {
+            p.rows[k].notes.insert(0, n);
+        }
+        let kept: Vec<Finding> = p
+            .findings
+            .iter()
+            .filter(|f| f.category == check::Category::Pairing && f.cpp_line.is_none())
+            .cloned()
+            .collect();
+        let refreshed = check::refresh(&mut p.rows, &p.cpp, &p.rust);
+        p.findings = kept.into_iter().chain(refreshed).collect();
+    }
+}
+
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
 /// Whether C++ `c` and Rust `r` may be the same method, judging by their
 /// classes. `A::f` doesn't port to `B::f` when the change has both a C++
 /// class named like `B` and a Rust type named like `A`, unless one class
@@ -1006,6 +1342,22 @@ fn unchanged_class_ok(c: &Function, r: &Function, h: &Hierarchy) -> bool {
         (Some(ca), Some(rb)) => ca == rb || h.is_ancestor(&ca, &rb),
         _ => true,
     }
+}
+
+/// A Rust test: `#[test]` (or a test attribute of another framework), or a
+/// function in a test file.
+fn is_rust_test(f: &Function) -> bool {
+    let attrs = f.lines.iter().take_while(|l| !l.contains("fn ")).any(|l| {
+        let t = l.trim_start();
+        t.starts_with("#[") && t.contains("test")
+    });
+    let file = file_name(&f.path);
+    attrs
+        || f.base.starts_with("test_")
+        || f.path.contains("/tests/")
+        || file.ends_with("_test.rs")
+        || file.ends_with("_tests.rs")
+        || file == "tests.rs"
 }
 
 /// A C++ function that exists for Rust to call through FFI.
@@ -1047,6 +1399,38 @@ fn forwardee(c: &Function, r: &Function, pool: &[Function], used: &[bool]) -> Op
         .filter(|(_, s)| *s > current)
         .max_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(j, _)| j)
+}
+
+/// Whether `a` is a thin wrapper that reaches `b`, directly or through
+/// another thin wrapper (`arch_foo` calling `rust_arch_foo` calling `foo`).
+fn forwards_to(a: &Function, b: &Function, universe: &[Function]) -> bool {
+    let thin = |f: &Function| body_len(f) <= 3;
+    let key = |f: &Function| normalize::call(&f.base).unwrap_or_else(|| normalize::ident(&f.base));
+    let target = key(b);
+    thin(a)
+        && (a.calls.contains(&target)
+            || universe.iter().any(|m| {
+                thin(m)
+                    && m.base != a.base
+                    && m.base != b.base
+                    && a.calls.contains(&key(m))
+                    && m.calls.contains(&target)
+            }))
+}
+
+/// A function's code without comments or whitespace, to tell identical
+/// copies apart from diverging ones.
+fn body_code(f: &Function) -> Vec<String> {
+    f.units
+        .iter()
+        .filter(|u| !matches!(u.kind, UnitKind::Signature | UnitKind::Comment))
+        .flat_map(|u| (u.start_line..=u.end_line).map(|l| f.line(l)))
+        .map(|l| {
+            let l = l.split("//").next().unwrap_or("");
+            l.split_whitespace().collect::<String>()
+        })
+        .filter(|l| !l.is_empty())
+        .collect()
 }
 
 /// Whether `r` calls `t`, allowing for `Type::init()` normalizing to the
@@ -1218,6 +1602,7 @@ fn build_pair(
         summary,
         overrides,
         rationale: String::new(),
+        duplicate_of: None,
     }
 }
 

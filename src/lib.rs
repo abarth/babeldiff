@@ -41,6 +41,7 @@ pub mod lint;
 pub mod model;
 pub mod normalize;
 pub mod patch;
+pub mod placement;
 pub mod render;
 pub mod rust;
 mod ts;
@@ -70,5 +71,11 @@ pub fn run_with(
     inputs.forced = forced;
     let mut report = analyze::analyze(inputs, opts, finder);
     report.lints = lint::lint(cs);
+    let (placement, lints) = placement::placement(&report.pairs);
+    report.placement = placement;
+    report.lints.extend(lints);
+    report
+        .lints
+        .sort_by(|a, b| (&a.path, a.line, a.kind).cmp(&(&b.path, b.line, b.kind)));
     report
 }

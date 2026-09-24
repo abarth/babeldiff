@@ -135,6 +135,9 @@ fn render_nav(out: &mut String, report: &Report) {
             report.lints.len()
         );
     }
+    if crate::render::placement_notable(report) {
+        out.push_str("<a class=\"extra\" href=\"#placement\">File placement</a>\n");
+    }
     if !report.cpp_changes.is_empty() {
         let _ = writeln!(
             out,
@@ -697,7 +700,8 @@ fn render_leftovers(out: &mut String, report: &Report) {
             "<section class=\"leftover\" id=\"lints\"><h2>Rubric lints</h2>\n\
              <p>Checks of the changed files against the porting rubric that need no pairing: \
              FFI declarations that disagree across the languages, <code>unsafe</code> without \
-             a safety comment, and FFI shims that do more than forward.</p><ul>\n",
+             a safety comment, FFI shims that do more than forward, and code that landed in a \
+             Rust file not named after its C++ file.</p><ul>\n",
         );
         for l in &report.lints {
             let (class, mark) = match l.severity {
@@ -717,6 +721,36 @@ fn render_leftovers(out: &mut String, report: &Report) {
                 esc(l.kind.name()),
                 esc(&l.message),
                 esc(&format!("{}:{}", l.path, l.line)),
+            );
+        }
+        out.push_str("</ul></section>\n");
+    }
+    if crate::render::placement_notable(report) {
+        out.push_str(
+            "<section class=\"leftover\" id=\"placement\"><h2>File placement</h2>\n\
+             <p>The Rust files each C++ file's functions went to. Each C++ file should become \
+             one Rust file named after it; unexpected destinations are marked.</p><ul>\n",
+        );
+        for pl in &report.placement {
+            let parts: Vec<String> = pl
+                .targets
+                .iter()
+                .map(|t| {
+                    let names: Vec<&str> = t.functions.iter().map(|(n, _)| n.as_str()).collect();
+                    format!(
+                        "<span class=\"{}\" title=\"{}\">{} ({})</span>",
+                        if t.expected { "loc" } else { "n-bad" },
+                        esc(&names.join(", ")),
+                        esc(&t.rust_path),
+                        t.functions.len()
+                    )
+                })
+                .collect();
+            let _ = writeln!(
+                out,
+                "<li><span class=\"loc\">{}</span> &rarr; {}</li>",
+                esc(&pl.cpp_path),
+                parts.join(", ")
             );
         }
         out.push_str("</ul></section>\n");
@@ -762,6 +796,31 @@ fn render_leftovers(out: &mut String, report: &Report) {
             );
         }
         for f in &report.unmatched_rust {
+            let callers = report.callers(f);
+            let helper = if callers.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " <span class=\"tag\">helper for {}</span>",
+                    esc(&callers.join(", "))
+                )
+            };
+            let _ = writeln!(
+                out,
+                "<li><span class=\"lang r\">Rust</span> <code>{}</code> <span class=\"loc\">{}</span>{helper}</li>",
+                esc(&f.name),
+                esc(&f.location())
+            );
+        }
+        out.push_str("</ul></section>\n");
+    }
+    if !report.rust_tests.is_empty() {
+        let _ = writeln!(
+            out,
+            "<section class=\"leftover\" id=\"rust-tests\"><h2>Rust tests with no C++ counterpart ({})</h2><ul>",
+            report.rust_tests.len()
+        );
+        for f in &report.rust_tests {
             let _ = writeln!(
                 out,
                 "<li><span class=\"lang r\">Rust</span> <code>{}</code> <span class=\"loc\">{}</span></li>",

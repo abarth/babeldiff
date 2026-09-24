@@ -24,6 +24,10 @@ pub enum LintKind {
     ExternSignature,
     UnsafeSafety,
     ShimLogic,
+    FilePlacement,
+    Provenance,
+    InventedLifetime,
+    UnsafeDensity,
 }
 
 impl LintKind {
@@ -33,6 +37,10 @@ impl LintKind {
             LintKind::ExternSignature => "extern-signature",
             LintKind::UnsafeSafety => "unsafe-safety",
             LintKind::ShimLogic => "shim-logic",
+            LintKind::FilePlacement => "file-placement",
+            LintKind::Provenance => "provenance-comment",
+            LintKind::InventedLifetime => "invented-lifetime",
+            LintKind::UnsafeDensity => "unsafe-density",
         }
     }
 
@@ -42,6 +50,10 @@ impl LintKind {
             LintKind::ExternSignature => "FFI declarations match on both sides",
             LintKind::UnsafeSafety => "every unsafe block and fn documents its safety",
             LintKind::ShimLogic => "FFI shims only forward",
+            LintKind::FilePlacement => "each C++ file becomes one Rust file named after it",
+            LintKind::Provenance => "no comments about where the code was ported from",
+            LintKind::InventedLifetime => "references borrow from what they point into",
+            LintKind::UnsafeDensity => "safe facades instead of unsafe code at each use",
         }
     }
 }
@@ -63,7 +75,9 @@ pub fn lint(cs: &ChangeSet) -> Vec<Lint> {
     out.extend(extern_signatures(cs));
     for v in &cs.rust_new {
         out.extend(unsafe_safety(v));
+        out.extend(provenance(v));
     }
+    out.extend(rust_function_lints(cs));
     out.extend(shim_logic(cs));
     out.sort_by(|a, b| (&a.path, a.line, a.kind).cmp(&(&b.path, b.line, b.kind)));
     out.dedup();
@@ -612,6 +626,222 @@ fn extern_signatures(cs: &ChangeSet) -> Vec<Lint> {
 }
 
 // ---------------------------------------------------------------------------
+// Invented lifetimes and unsafe density
+
+/// Code of a line without its comment.
+fn code_part(line: &str) -> &str {
+    line.split("//").next().unwrap_or("")
+}
+
+/// Lints over each changed Rust function.
+fn rust_function_lints(cs: &ChangeSet) -> Vec<Lint> {
+    let mut out = Vec::new();
+    for v in &cs.rust_new {
+        let functions = crate::extract::extract(Lang::Rust, &v.path, &v.text).functions;
+        let mut per_file: Vec<(usize, String)> = Vec::new();
+        for f in &functions {
+            if !touched(v, f.start_line..=f.end_line) {
+                continue;
+            }
+            out.extend(invented_lifetime(v, f));
+            // Thin FFI shims and tests need their unsafe; a function that
+            // needs a lot of it points at a missing safe facade.
+            let test = f
+                .lines
+                .iter()
+                .take_while(|l| !l.contains("fn "))
+                .any(|l| l.trim_start().starts_with("#[") && l.contains("test"));
+            let n = unsafe_blocks(f);
+            let thin = f
+                .units
+                .iter()
+                .filter(|u| !matches!(u.kind, UnitKind::Signature | UnitKind::Comment))
+                .count()
+                <= 3;
+            if n >= UNSAFE_FN_MIN && !(f.is_ffi && thin) && !test {
+                per_file.push((n, f.name.clone()));
+            }
+        }
+        let total: usize = per_file.iter().map(|(n, _)| n).sum();
+        if total >= UNSAFE_FILE_MIN {
+            per_file.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            let top: Vec<String> = per_file
+                .iter()
+                .take(3)
+                .map(|(n, name)| format!("{name} {n}"))
+                .collect();
+            out.push(Lint {
+                kind: LintKind::UnsafeDensity,
+                severity: Severity::Note,
+                path: v.path.clone(),
+                line: 1,
+                message: format!(
+                    "{total} unsafe blocks in {} changed function{} (most in {}); a safe facade for what they reach into would remove most of them",
+                    per_file.len(),
+                    if per_file.len() == 1 { "" } else { "s" },
+                    top.join(", ")
+                ),
+                related: None,
+            });
+        }
+    }
+    out
+}
+
+/// Files with at least this many unsafe blocks in changed functions that
+/// each have at least [`UNSAFE_FN_MIN`] get a note.
+const UNSAFE_FILE_MIN: usize = 10;
+const UNSAFE_FN_MIN: usize = 3;
+
+/// Number of `unsafe { ... }` blocks in a function's body.
+pub fn unsafe_blocks(f: &Function) -> usize {
+    static UNSAFE_BLOCK: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\bunsafe\s*\{").unwrap());
+    f.lines
+        .iter()
+        .map(|l| UNSAFE_BLOCK.find_iter(code_part(l)).count())
+        .sum()
+}
+
+/// A reference made from a raw pointer that was taken from a place still
+/// in scope (`let p = buf.as_mut_ptr(); ... &mut *p`): the reference's
+/// lifetime is invented rather than borrowed from `buf`, so the compiler
+/// can't check it. Borrowing `buf` (or a part of it) says the same thing
+/// safely.
+fn invented_lifetime(v: &Version, f: &Function) -> Vec<Lint> {
+    static FROM_PLACE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"\blet\s+(?:mut\s+)?([a-z_]\w*)\s*(?::[^=]*)?=\s*&?(?:mut\s+)?([a-z_][\w.]*(?:\[[^\]]*\])?)\s*\.\s*as_(?:mut_)?ptr\s*\(\s*\)").unwrap()
+    });
+    static LET: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\blet\s+(?:mut\s+)?([a-z_]\w*)\s*(?::[^=]*)?=(.*)").unwrap());
+    static DEREF: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"&\s*(?:mut\s+)?\*\s*\(?\s*([a-z_]\w*)\b").unwrap());
+    // Pointer name -> the place it came from, and the line.
+    let mut derived: Vec<(String, String, usize)> = Vec::new();
+    let mut out = Vec::new();
+    let code: Vec<&str> = f.lines.iter().map(|l| code_part(l).trim()).collect();
+    for (k, text) in code.iter().enumerate() {
+        let line = f.start_line + k;
+        // A `let` can span lines (a call that returns a derived pointer):
+        // its value runs to the `;`, within a few lines.
+        let stmt = || -> String {
+            let end = (k..code.len().min(k + 8))
+                .find(|&m| code[m].ends_with(';'))
+                .unwrap_or(k);
+            code[k..=end].join(" ")
+        };
+        if let Some(c) = FROM_PLACE.captures(text) {
+            derived.push((c[1].to_string(), c[2].to_string(), line));
+            continue;
+        }
+        for c in DEREF.captures_iter(text) {
+            let Some((name, place, at)) = derived.iter().find(|(n, _, _)| *n == c[1]).cloned()
+            else {
+                continue;
+            };
+            if !touched(v, line..=line) {
+                continue;
+            }
+            out.push(Lint {
+                kind: LintKind::InventedLifetime,
+                severity: Severity::Issue,
+                path: v.path.clone(),
+                line,
+                message: format!(
+                    "a reference is made from `{name}`, a raw pointer into `{place}` (line {at}), so its lifetime is invented rather than borrowed from `{place}`; borrow `{place}` instead"
+                ),
+                related: None,
+            });
+        }
+        // A pointer computed from a derived pointer is derived too.
+        if LET.is_match(text) {
+            let whole = stmt();
+            let Some(c) = LET.captures(&whole) else {
+                continue;
+            };
+            let rhs = c[2].to_string();
+            let from = derived.iter().find(|(n, _, _)| {
+                Regex::new(&format!(r"\b{}\b", regex::escape(n))).is_ok_and(|r| r.is_match(&rhs))
+            });
+            if let Some((_, place, at)) = from.cloned() {
+                let pointerish = ["*mut", "*const", "ptr", ".add(", ".cast", ".offset("];
+                if pointerish.iter().any(|p| rhs.contains(p)) && !rhs.trim_start().starts_with('&')
+                {
+                    derived.push((c[1].to_string(), place, at));
+                }
+            }
+        }
+    }
+    out.dedup_by(|a, b| a.line == b.line);
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Provenance comments
+
+static PROVENANCE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?ix)
+        \b(?:ported|translated|converted|transliterated|carried\s+over|adapted)\s+(?:directly\s+|verbatim\s+)?from\b
+        | \bport\s+of\s+(?:the\s+)?(?:C\+\+|`)
+        | \b[\w./-]+\.(?:cc|cpp|h|hh|S)\s*:\s*\d+
+        | \b(?:mirrors|matches|follows)\s+(?:the\s+)?(?:C\+\+\s+)?`?[\w./-]+\.(?:cc|cpp|h)\b
+        | \b(?:the|its)\s+C\+\+\s+(?:version|implementation|original|counterpart)\b
+        | \bC\+\+\s+original\b",
+    )
+    .unwrap()
+});
+
+/// Comments that point back at the C++ a function was ported from
+/// ("Ported from foo.cc", "(`foo.cc:12-34`)"). They stop being true, or
+/// useful, once the change lands. Reported once per file.
+fn provenance(v: &Version) -> Vec<Lint> {
+    let mut hits: Vec<(usize, String)> = Vec::new();
+    for (i, line) in v.text.lines().enumerate() {
+        let n = i + 1;
+        let Some(pos) = line.find("//") else { continue };
+        let comment = &line[pos..];
+        if comment.contains("SAFETY") || !touched(v, n..=n) {
+            continue;
+        }
+        if PROVENANCE.is_match(comment) {
+            let text = comment
+                .trim_start_matches('/')
+                .trim_start_matches('!')
+                .trim();
+            hits.push((n, text.to_string()));
+        }
+    }
+    let Some((first, example)) = hits.first().cloned() else {
+        return Vec::new();
+    };
+    let example: String = if example.chars().count() > 80 {
+        format!("{}...", example.chars().take(80).collect::<String>())
+    } else {
+        example
+    };
+    let lines: Vec<String> = hits.iter().take(8).map(|(n, _)| n.to_string()).collect();
+    let more = if hits.len() > 8 { ", ..." } else { "" };
+    vec![Lint {
+        kind: LintKind::Provenance,
+        severity: Severity::Issue,
+        path: v.path.clone(),
+        line: first,
+        message: format!(
+            "{} comment{} say{} where the code was ported from (line{} {}{more}), such as \"{example}\"; drop {}, since {} stop{} being relevant once the change lands",
+            hits.len(),
+            if hits.len() == 1 { "" } else { "s" },
+            if hits.len() == 1 { "s" } else { "" },
+            if hits.len() == 1 { "" } else { "s" },
+            lines.join(", "),
+            if hits.len() == 1 { "it" } else { "them" },
+            if hits.len() == 1 { "it" } else { "they" },
+            if hits.len() == 1 { "s" } else { "" },
+        ),
+        related: None,
+    }]
+}
+
+// ---------------------------------------------------------------------------
 // unsafe without SAFETY
 
 fn unsafe_safety(v: &Version) -> Vec<Lint> {
@@ -926,6 +1156,33 @@ mod tests {
             .filter(|l| l.kind == kind)
             .map(|l| l.message.clone())
             .collect()
+    }
+
+    #[test]
+    fn invented_lifetimes_are_reported() {
+        let rust = "fn f(arch: &mut Arch) {\n    let buf_ptr = arch.buffer.as_mut_ptr();\n    let save_ptr = unsafe {\n        component(buf_ptr, 0)\n    } as *mut Area;\n    let save = unsafe { &mut *save_ptr };\n    let ok = unsafe { &*other };\n}\n";
+        let v = version("foo.rs", rust);
+        let f = &crate::extract::extract(Lang::Rust, "foo.rs", rust).functions[0];
+        let l = invented_lifetime(&v, f);
+        assert_eq!(l.len(), 1, "{l:?}");
+        assert_eq!(l[0].line, 6);
+        assert!(l[0].message.contains("`arch.buffer`"), "{}", l[0].message);
+    }
+
+    #[test]
+    fn provenance_comments_are_reported_once_per_file() {
+        let v = version(
+            "foo.rs",
+            "//! Ported from `kernel/foo.cc`.\n\n/// Frees the page (`foo.cc:120-134`).\nfn free() {}\n\n// Mirrors the C++ behavior of checking twice.\n// SAFETY: from foo.cc:12 as well.\nfn g() {}\n",
+        );
+        let l = provenance(&v);
+        assert_eq!(l.len(), 1);
+        assert_eq!(l[0].line, 1);
+        assert!(
+            l[0].message.starts_with("2 comments say"),
+            "{}",
+            l[0].message
+        );
     }
 
     #[test]

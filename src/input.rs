@@ -284,6 +284,19 @@ pub fn build_inputs(cs: &ChangeSet, min_changed: f64) -> Inputs {
         }
     }
     inputs.cpp = cpp;
+    // Function-like macros the old C++ defines, which a conversion should
+    // keep as macros rather than expand at each use.
+    static DEFINE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?m)^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)\(").unwrap()
+    });
+    for v in &cs.cpp_old {
+        for c in DEFINE.captures_iter(&v.text) {
+            let name = c[1].to_string();
+            if !inputs.cpp_macros.contains(&name) {
+                inputs.cpp_macros.push(name);
+            }
+        }
+    }
     inputs.cpp_changed_paths = cs
         .cpp_old
         .iter()

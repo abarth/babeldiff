@@ -463,3 +463,96 @@ fn issues_only_drops_notes_and_clean_pairs() {
     assert!(report.pairs.iter().all(|p| p.issues() > 0));
     assert_eq!(report.pairs.len(), 2);
 }
+
+fn lantern_report(name: &str) -> Report {
+    git_report("lantern", name)
+}
+
+#[test]
+fn lantern_golden() {
+    let report = lantern_report("lantern-golden");
+    check_golden(
+        &fixture("lantern/expected.txt"),
+        &render(&report, &opts(Layout::Stacked)),
+    );
+}
+
+/// The lantern fixture plants the mistakes found reviewing a large
+/// conversion by hand: a second copy of a function that drops a mask, a
+/// constant the C++ never used, a mask the Rust adds, a macro and a helper
+/// expanded inline, a call moved out of `DEBUG_ASSERT`, `ASSERT(false)`
+/// turned into an error, an added check, a function in an unrelated file,
+/// a reference with an invented lifetime and "Ported from" comments.
+#[test]
+fn lantern_finds_the_planted_mistakes() {
+    let report = lantern_report("lantern-planted");
+    let mut issues: Vec<String> = report
+        .pairs
+        .iter()
+        .flat_map(|p| p.all_findings())
+        .filter(|f| f.severity == Severity::Issue)
+        .map(|f| format!("{} {}", f.category.name(), f.message))
+        .collect();
+    issues.sort();
+    assert_eq!(
+        issues,
+        [
+            "assert C++ calls is_lit_locked only inside DEBUG_ASSERT, so only in debug builds; the Rust calls it unconditionally at line 56",
+            "assert C++ panics here (ASSERT(false)); the Rust returns NOT_SUPPORTED instead (line 73)",
+            "call C++ calls the helper copy_color at 3 places (lines 44, 45, 46); the Rust never calls it, so its code is repeated inline",
+            "call C++ macro COPY_WICKS is expanded inline in the Rust; keep it as a macro (macro_rules!) and use it where the C++ does",
+            "call C++ macro COPY_WICKS is expanded inline in the Rust; keep it as a macro (macro_rules!) and use it where the C++ does",
+            "error-path Rust adds a check `lantern.is_null() || out.is_null()`, returning INVALID_ARGS, that the C++ doesn't make",
+            "pairing the change defines read_brightness twice, here and at zircon/kernel/arch/toy/src/lantern.rs:8, and the copies differ; both are compared with the C++, and callers may reach either",
+            "value C++ sets LANTERN_BRIGHT_MASK here, and the Rust doesn't",
+            "value Rust also clears LANTERN_FLAGS_RESUME, which the C++ doesn't",
+            "value only Rust uses LANTERN_OFF_MASK; the C++ function never mentions it",
+        ]
+    );
+    // Both copies of read_brightness are compared with the C++.
+    let copies: Vec<&str> = report
+        .pairs
+        .iter()
+        .filter(|p| p.cpp.name == "read_brightness")
+        .map(|p| p.rust.path.rsplit('/').next().unwrap())
+        .collect();
+    assert_eq!(copies, ["lantern.rs", "glow.rs"]);
+    // The lock the closure runs under lines up with the C++ guard.
+    let state = report
+        .pairs
+        .iter()
+        .find(|p| p.cpp.name == "lantern_get_state")
+        .unwrap();
+    assert_eq!(state.summary.cpp_locks, state.summary.rust_locks);
+
+    let lints: Vec<(&str, usize, &str)> = report
+        .lints
+        .iter()
+        .map(|l| (l.path.rsplit('/').next().unwrap(), l.line, l.kind.name()))
+        .collect();
+    assert_eq!(
+        lints,
+        [
+            ("lantern.cc", 1, "file-placement"),
+            ("glow.rs", 28, "invented-lifetime"),
+            ("lantern.rs", 4, "provenance-comment"),
+        ]
+    );
+    let placement: Vec<(&str, Vec<(&str, bool)>)> = report
+        .placement
+        .iter()
+        .map(|p| {
+            (
+                p.cpp_path.rsplit('/').next().unwrap(),
+                p.targets
+                    .iter()
+                    .map(|t| (t.rust_path.rsplit('/').next().unwrap(), t.expected))
+                    .collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        placement,
+        [("lantern.cc", vec![("lantern.rs", true), ("glow.rs", false)])]
+    );
+}

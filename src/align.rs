@@ -63,7 +63,37 @@ fn is_return_vs_propagated(a: &Unit, b: &Unit) -> bool {
     (ret(a) && prop(b)) || (prop(a) && ret(b))
 }
 
+/// A `case` against a branch of an if/else-if chain that does the same
+/// dispatch: `case Foo::A:` and `if x == Foo::A`, or `default:` and `else`.
+pub fn case_vs_branch(a: &Unit, b: &Unit) -> Option<f64> {
+    let (case, branch) = match (a.kind, b.kind) {
+        (UnitKind::Case, _) => (a, b),
+        (_, UnitKind::Case) => (b, a),
+        _ => return None,
+    };
+    let default = case.features.names.is_empty();
+    match branch.kind {
+        UnitKind::If | UnitKind::ElseIf if !default => {
+            let names = &case.features.names;
+            let hit = names
+                .iter()
+                .filter(|n| branch.features.names.contains(n))
+                .count();
+            Some(if hit == 0 {
+                0.0
+            } else {
+                0.3 + 0.6 * hit as f64 / names.len() as f64
+            })
+        }
+        UnitKind::Else if default => Some(0.6),
+        _ => None,
+    }
+}
+
 pub fn similarity(a: &Unit, b: &Unit) -> f64 {
+    if let Some(s) = case_vs_branch(a, b) {
+        return s;
+    }
     if is_handled_vs_propagated(a, b) || is_return_vs_propagated(a, b) {
         let (fa, fb) = (&a.features, &b.features);
         if fa.calls.is_empty() || fb.calls.is_empty() {
