@@ -80,6 +80,8 @@ pub enum Category {
     Value,
     /// Unsafe code the C++ didn't need.
     Unsafe,
+    /// Code compiled only in some configurations on one side.
+    Conditional,
 }
 
 impl Category {
@@ -98,6 +100,7 @@ impl Category {
             Category::Atomic => "atomic",
             Category::Value => "value",
             Category::Unsafe => "unsafe",
+            Category::Conditional => "conditional",
         }
     }
 
@@ -115,6 +118,7 @@ impl Category {
             Category::Pairing => "pairing",
             Category::Atomic => "atomics and memory ordering",
             Category::Unsafe => "safe facades over unsafe code",
+            Category::Conditional => "conditional compilation stays conditional",
         }
     }
 }
@@ -361,6 +365,7 @@ pub fn check_with(
     merged_checks(&mut rows, cpp, rust);
     assert_semantics(&mut rows, cpp, rust);
     exhaustive_match(&mut rows, cpp, rust);
+    conditional_compilation(&mut rows, cpp, rust);
     dedupe_values(&mut rows);
     group_runs(&mut rows, cpp, rust);
     let findings = refresh(&mut rows, cpp, rust);
@@ -458,6 +463,132 @@ fn exhaustive_match(rows: &mut [Row], cpp: &Function, rust: &Function) {
             }
         }
         k = end;
+    }
+}
+
+/// Rows for conditional compilation. C++ `#if` code must stay conditional
+/// in Rust (`#[cfg]` or `cfg!`): a `#if` with no Rust counterpart means
+/// the Rust either always runs that code or never does, and a run-time
+/// `if` on a build setting (`__has_feature(safe_stack)`) can't stand in
+/// for it. A run-time `if` on a plain constant (`#if LK_DEBUGLEVEL > 1`)
+/// compiles to the same code, so that is only a note.
+fn conditional_compilation(rows: &mut [Row], cpp: &Function, rust: &Function) {
+    let directive = |f: &Function, u: &Unit| f.line(u.start_line).trim().to_string();
+    let is_else = |f: &Function, u: &Unit| {
+        let d = directive(f, u);
+        d.starts_with("#else") || d.starts_with("} else")
+    };
+    // A condition on the compiler or build configuration, as opposed to a
+    // comparison of a named constant.
+    let build_setting = |d: &str| {
+        d.starts_with("#ifdef")
+            || d.starts_with("#ifndef")
+            || d.contains("defined")
+            || d.contains("__")
+    };
+    // Lines a C++ directive guards: up to the next unit back at its depth.
+    let span = |u: &Unit, k: usize| {
+        let end = cpp.units[k + 1..]
+            .iter()
+            .take_while(|v| v.depth > u.depth)
+            .map(|v| v.end_line)
+            .max()
+            .unwrap_or(u.end_line);
+        if end > u.start_line + 1 {
+            format!("lines {}-{}", u.start_line + 1, end)
+        } else {
+            format!("line {}", end)
+        }
+    };
+    // Rust that mentions the condition's names outside any cfg: the stub
+    // or run-time test the `#if` became.
+    let mention = |u: &Unit| -> Option<(usize, String)> {
+        let words: Vec<&String> = u.features.idents.iter().filter(|w| w.len() >= 4).collect();
+        rust.units
+            .iter()
+            .filter(|v| v.kind != UnitKind::Cfg && v.kind != UnitKind::Comment)
+            .find_map(|v| {
+                let t = directive(rust, v);
+                let flat = t.replace('_', "").to_ascii_lowercase();
+                words
+                    .iter()
+                    .any(|w| flat.contains(w.as_str()))
+                    .then_some((v.start_line, t))
+            })
+    };
+    for r in rows.iter_mut() {
+        let cu = r.cpp.map(|k| (k, &cpp.units[k]));
+        let ru = r.rust.map(|k| &rust.units[k]);
+        match (cu, ru) {
+            (Some((k, u)), None) if u.kind == UnitKind::Cfg => {
+                let d = directive(cpp, u);
+                r.notes = if is_else(cpp, u) {
+                    vec![Note::new(
+                        Severity::Note,
+                        Category::Conditional,
+                        format!("`{d}` branch only in C++"),
+                    )]
+                } else {
+                    let mut msg = format!(
+                        "C++ compiles {} only when `{d}`; the Rust has no `#[cfg]` or `cfg!` for it, so it runs that code unconditionally or not at all",
+                        span(u, k)
+                    );
+                    if let Some((line, text)) = mention(u) {
+                        let text: String = text.chars().take(60).collect();
+                        msg.push_str(&format!(
+                            "; Rust line {line} (`{text}`) is not a compile-time condition"
+                        ));
+                    }
+                    vec![Note::new(Severity::Issue, Category::Conditional, msg)]
+                };
+            }
+            (None, Some(v)) if v.kind == UnitKind::Cfg && !is_else(rust, v) => {
+                r.notes = vec![Note::new(
+                    Severity::Note,
+                    Category::Conditional,
+                    format!(
+                        "Rust compiles this only when `{}`; the C++ has no `#if` for it",
+                        directive(rust, v)
+                    ),
+                )];
+            }
+            (Some((_, u)), Some(v)) if u.kind == UnitKind::Cfg && v.kind == UnitKind::Cfg => {
+                r.notes.clear();
+            }
+            (Some((_, u)), Some(v)) if u.kind == UnitKind::Cfg => {
+                let d = directive(cpp, u);
+                r.notes = vec![if build_setting(&d) {
+                    Note::new(
+                        Severity::Issue,
+                        Category::Conditional,
+                        format!(
+                            "C++ decides this at compile time (`{d}`), but the Rust tests it at run time (`{}`); use `#[cfg]` or `cfg!`",
+                            directive(rust, v)
+                        ),
+                    )
+                } else {
+                    Note::new(
+                        Severity::Note,
+                        Category::Conditional,
+                        format!(
+                            "C++ decides this at compile time (`{d}`); the Rust tests the same constant at run time, which compiles to the same code"
+                        ),
+                    )
+                }];
+            }
+            (Some((_, u)), Some(v)) if v.kind == UnitKind::Cfg => {
+                r.notes = vec![Note::new(
+                    Severity::Note,
+                    Category::Conditional,
+                    format!(
+                        "the Rust decides this at compile time (`{}`), where the C++ tests `{}` at run time",
+                        directive(rust, v),
+                        directive(cpp, u)
+                    ),
+                )];
+            }
+            _ => {}
+        }
     }
 }
 
@@ -939,6 +1070,7 @@ fn group_runs(rows: &mut [Row], cpp: &Function, rust: &Function) {
                                 | Category::Trace
                                 | Category::Assert
                                 | Category::Order
+                                | Category::Conditional
                         )
                     })
             })

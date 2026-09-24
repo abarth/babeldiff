@@ -7,6 +7,49 @@ use std::sync::LazyLock;
 
 /// Converts an identifier to lower snake case and drops leading and trailing
 /// underscores, so `CommitRange`, `commit_range` and `commit_range_` agree.
+/// The configuration names a conditional-compilation condition tests
+/// (`#if __has_feature(safe_stack)`, `#[cfg(feature = "safe-stack")]`),
+/// lowercase with separators dropped so `safe_stack` meets `safestack`.
+pub fn cfg_words(text: &str) -> Vec<String> {
+    const SYNTAX: &[&str] = &[
+        "if",
+        "ifdef",
+        "ifndef",
+        "elif",
+        "elifdef",
+        "elifndef",
+        "else",
+        "endif",
+        "defined",
+        "hasfeature",
+        "hasinclude",
+        "hasbuiltin",
+        "hasattribute",
+        "cfg",
+        "not",
+        "all",
+        "any",
+        "feature",
+        "true",
+        "false",
+    ];
+    static WORD: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"[A-Za-z_][A-Za-z0-9_-]*").unwrap());
+    let mut out: Vec<String> = Vec::new();
+    for m in WORD.find_iter(text) {
+        let w: String = m
+            .as_str()
+            .chars()
+            .filter(|c| *c != '_' && *c != '-')
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if !w.is_empty() && !SYNTAX.contains(&w.as_str()) && !out.contains(&w) {
+            out.push(w);
+        }
+    }
+    out
+}
+
 pub fn ident(s: &str) -> String {
     let s = s.strip_prefix("r#").unwrap_or(s);
     let chars: Vec<char> = s.chars().collect();

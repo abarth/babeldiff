@@ -1,6 +1,7 @@
 //! Extracts functions and their units from Rust source.
 
 use crate::model::{Features, Function, Lang, Ret, Unit, UnitKind};
+use crate::normalize;
 use crate::ts::{self, FeatureAcc, UnitBuilder};
 use regex::Regex;
 use std::sync::LazyLock;
@@ -240,9 +241,29 @@ impl<'a> Ctx<'a> {
     fn block(&self, n: Node, depth: usize, tail: bool, fcx: FnCtx, b: &mut UnitBuilder) {
         let children = ts::named_children(n);
         let last = children.iter().rposition(|c| !ts::is_comment(*c));
+        // A statement under `#[cfg(..)]` goes one level below the attribute.
+        let mut cfg = false;
         for (i, c) in children.iter().enumerate() {
+            if c.kind() == "attribute_item" {
+                let t = self.text(*c);
+                if t.trim_start().starts_with("#[cfg(") {
+                    let f = Features {
+                        idents: normalize::cfg_words(t),
+                        ..Features::default()
+                    };
+                    b.push(UnitKind::Cfg, ts::line(*c), ts::end_line(*c), depth, f);
+                    cfg = true;
+                }
+                continue;
+            }
             let is_tail = tail && Some(i) == last && self.is_value_position(*c);
-            self.statement(*c, depth, is_tail, fcx, b);
+            let d = if cfg && !ts::is_comment(*c) {
+                cfg = false;
+                depth + 1
+            } else {
+                depth
+            };
+            self.statement(*c, d, is_tail, fcx, b);
         }
     }
 
@@ -529,7 +550,19 @@ impl<'a> Ctx<'a> {
             f.checks_error = t.contains(".is_err()") || t.trim_start().starts_with("let Err");
             self.conjuncts(c, &mut f.conjuncts);
         }
-        let kind = if is_else_if {
+        // `if cfg!(..)` chooses at compile time, like C++ `#if`.
+        let cfg = cond.is_some_and(|c| {
+            c.kind() == "macro_invocation" && self.text(c).trim_start().starts_with("cfg!")
+        });
+        if let (true, Some(c)) = (cfg, cond) {
+            f = Features {
+                idents: normalize::cfg_words(self.text(c)),
+                ..Features::default()
+            };
+        }
+        let kind = if cfg {
+            UnitKind::Cfg
+        } else if is_else_if {
             UnitKind::ElseIf
         } else {
             UnitKind::If
@@ -672,8 +705,20 @@ impl<'a> Ctx<'a> {
             if pattern.is_some_and(|p| self.text(p).trim() == "_") {
                 f.idents.push("default".to_string());
             }
-            let header_end = value.map_or(ts::line(arm), |v| ts::line(v));
-            b.push(UnitKind::Case, ts::line(arm), header_end, depth + 1, f);
+            // `#[cfg(..)]` on an arm, like C++ `#if` around a `case`.
+            for a in ts::named_children(arm) {
+                let t = self.text(a);
+                if a.kind() == "attribute_item" && t.trim_start().starts_with("#[cfg(") {
+                    let cf = Features {
+                        idents: normalize::cfg_words(t),
+                        ..Features::default()
+                    };
+                    b.push(UnitKind::Cfg, ts::line(a), ts::end_line(a), depth + 1, cf);
+                }
+            }
+            let line = pattern.map_or(ts::line(arm), |p| ts::line(p));
+            let header_end = value.map_or(line, |v| ts::line(v));
+            b.push(UnitKind::Case, line, header_end, depth + 1, f);
             // Comments between the alternatives of a merged arm
             // (`0x4e /* Skylake */ | 0x5e /* Kaby Lake */ => ...`), which
             // C++ writes one per `case`.

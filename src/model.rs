@@ -59,6 +59,10 @@ pub enum UnitKind {
     Continue,
     Goto,
     Label,
+    /// A conditionally compiled branch: C++ `#if`, `#ifdef`, `#elif` or
+    /// `#else`, or Rust `#[cfg(..)]` on a statement or `if cfg!(..)`. The
+    /// code it guards follows one level deeper.
+    Cfg,
 }
 
 impl UnitKind {
@@ -78,6 +82,7 @@ impl UnitKind {
             UnitKind::Continue => "continue",
             UnitKind::Goto => "goto",
             UnitKind::Label => "label",
+            UnitKind::Cfg => "conditional compilation",
         }
     }
 

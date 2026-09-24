@@ -1,6 +1,7 @@
 //! Extracts functions and their units from C++ source.
 
 use crate::model::{Features, Function, Lang, Ret, Unit, UnitKind};
+use crate::normalize;
 use crate::ts::{self, FeatureAcc, UnitBuilder};
 use regex::Regex;
 use std::collections::HashMap;
@@ -354,6 +355,32 @@ impl<'a> Ctx<'a> {
         }
     }
 
+    /// `#if`, `#ifdef`, `#elif` or `#else` inside a body: a
+    /// conditional-compilation unit for the directive, the code it guards
+    /// one level deeper, then the `#elif`/`#else` that follows.
+    fn preproc(&self, n: Node, depth: usize, b: &mut UnitBuilder) {
+        let line = ts::line(n);
+        let cond = n
+            .child_by_field_name("condition")
+            .or_else(|| n.child_by_field_name("name"));
+        let alt = n.child_by_field_name("alternative");
+        let directive = self.text(n).lines().next().unwrap_or("").to_string();
+        let f = Features {
+            idents: normalize::cfg_words(&directive),
+            ..Features::default()
+        };
+        b.push(UnitKind::Cfg, line, line, depth, f);
+        for c in ts::named_children(n) {
+            if Some(c) == cond || Some(c) == alt {
+                continue;
+            }
+            self.statement(c, depth + 1, b);
+        }
+        if let Some(a) = alt {
+            self.preproc(a, depth, b);
+        }
+    }
+
     fn statement(&self, n: Node, depth: usize, b: &mut UnitBuilder) {
         let line = ts::line(n);
         match n.kind() {
@@ -367,16 +394,8 @@ impl<'a> Ctx<'a> {
                     }
                 }
             }
-            "preproc_if" | "preproc_ifdef" | "preproc_else" | "preproc_elif" => {
-                for c in ts::named_children(n) {
-                    if !matches!(
-                        c.kind(),
-                        "identifier" | "preproc_defined" | "binary_expression"
-                    ) {
-                        self.statement(c, depth, b);
-                    }
-                }
-            }
+            "preproc_if" | "preproc_ifdef" | "preproc_else" | "preproc_elif"
+            | "preproc_elifdef" => self.preproc(n, depth, b),
             "if_statement" => self.if_statement(n, depth, false, b),
             "for_statement" | "for_range_loop" | "while_statement" | "do_statement" => {
                 let body = n.child_by_field_name("body");
