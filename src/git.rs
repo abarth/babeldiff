@@ -4,6 +4,7 @@ use crate::analyze::{name_similarity, CppFinder};
 use crate::cpp::DeclComments;
 use crate::extract::{self, attach_decl_comments};
 use crate::input::{ChangeSet, Version};
+use crate::layout;
 use crate::model::{Function, Lang};
 use crate::normalize;
 use crate::patch;
@@ -234,13 +235,10 @@ impl CppFinder for RepoFinder {
                 }
             }
         }
-        // Prefer files near the Rust file.
-        let dir = rust
-            .path
-            .rsplit_once('/')
-            .map_or("", |(d, _)| d)
-            .to_string();
-        paths.sort_by_key(|p| (!p.starts_with(&dir), stem(p) != want, p.len()));
+        // Never another architecture's C++, and files where the Rust's C++
+        // is expected first.
+        paths.retain(|p| !layout::arch_conflict(p, &rust.path));
+        paths.sort_by_key(|p| (!layout::related(p, &rust.path), stem(p) != want, p.len()));
         paths.truncate(self.max_files);
 
         let mut decls = DeclComments::new();

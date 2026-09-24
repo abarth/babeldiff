@@ -3,6 +3,7 @@
 
 use crate::align::{self, Pair};
 use crate::check::{self, Finding, Row, Severity, Summary};
+use crate::layout;
 use crate::model::{Function, Unit, UnitKind};
 use crate::normalize::{self, seq_similarity};
 use std::collections::{HashMap, HashSet};
@@ -340,6 +341,18 @@ fn asks_instead(a: &Function, b: &Function) -> bool {
     predicate(&wa, &wb) || predicate(&wb, &wa)
 }
 
+/// Whether unchanged C++ `c` is somewhere Rust `r`'s counterpart could be.
+/// C++ outside the Rust's component (see [`layout::related`]) must be the
+/// same function by class and name: the Rust may duplicate a generic
+/// helper, but a merely similar method there is someone else's code.
+fn expected_place(c: &Function, r: &Function) -> bool {
+    if layout::arch_conflict(&c.path, &r.path) {
+        return false;
+    }
+    layout::related(&c.path, &r.path)
+        || (class_key(c) == class_key(r) && name_words(c) == name_words(r))
+}
+
 fn plausible(a: &Function, b: &Function) -> bool {
     let body = |f: &Function| {
         f.units
@@ -347,7 +360,7 @@ fn plausible(a: &Function, b: &Function) -> bool {
             .filter(|u| !matches!(u.kind, UnitKind::Signature | UnitKind::Comment))
             .count()
     };
-    if asks_instead(a, b) {
+    if asks_instead(a, b) || layout::arch_conflict(&a.path, &b.path) {
         return false;
     }
     body(a).min(body(b)) >= 3 || name_similarity(a, b) >= 0.5
@@ -905,6 +918,7 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
             .into_iter()
             .filter(|c| !in_change(c) && !asks_instead(c, r))
             .filter(|c| !found_used.contains(&(c.path.clone(), c.start_line)))
+            .filter(|c| expected_place(c, r))
             .map(|c| {
                 let ok = unchanged_class_ok(&c, r, &hierarchy);
                 (ok, score(&c, r).0, c)
@@ -982,6 +996,7 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
         let hits: Vec<&Function> = universe
             .iter()
             .filter(|r| !r.is_ffi && class_key(r) == class_key(c) && name_words(r) == name_words(c))
+            .filter(|r| !layout::arch_conflict(&c.path, &r.path))
             .filter(|r| find_rust(&rust_pool, r).is_none_or(|ri| !rust_used[ri]))
             .collect();
         let [r] = hits.as_slice() else { continue };
