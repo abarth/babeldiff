@@ -76,6 +76,10 @@ pub enum Category {
     Pairing,
     /// Memory ordering of atomic operations.
     Atomic,
+    /// Constants, flags and masks one side uses and the other doesn't.
+    Value,
+    /// Unsafe code the C++ didn't need.
+    Unsafe,
 }
 
 impl Category {
@@ -92,6 +96,8 @@ impl Category {
             Category::Order => "order",
             Category::Pairing => "pairing",
             Category::Atomic => "atomic",
+            Category::Value => "value",
+            Category::Unsafe => "unsafe",
         }
     }
 
@@ -101,11 +107,14 @@ impl Category {
             Category::Comment => "comment parity (rubric 3.15, pitfall 22)",
             Category::ErrorPath => "behavioral parity of error paths",
             Category::Lock => "locking parity (rubric 3.4)",
-            Category::ControlFlow | Category::Call | Category::Order => "direct translation",
+            Category::ControlFlow | Category::Call | Category::Order | Category::Value => {
+                "direct translation"
+            }
             Category::Assert => "assertions (pitfall 23)",
             Category::Trace => "trace parity (rubric 3.9, pitfall 16)",
             Category::Pairing => "pairing",
             Category::Atomic => "atomics and memory ordering",
+            Category::Unsafe => "safe facades over unsafe code",
         }
     }
 }
@@ -184,6 +193,7 @@ pub fn check_with(
         );
         a == b
     };
+    let (cpp_names, rust_names) = (Tokens::of(cpp), Tokens::of(rust));
     let mut rows = Vec::new();
     let unmatched_c: Vec<usize> = pairs
         .iter()
@@ -208,6 +218,25 @@ pub fn check_with(
                     cpp.units[i].features.asserts,
                     &mut notes,
                 );
+                // Constants passed to a call only one side makes, or tested
+                // by a condition already reported as different, are part
+                // of that difference.
+                let explained = notes.iter().any(|n| {
+                    n.category == Category::Call || n.message.starts_with("condition reads")
+                });
+                lock_by_callback(&cpp.units[i], &rust.units[j], cpp, rust, &mut notes);
+                let cases =
+                    cpp.units[i].kind == UnitKind::Case || rust.units[j].kind == UnitKind::Case;
+                if !cases {
+                    value_diff(
+                        &unit_text(cpp, &cpp.units[i]),
+                        &unit_text(rust, &rust.units[j]),
+                        &cpp_names,
+                        &rust_names,
+                        explained,
+                        &mut notes,
+                    );
+                }
                 if notes.iter().any(|n| n.severity == Severity::Issue) {
                     Marker::Issue
                 } else if notes.is_empty() {
@@ -249,6 +278,7 @@ pub fn check_with(
                     let n = soften_balanced(n, u, flow_balanced(u.kind));
                     notes.push(soften_moved(n, u, ctx.elsewhere));
                 }
+                one_sided_constant(&unit_text(cpp, u), u, "C++", &rust_names, &mut notes);
                 Marker::CppOnly
             }
             (None, Some(j)) => {
@@ -273,6 +303,12 @@ pub fn check_with(
                     let n = soften_if_called(only_in(u, "Rust", "C++", moved), u, cpp);
                     notes.push(soften_balanced(n, u, flow_balanced(u.kind)));
                 }
+                // A plain binding (`let dr7 = X86_DR7_MASK;`) is still a
+                // value the C++ may not have.
+                let lost_value = !claimed.contains(&j) && u.kind != UnitKind::Comment;
+                if lost_value {
+                    one_sided_constant(&unit_text(rust, u), u, "Rust", &cpp_names, &mut notes);
+                }
                 Marker::RustOnly
             }
             (None, None) => continue,
@@ -284,9 +320,399 @@ pub fn check_with(
             notes,
         });
     }
+    one_finding_per_check(&mut rows, cpp, rust);
+    switch_as_if_chain(&mut rows, cpp, rust);
+    merged_checks(&mut rows, cpp, rust);
+    assert_semantics(&mut rows, cpp, rust);
     group_runs(&mut rows, cpp, rust);
-    let findings = findings_of(&rows, cpp, rust);
+    let findings = refresh(&mut rows, cpp, rust);
     (rows, findings)
+}
+
+/// Re-marks rows after their notes changed and lists their findings.
+pub fn refresh(rows: &mut [Row], cpp: &Function, rust: &Function) -> Vec<Finding> {
+    for r in rows.iter_mut() {
+        if matches!(r.marker, Marker::Same | Marker::Note | Marker::Issue) {
+            r.marker = if r.notes.iter().any(|n| n.severity == Severity::Issue) {
+                Marker::Issue
+            } else if r.notes.is_empty() {
+                Marker::Same
+            } else {
+                Marker::Note
+            };
+        }
+    }
+    findings_of(rows, cpp, rust)
+}
+
+/// A C++ guard on the stack against a Rust closure that runs under the same
+/// lock because it is passed to a callback (`with_chain_lock(t, f)`): the
+/// same lock, taken a different way.
+fn lock_by_callback(a: &Unit, b: &Unit, cpp: &Function, rust: &Function, notes: &mut Vec<Note>) {
+    static LET_CLOSURE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\blet\s+(?:mut\s+)?\w+\s*(?::[^=]*)?=\s*(?:move\s+)?\|").unwrap()
+    });
+    if a.features.locks.is_empty() || a.features.locks != b.features.locks {
+        return;
+    }
+    let guard = unit_text(cpp, a).contains("Guard");
+    if guard && LET_CLOSURE.is_match(&unit_text(rust, b)) {
+        notes.push(Note::new(
+            Severity::Note,
+            Category::Lock,
+            "same lock, but the Rust takes it by passing this closure to a callback instead of holding a guard like the C++; a guard type would keep the Rust shaped like the C++",
+        ));
+    }
+}
+
+/// Turns a one-sided issue on a row into a note with more to say.
+fn demote(r: &mut Row, why: &str) {
+    for n in &mut r.notes {
+        if n.severity == Severity::Issue && n.category != Category::Comment {
+            n.severity = Severity::Note;
+            n.message = format!("{}; {why}", n.message);
+        }
+    }
+}
+
+/// The unit of a row on one side.
+fn row_unit<'f>(r: &Row, f: &'f Function, cpp_side: bool) -> Option<&'f Unit> {
+    if cpp_side { r.cpp } else { r.rust }.map(|k| &f.units[k])
+}
+
+/// A C++ `switch` written as an if/else-if chain in Rust (or a `match`
+/// written as one in C++): once its cases line up with the branches, the
+/// `switch` header on its own is a rewrite, not a change in behavior.
+fn switch_as_if_chain(rows: &mut [Row], cpp: &Function, rust: &Function) {
+    let crossed = rows.iter().any(|r| {
+        let (Some(i), Some(j)) = (r.cpp, r.rust) else {
+            return false;
+        };
+        let (a, b) = (&cpp.units[i], &rust.units[j]);
+        (a.kind == UnitKind::Case) != (b.kind == UnitKind::Case)
+            && crate::align::case_vs_branch(a, b).is_some()
+    });
+    if !crossed {
+        return;
+    }
+    for r in rows.iter_mut() {
+        let u = match r.marker {
+            Marker::CppOnly => row_unit(r, cpp, true),
+            Marker::RustOnly => row_unit(r, rust, false),
+            _ => None,
+        };
+        // The branches of the chain name what the cases test.
+        let (other, other_cases) = if r.marker == Marker::CppOnly {
+            (rust, false)
+        } else {
+            (cpp, true)
+        };
+        let case_names: Vec<&String> = other
+            .units
+            .iter()
+            .filter(|v| (v.kind == UnitKind::Case) == other_cases)
+            .filter(|v| {
+                v.kind == UnitKind::Case || matches!(v.kind, UnitKind::If | UnitKind::ElseIf)
+            })
+            .flat_map(|v| v.features.names.iter())
+            .collect();
+        let part_of_chain = |u: &Unit| match u.kind {
+            UnitKind::Switch | UnitKind::Case => true,
+            UnitKind::If | UnitKind::ElseIf => {
+                u.features.names.iter().any(|n| case_names.contains(&n))
+            }
+            UnitKind::Else => true,
+            _ => false,
+        };
+        if u.is_some_and(part_of_chain) {
+            demote(
+                r,
+                "the switch and the if/else-if chain dispatch the same way",
+            );
+        }
+    }
+}
+
+/// The error an `if` returns: the error of the return right after it.
+fn if_returns(f: &Function, k: usize) -> Option<String> {
+    let next = f
+        .units
+        .get(k + 1..)?
+        .iter()
+        .find(|u| u.kind != UnitKind::Comment)?;
+    match (&next.kind, &next.features.ret) {
+        (UnitKind::Return, Some(Ret::Error(e))) if next.depth > f.units[k].depth => Some(e.clone()),
+        _ => None,
+    }
+}
+
+/// Several C++ checks returning the same error, written as one Rust `if a
+/// || b || c`: the C++ checks the Rust merged are not missing.
+fn merged_checks(rows: &mut [Row], cpp: &Function, rust: &Function) {
+    let merged: Vec<(usize, String)> = rust
+        .units
+        .iter()
+        .enumerate()
+        .filter(|(_, u)| {
+            matches!(u.kind, UnitKind::If | UnitKind::ElseIf) && u.features.conjuncts.len() >= 2
+        })
+        .filter_map(|(j, _)| if_returns(rust, j).map(|e| (j, e)))
+        .collect();
+    if merged.is_empty() {
+        return;
+    }
+    let mut folded: Vec<(usize, usize)> = Vec::new();
+    for (k, r) in rows.iter().enumerate() {
+        let Some(i) = r.cpp.filter(|_| r.rust.is_none()) else {
+            continue;
+        };
+        let u = &cpp.units[i];
+        if !matches!(u.kind, UnitKind::If | UnitKind::ElseIf) || u.features.conjuncts.is_empty() {
+            continue;
+        }
+        let Some(err) = if_returns(cpp, i) else {
+            continue;
+        };
+        let hit = merged.iter().find(|(j, e)| {
+            *e == err
+                && u.features.conjuncts.iter().all(|c| {
+                    !c.names.is_empty()
+                        && rust.units[*j]
+                            .features
+                            .conjuncts
+                            .iter()
+                            .any(|d| c.names.iter().all(|n| d.names.contains(n)))
+                })
+        });
+        if let Some((j, _)) = hit {
+            folded.push((k, rust.units[*j].start_line));
+        }
+    }
+    for (k, line) in folded {
+        let why = format!("the Rust merges this check into the `||` condition at line {line}");
+        demote(&mut rows[k], &why);
+        // And the C++ return that goes with it.
+        if let Some(next) = rows[k + 1..].iter_mut().find(|r| r.cpp.is_some()) {
+            if next.rust.is_none()
+                && next
+                    .cpp
+                    .is_some_and(|i| cpp.units[i].kind == UnitKind::Return)
+            {
+                demote(next, &why);
+            }
+        }
+    }
+}
+
+/// The condition of an `if` as written, without `if`, parentheses and the
+/// opening brace.
+fn condition_text(f: &Function, u: &Unit) -> String {
+    let t = unit_text(f, u);
+    let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    let t = t.trim_start_matches("} ").trim_start_matches("else ");
+    let t = t.strip_prefix("if").unwrap_or(t).trim();
+    let t = t.trim_end_matches('{').trim();
+    let t = if t.starts_with('(') && t.ends_with(')') {
+        &t[1..t.len() - 1]
+    } else {
+        t
+    };
+    let t = t.trim();
+    if t.chars().count() > 80 {
+        format!("{}...", t.chars().take(77).collect::<String>())
+    } else {
+        t.to_string()
+    }
+}
+
+/// An `if` on one side only whose body just returns: one finding for the
+/// check, "Rust adds a check `x.is_null()` returning INVALID_ARGS", instead
+/// of one for the `if` and one for the `return`.
+fn one_finding_per_check(rows: &mut [Row], cpp: &Function, rust: &Function) {
+    for k in 0..rows.len() {
+        let marker = rows[k].marker;
+        let (f, cpp_side) = match marker {
+            Marker::CppOnly => (cpp, true),
+            Marker::RustOnly => (rust, false),
+            _ => continue,
+        };
+        let Some(u) = row_unit(&rows[k], f, cpp_side) else {
+            continue;
+        };
+        if !matches!(u.kind, UnitKind::If | UnitKind::ElseIf)
+            || !rows[k].notes.iter().any(|n| n.severity == Severity::Issue)
+        {
+            continue;
+        }
+        let idx = if cpp_side { rows[k].cpp } else { rows[k].rust }.unwrap();
+        // The return must be the next unit of the `if`, on the same side
+        // and one-sided too.
+        let Some(next) = (k + 1..rows.len()).find(|&m| {
+            row_unit(&rows[m], f, cpp_side).is_some_and(|v| v.kind != UnitKind::Comment)
+        }) else {
+            continue;
+        };
+        let Some(v) = row_unit(&rows[next], f, cpp_side) else {
+            continue;
+        };
+        let vi = if cpp_side {
+            rows[next].cpp
+        } else {
+            rows[next].rust
+        }
+        .unwrap();
+        if rows[next].marker != marker
+            || v.kind != UnitKind::Return
+            || v.depth <= u.depth
+            || vi != idx + 1
+                && f.units[idx + 1..vi]
+                    .iter()
+                    .any(|w| w.kind != UnitKind::Comment)
+        {
+            continue;
+        }
+        let what = match &v.features.ret {
+            Some(Ret::Error(e)) => format!("returning {e}"),
+            Some(r) => format!("returning {r}"),
+            None => "returning".to_string(),
+        };
+        let cond = condition_text(f, u);
+        let msg = if cpp_side {
+            format!("C++ checks `{cond}` here, {what}; the Rust doesn't")
+        } else {
+            format!("Rust adds a check `{cond}`, {what}, that the C++ doesn't make")
+        };
+        let category = if matches!(v.features.ret, Some(Ret::Error(_)) | Some(Ret::Status)) {
+            Category::ErrorPath
+        } else {
+            Category::ControlFlow
+        };
+        rows[k].notes.retain(|n| n.severity != Severity::Issue);
+        rows[k]
+            .notes
+            .insert(0, Note::new(Severity::Issue, category, msg));
+        rows[next].notes.retain(|n| n.severity != Severity::Issue);
+    }
+}
+
+/// Calls a function makes, by the words of their names, for matching
+/// `IsUserStateSavedLocked` against `is_user_state_saved`.
+pub(crate) fn call_like(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let (wa, wb) = (crate::normalize::words(a), crate::normalize::words(b));
+    let within = |x: &[String], y: &[String]| x.len() >= 2 && x.iter().all(|w| y.contains(w));
+    within(&wa, &wb) || within(&wb, &wa)
+}
+
+/// Assertions whose meaning changed:
+/// - a call the C++ makes only inside `DEBUG_ASSERT` (debug builds only)
+///   that the Rust makes unconditionally;
+/// - a C++ `ASSERT(false)` or `PANIC` where the Rust returns an error.
+fn assert_semantics(rows: &mut [Row], cpp: &Function, rust: &Function) {
+    static PANIC: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\b(?:(?:ZX_)?(?:DEBUG_)?ASSERT(?:_MSG)?\s*\(\s*false\b|(?:ZX_)?PANIC(?:_UNIMPLEMENTED)?\b|__UNREACHABLE\b|__builtin_unreachable\b|panic\s*\()").unwrap()
+    });
+    static RUST_PANIC: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\b(?:panic|unreachable|todo|unimplemented)!|\bassert!\s*\(\s*false\b|\.expect\(|\.unwrap\(\)").unwrap()
+    });
+    let rust_code: Vec<(usize, String)> = rust
+        .units
+        .iter()
+        .enumerate()
+        .map(|(j, u)| (j, unit_text(rust, u)))
+        .collect();
+    let rust_panics = rust_code
+        .iter()
+        .any(|(_, t)| RUST_PANIC.is_match(&code_only(t)));
+    for k in 0..rows.len() {
+        let Some(i) = rows[k].cpp else { continue };
+        let u = &cpp.units[i];
+        if !u.features.asserts {
+            continue;
+        }
+        let text = code_only(&unit_text(cpp, u));
+        if text.trim_start().starts_with("DEBUG_ASSERT") {
+            for c in u.features.calls.iter().filter(|c| c.as_str() != "assert") {
+                let elsewhere_in_cpp = cpp
+                    .units
+                    .iter()
+                    .any(|v| !v.features.asserts && v.features.calls.contains(c));
+                let in_rust_assert = rust.units.iter().any(|v| {
+                    v.features.asserts && v.features.calls.iter().any(|d| call_like(c, d))
+                });
+                let unconditional = rust.units.iter().position(|v| {
+                    !v.features.asserts && v.features.calls.iter().any(|d| call_like(c, d))
+                });
+                if let (false, false, Some(j)) = (elsewhere_in_cpp, in_rust_assert, unconditional) {
+                    let v = &rust.units[j];
+                    // The Rust statement making the call is this finding,
+                    // not one of its own.
+                    if let Some(m) = rows
+                        .iter()
+                        .position(|r| r.rust == Some(j) && r.cpp.is_none())
+                    {
+                        demote(
+                            &mut rows[m],
+                            &format!(
+                                "it makes the call C++ makes only inside DEBUG_ASSERT at line {}",
+                                u.start_line
+                            ),
+                        );
+                    }
+                    rows[k]
+                        .notes
+                        .retain(|n| !n.message.starts_with("only C++ asserts"));
+                    rows[k].notes.push(Note::new(
+                        Severity::Issue,
+                        Category::Assert,
+                        format!(
+                            "C++ calls {c} only inside DEBUG_ASSERT, so only in debug builds; the Rust calls it unconditionally at line {}",
+                            v.start_line
+                        ),
+                    ));
+                    break;
+                }
+            }
+        }
+        if PANIC.is_match(&text) && !rust_panics {
+            // The Rust error return nearest after the aligned position.
+            let after = rows[k..].iter().filter_map(|r| r.rust).next().unwrap_or(0);
+            let before = rows[..k]
+                .iter()
+                .filter_map(|r| r.rust)
+                .next_back()
+                .unwrap_or(0);
+            let ret = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.cpp.is_none())
+                .filter_map(|(m, r)| r.rust.map(|j| (m, j)))
+                .filter(|(_, j)| matches!(rust.units[*j].features.ret, Some(Ret::Error(_))))
+                .min_by_key(|(_, j)| (*j as isize - after.max(before) as isize).unsigned_abs());
+            if let Some((m, j)) = ret {
+                let e = match &rust.units[j].features.ret {
+                    Some(Ret::Error(e)) => e.clone(),
+                    _ => String::new(),
+                };
+                let line = rust.units[j].start_line;
+                rows[k].notes.retain(|n| n.severity != Severity::Issue);
+                rows[k].notes.push(Note::new(
+                    Severity::Issue,
+                    Category::Assert,
+                    format!(
+                        "C++ panics here ({}); the Rust returns {e} instead (line {line})",
+                        text.split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                            .trim_end_matches(';')
+                    ),
+                ));
+                demote(&mut rows[m], "it stands in for a C++ panic");
+            }
+        }
+    }
 }
 
 /// Whether the unit at `j` is part of the function's leading doc comment.
@@ -356,6 +782,10 @@ fn group_runs(rows: &mut [Row], cpp: &Function, rust: &Function) {
         let noted: Vec<usize> = (i..j)
             .filter(|&k| {
                 !rows[k].notes.is_empty()
+                    && rows[k].notes.iter().all(|n| {
+                        !n.message.starts_with("Rust adds a check")
+                            && !n.message.starts_with("C++ checks")
+                    })
                     && rows[k].notes.iter().all(|n| {
                         !matches!(
                             n.category,
@@ -905,9 +1335,10 @@ fn compare(a: &Unit, b: &Unit, notes: &mut Vec<Note>) {
 /// Kinds that are the same step spelled differently: a C++ `if` that
 /// returns early and Rust's `let ... else`, or `else { if }` and `else if`.
 fn equivalent_kinds(a: UnitKind, b: UnitKind) -> bool {
+    use UnitKind::{Case, Else, ElseIf, If};
     matches!(
         (a, b),
-        (UnitKind::If, UnitKind::ElseIf) | (UnitKind::ElseIf, UnitKind::If)
+        (If, ElseIf) | (ElseIf, If) | (Case, If | ElseIf | Else) | (If | ElseIf | Else, Case)
     )
 }
 
@@ -1206,6 +1637,350 @@ fn unit_text(f: &Function, u: &Unit) -> String {
         .map(|l| f.line(l))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Source text with comments and string literals blanked, so only code is
+/// searched.
+fn code_only(text: &str) -> String {
+    static STR: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"//[^\n]*|/\*(?s:.)*?\*/|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)'"#)
+            .unwrap()
+    });
+    STR.replace_all(text, " ").into_owned()
+}
+
+/// A named constant a piece of code uses, with the words of its name
+/// (`X86_FLAGS_RF`, or C++ `kMaxSize` as `MAX_SIZE`).
+#[derive(Clone, Debug, PartialEq)]
+struct Constant {
+    name: String,
+    words: Vec<String>,
+}
+
+/// The named constants in `text`. Macros, error codes (compared as
+/// errors), limits such as `UINT32_MAX` and `u32::MAX`, and `NULL` are
+/// left out.
+fn constants(text: &str) -> Vec<Constant> {
+    static CONST: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"\b([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+|[A-Z]{3,}[0-9]*|k[A-Z][A-Za-z0-9]*)\b(\s*[(!])?",
+        )
+        .unwrap()
+    });
+    // Log levels and test macros are not values.
+    const SKIP: &[&str] = &[
+        "NULL",
+        "TRUE",
+        "FALSE",
+        "MAX",
+        "MIN",
+        "BITS",
+        "EOF",
+        "LTRACE",
+        "LOCAL_TRACE",
+        "ZX_OK",
+        "SAFETY",
+        "TODO",
+        "FIXME",
+        "NOTE",
+        "XXX",
+        "CRITICAL",
+        "ALWAYS",
+        "INFO",
+        "SPEW",
+        "INFO_VERBOSE",
+        "BEGIN_TEST",
+        "END_TEST",
+        "FFI_ALWAYS_INLINE",
+        "DEBUG_ASSERT_IMPLEMENTED",
+    ];
+    let code = code_only(text);
+    let mut out: Vec<Constant> = Vec::new();
+    for c in CONST.captures_iter(&code) {
+        if c.get(2).is_some() {
+            continue;
+        }
+        let raw = &c[1];
+        let name = match raw.strip_prefix('k') {
+            Some(rest) => crate::normalize::ident(rest).to_ascii_uppercase(),
+            None => raw.to_string(),
+        };
+        if SKIP.contains(&name.as_str())
+            || name.starts_with("ZX_ERR_")
+            || name.starts_with("ERR_")
+            || name.ends_with("_MAX")
+            || name.ends_with("_MIN")
+            || name.starts_with("TA_")
+            || name.starts_with("__")
+        {
+            continue;
+        }
+        // `Status::INVALID_ARGS` is an error code.
+        let before = &code[..c.get(1).unwrap().start()];
+        if before.trim_end().ends_with("::")
+            && before
+                .trim_end()
+                .trim_end_matches("::")
+                .rsplit(|ch: char| !ch.is_alphanumeric() && ch != '_')
+                .next()
+                .is_some_and(|seg| seg.ends_with("Status") || seg.ends_with("Error") || seg == "zx")
+        {
+            continue;
+        }
+        let words = crate::normalize::words(&name);
+        // A one-word name (`DEFAULT`, `MASK`, `IRQ`) says too little to
+        // tell whether the other side spells it differently.
+        if words.len() < 2 {
+            continue;
+        }
+        if !out.iter().any(|o| o.name == name) {
+            out.push(Constant { name, words });
+        }
+    }
+    out
+}
+
+/// The words of every identifier a function's code mentions, to tell
+/// whether a constant one side uses appears anywhere in the other.
+pub(crate) struct Tokens(Vec<Vec<String>>);
+
+impl Tokens {
+    fn of(f: &Function) -> Tokens {
+        static ID: std::sync::LazyLock<regex::Regex> =
+            std::sync::LazyLock::new(|| regex::Regex::new(r"[A-Za-z_][A-Za-z0-9_]*").unwrap());
+        let mut v: Vec<Vec<String>> = Vec::new();
+        for u in &f.units {
+            if u.kind == UnitKind::Comment {
+                continue;
+            }
+            let text = code_only(&unit_text(f, u));
+            for m in ID.find_iter(&text) {
+                let t = m.as_str();
+                let t = match t.strip_prefix('k') {
+                    Some(rest) if rest.starts_with(|c: char| c.is_ascii_uppercase()) => rest,
+                    _ => t,
+                };
+                let w = crate::normalize::words(t);
+                if !w.is_empty() && !v.contains(&w) {
+                    v.push(w);
+                }
+            }
+        }
+        Tokens(v)
+    }
+
+    /// Whether the constant, or a name ending the same way (`CR0_WP` for
+    /// `X86_CR0_WP`, the enum variant `GeneralRegs` for
+    /// `ZX_THREAD_STATE_GENERAL_REGS`), appears.
+    fn has(&self, c: &Constant) -> bool {
+        let w = &c.words;
+        let n = w.len();
+        self.0.iter().any(|t| {
+            t == w
+                || (t.len() >= 2 && w.ends_with(t))
+                || (n >= 2 && t.ends_with(w))
+                // A global `xsave_supported` became `XSAVE_SUPPORTED_ATOMIC`.
+                || (t.len() >= 2 && n == t.len() + 1 && w.starts_with(t))
+        }) || (n >= 2 && {
+            // An enum: `X86_VENDOR_INTEL` is `X86Vendor::Intel`, and
+            // `DELIVERY_MODE_INIT` is `DeliveryMode::Init`.
+            let (head, last) = w.split_at(n - 1);
+            self.0.iter().any(|t| t.as_slice() == last)
+                && self.0.iter().any(|t| {
+                    !t.is_empty()
+                        && (head.ends_with(t) || t.ends_with(head))
+                        && (t.len() >= 2 || t[0].len() >= 4)
+                })
+        })
+    }
+}
+
+/// Integer literals in code, by value.
+fn literals(text: &str) -> Vec<u128> {
+    static LIT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"\b(0[xX][0-9A-Fa-f_]+|[0-9][0-9_]*)(?:[uUlLzZ]+|[ui](?:8|16|32|64|128|size))?\b",
+        )
+        .unwrap()
+    });
+    let code = code_only(text);
+    let mut out: Vec<u128> = LIT
+        .captures_iter(&code)
+        .filter_map(|c| {
+            let t = c[1].replace('_', "");
+            match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+                Some(h) => u128::from_str_radix(h, 16).ok(),
+                None => t.parse().ok(),
+            }
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// How `code` combines the constant with a mask: `|`, `&`, or `& !`/`& ~`.
+fn mask_op(code: &str, c: &Constant) -> Option<&'static str> {
+    let re = regex::Regex::new(&format!(
+        r"(\|=?|&=?|\^=?)\s*([!~])?\s*\(?\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*{0}\b|\b{0}\s*\)?\s*(\||&|\^)",
+        regex::escape(&c.name)
+    ))
+    .ok()?;
+    let m = re.captures(code)?;
+    let op = m.get(1).or(m.get(3)).map_or("", |o| o.as_str());
+    Some(match (op.chars().next(), m.get(2).is_some()) {
+        (Some('&'), true) => "clears",
+        (Some('&'), false) => "masks with",
+        (Some('|'), _) => "sets",
+        _ => "toggles",
+    })
+}
+
+/// Reports named constants, flags and masks on only one side of an aligned
+/// pair of units, when the other function never mentions them: `C++ writes
+/// 0, Rust writes X86_DR7_MASK`, or `Rust also clears X86_FLAGS_RF`.
+fn value_diff(
+    a: &str,
+    b: &str,
+    cpp_names: &Tokens,
+    rust_names: &Tokens,
+    explained: bool,
+    notes: &mut Vec<Note>,
+) {
+    let (ca, cb) = (constants(a), constants(b));
+    let only_a: Vec<&Constant> = ca
+        .iter()
+        .filter(|c| {
+            !cb.iter()
+                .any(|d| d.words.ends_with(&c.words) || c.words.ends_with(&d.words))
+        })
+        .filter(|c| !rust_names.has(c))
+        .collect();
+    let only_b: Vec<&Constant> = cb
+        .iter()
+        .filter(|c| {
+            !ca.iter()
+                .any(|d| d.words.ends_with(&c.words) || c.words.ends_with(&d.words))
+        })
+        .filter(|c| !cpp_names.has(c))
+        .collect();
+    if only_a.is_empty() && only_b.is_empty() {
+        return;
+    }
+    let (la, lb) = (literals(a), literals(b));
+    let lit_only = |x: &[u128], y: &[u128]| -> Vec<String> {
+        x.iter()
+            .filter(|v| !y.contains(v))
+            .map(|v| {
+                if *v > 9 {
+                    format!("{v:#x}")
+                } else {
+                    v.to_string()
+                }
+            })
+            .collect()
+    };
+    let (lit_a, lit_b) = (lit_only(&la, &lb), lit_only(&lb, &la));
+    let names = |v: &[&Constant]| {
+        v.iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let (code_a, code_b) = (code_only(a), code_only(b));
+    if explained {
+        let masked = only_a.iter().any(|c| mask_op(&code_a, c).is_some())
+            || only_b.iter().any(|c| mask_op(&code_b, c).is_some());
+        if !masked {
+            return;
+        }
+    }
+    // One constant replaced by another.
+    if !only_a.is_empty() && !only_b.is_empty() {
+        notes.push(Note::new(
+            Severity::Issue,
+            Category::Value,
+            format!(
+                "C++ uses {} where Rust uses {}",
+                names(&only_a),
+                names(&only_b)
+            ),
+        ));
+        return;
+    }
+    // A literal and a constant may well be the same value.
+    if !only_b.is_empty() && !lit_a.is_empty() {
+        notes.push(Note::new(
+            Severity::Note,
+            Category::Value,
+            format!(
+                "C++ uses {} where Rust uses {}",
+                lit_a.join(", "),
+                names(&only_b)
+            ),
+        ));
+        return;
+    }
+    if !only_a.is_empty() && !lit_b.is_empty() {
+        notes.push(Note::new(
+            Severity::Note,
+            Category::Value,
+            format!(
+                "C++ uses {} where Rust uses {}",
+                names(&only_a),
+                lit_b.join(", ")
+            ),
+        ));
+        return;
+    }
+    for c in &only_a {
+        let msg = match mask_op(&code_a, c) {
+            Some(op) => format!("C++ {op} {} here, and the Rust doesn't", c.name),
+            None => format!(
+                "only C++ uses {} here; the Rust function never mentions it",
+                c.name
+            ),
+        };
+        notes.push(Note::new(Severity::Issue, Category::Value, msg));
+    }
+    for c in &only_b {
+        let msg = match mask_op(&code_b, c) {
+            Some(op) => format!("Rust also {op} {}, which the C++ doesn't", c.name),
+            None => format!(
+                "only Rust uses {} here; the C++ function never mentions it",
+                c.name
+            ),
+        };
+        notes.push(Note::new(Severity::Issue, Category::Value, msg));
+    }
+}
+
+/// A statement on one side only that uses a constant the other function
+/// never mentions: the value is new or lost, whatever else the statement
+/// does.
+fn one_sided_constant(text: &str, u: &Unit, side: &str, other: &Tokens, notes: &mut Vec<Note>) {
+    if !matches!(u.kind, UnitKind::Stmt | UnitKind::Return)
+        || notes.iter().any(|n| n.severity == Severity::Issue)
+    {
+        return;
+    }
+    let missing: Vec<String> = constants(text)
+        .into_iter()
+        .filter(|c| !other.has(c))
+        .map(|c| c.name)
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    let other_side = if side == "C++" { "Rust" } else { "C++" };
+    notes.push(Note::new(
+        Severity::Issue,
+        Category::Value,
+        format!(
+            "only {side} uses {}; the {other_side} function never mentions it",
+            missing.join(", ")
+        ),
+    ));
 }
 
 /// Rank of a memory ordering, weakest first. Acquire and release are

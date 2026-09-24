@@ -135,7 +135,8 @@ C++ side, since in Rust they become token parameters.
 
 Findings start with `!` (issue) or `~` (note), so `grep '^    !'` lists the
 issues. The first lines of the report count issues by kind. At the end the
-report lists functions it could not pair and the FFI shims it recognized,
+report lists functions it could not pair (Rust tests separately, and Rust
+helpers with the paired functions that call them) and the FFI shims it recognized,
 including shims it could not resolve (`-> ambiguous: A or B`), which
 `--pair` settles.
 
@@ -153,6 +154,32 @@ checks:
 | `trace` | Trace and debug printing. A dropped trace is an issue. |
 | `order` | The same step at a different position. |
 | `atomic` | Memory ordering of atomic operations. A Rust ordering weaker than the C++ one (which is `seq_cst` when unstated) is an issue. |
+| `value` | Named constants, flags and masks on one side only, when the other function never mentions them: `Rust also clears X86_FLAGS_RF`, `C++ sets X86_DR6_MASK here, and the Rust doesn't`, or a statement that uses a constant the other side never does. A literal replaced by a constant is a note, since it may be the same value. |
+| `pairing` | How functions were paired. A function the change defines twice (in two Rust modules) is paired with the C++ once per copy, and an issue says so when the copies differ. |
+| `unsafe` | A note on a function that adds three or more `unsafe` blocks where the C++ needed none, which usually means a safe facade is missing. |
+
+Some checks look at the structure the Rust keeps:
+
+- A C++ function-like macro used as a statement (`COPY_COMMON_REGS(out, in);`)
+  that the Rust expands inline is one issue per function: keep it as a
+  `macro_rules!`.
+- A local lambda or a helper in the same C++ file that the C++ calls at two
+  or more places and the Rust never calls is one issue ("inlined at 3
+  places"). A converted helper called once whose Rust port the aligned Rust
+  statement doesn't call is an issue too.
+- A call the C++ makes only inside `DEBUG_ASSERT` that the Rust makes
+  unconditionally, and a C++ `ASSERT(false)` or `PANIC` that the Rust turns
+  into an error return, are `assert` issues.
+- An `if` on one side only whose body returns is one finding, "Rust adds a
+  check `x.is_null()` returning INVALID_ARGS", not one for the `if` and one
+  for the `return`. Several C++ checks merged into one Rust `if a || b` are
+  not missing.
+- A C++ `switch` lines up with a Rust if/else-if chain case by case
+  (`default` with `else`).
+- A closure passed to a function that takes a lock around it
+  (`let f = |t| {...}; with_chain_lock(t, f)`) lines up with the C++ guard
+  and the statements under it, with a note that the lock is taken through
+  a callback.
 
 Separately, babeldiff runs rubric lints over the changed files. They need
 no pairing, and they are listed at the end of the report, under
@@ -163,6 +190,10 @@ no pairing, and they are listed at the end of the report, under
 | `extern-signature` | A Rust `extern "C"` declaration of a `cpp_*` helper, or a `rust_*` export, has the parameters and return type of the C++ side: the same count, pointer depth and scalar widths. A mutable pointer the receiving side may write through while the other treats it as const is a note. |
 | `unsafe-safety` | Every `unsafe` block and `unsafe impl` has a `// SAFETY:` comment, and every `unsafe fn` a `# Safety` doc section. Blocks are reported once per function. |
 | `shim-logic` | A `rust_*` shim or `cpp_*` helper only forwards. Branches, loops and `match` arms are reported unless they only convert a result, a status, or a null pointer or empty optional. |
+| `file-placement` | Each C++ file becomes one Rust file named after it (`foo.cc` to `foo.rs`, `dir_foo.rs` for a flattened directory, or a part named `foo_*.rs`). A C++ file split across several Rust files, and functions that landed in a file not named after their C++ file, are issues; a Rust file that collects three or more C++ files is a note. Test files and `_ffi` companions don't count. The report also maps each C++ file to the Rust files its functions went to, under `File placement`. |
+| `provenance-comment` | Comments that say where code was ported from ("Ported from foo.cc", "(`foo.cc:12-34`)", "Mirrors the C++ version"), reported once per file. |
+| `invented-lifetime` | A reference made from a raw pointer that was taken from a place still in scope (`let p = buf.as_mut_ptr(); ... &mut *p`), whose lifetime the compiler can't check. |
+| `unsafe-density` | A note on a file whose changed functions have ten or more `unsafe` blocks between them. |
 
 A lint issue counts toward the exit status like any other issue.
 
@@ -173,7 +204,12 @@ lock moved ahead of the argument checks, and a dropped comment).
 an enum, with four more (a test added to a condition, a dropped trace, a
 dropped comment in one override, and a different error code); babeldiff
 reports exactly those four as issues. It also plants one of each rubric
-lint.
+lint. `tests/fixtures/lantern` plants the structural mistakes: a function
+defined twice with one copy dropping a mask, constants and masks on one
+side only, a macro and a lambda expanded inline, a call moved out of
+`DEBUG_ASSERT`, `ASSERT(false)` turned into an error, an added check, code
+in a file not named after its C++ file, an invented lifetime, and "Ported
+from" comments.
 
 ## JSON output
 
@@ -305,7 +341,8 @@ integration; implement `analyze::CppFinder` to look up C++ some other way.
 - A C++ function split across several Rust functions (or the reverse) is
   paired with its best match only; the rest shows as unpaired.
 - Macros are compared by name and the calls inside their arguments, not
-  expanded.
+  expanded; a macro the Rust expands inline is reported, but its expansion
+  is not compared with the macro's body.
 - Similarity thresholds are tuned on about 55 Zircon conversion changes; use
   `--pair` when the matcher gets a pairing wrong.
 - It compares functions. C++ that stays C++ but changes, FFI declarations,

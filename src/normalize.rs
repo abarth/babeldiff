@@ -184,10 +184,13 @@ pub fn call(name: &str) -> Option<String> {
     if n.is_empty() || NOISE_CALLS.contains(&n.as_str()) {
         return None;
     }
-    // C's `arch_zero_page()` is Rust's `arch::zero_page()`.
-    if let Some(rest) = n.strip_prefix("arch_") {
-        if !rest.is_empty() {
-            n = rest.to_string();
+    // C's `arch_zero_page()` is Rust's `arch::zero_page()`, and an
+    // architecture's `x86_foo()` is `foo()` inside its own crate.
+    for prefix in ["arch_", "x86_", "arm64_", "riscv64_"] {
+        if let Some(rest) = n.strip_prefix(prefix) {
+            if !rest.is_empty() {
+                n = rest.to_string();
+            }
         }
     }
     // Test checks: zxtest's `EXPECT_EQ` and `ASSERT_OK` are Rust's

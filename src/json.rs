@@ -24,6 +24,7 @@ pub fn render_json(report: &Report, title: &str) -> String {
     s.num("notes", report.notes() as f64);
     s.num("unpaired_cpp", report.unmatched_cpp.len() as f64);
     s.num("unpaired_rust", report.unmatched_rust.len() as f64);
+    s.num("unpaired_rust_tests", report.rust_tests.len() as f64);
     let mut by = Obj::new();
     for (c, n) in crate::analyze::issues_by_category(report) {
         by.num(c.name(), n as f64);
@@ -38,7 +39,25 @@ pub fn render_json(report: &Report, title: &str) -> String {
     let pairs: Vec<String> = report.pairs.iter().map(pair).collect();
     o.raw("pairs", &array(&pairs));
     o.raw("unpaired_cpp", &array(&functions(&report.unmatched_cpp)));
-    o.raw("unpaired_rust", &array(&functions(&report.unmatched_rust)));
+    let unpaired_rust: Vec<String> = report
+        .unmatched_rust
+        .iter()
+        .map(|f| {
+            let callers: Vec<String> = report.callers(f).iter().map(|c| quote(c)).collect();
+            let mut x = Obj::new();
+            x.str("name", &f.name);
+            x.str("path", &f.path);
+            x.num("start_line", f.start_line as f64);
+            x.num("end_line", f.end_line as f64);
+            x.raw("helper_for", &array(&callers));
+            x.finish()
+        })
+        .collect();
+    o.raw("unpaired_rust", &array(&unpaired_rust));
+    o.raw(
+        "unpaired_rust_tests",
+        &array(&functions(&report.rust_tests)),
+    );
     o.raw(
         "removed_cpp_ffi_helpers",
         &array(&functions(&report.removed_cpp_shims)),
@@ -109,6 +128,29 @@ pub fn render_json(report: &Report, title: &str) -> String {
         })
         .collect();
     o.raw("lints", &array(&lints));
+    let placement: Vec<String> = report
+        .placement
+        .iter()
+        .map(|pl| {
+            let mut x = Obj::new();
+            x.str("cpp", &pl.cpp_path);
+            let targets: Vec<String> = pl
+                .targets
+                .iter()
+                .map(|t| {
+                    let mut y = Obj::new();
+                    y.str("rust", &t.rust_path);
+                    y.raw("expected", if t.expected { "true" } else { "false" });
+                    let fs: Vec<String> = t.functions.iter().map(|(n, _)| quote(n)).collect();
+                    y.raw("functions", &array(&fs));
+                    y.finish()
+                })
+                .collect();
+            x.raw("targets", &array(&targets));
+            x.finish()
+        })
+        .collect();
+    o.raw("placement", &array(&placement));
     let mut out = o.finish();
     out.push('\n');
     out
