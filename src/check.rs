@@ -344,14 +344,39 @@ pub fn check_with(
                 // One note per doc block, though a blank `///` line splits
                 // it into several comment units.
                 let block_start = j == 0 || rust.units[j - 1].kind != UnitKind::Comment;
+                // Conversions add no comments but SAFETY ones: a comment
+                // whose words aren't in the C++ is new text.
+                let carried = u.kind == UnitKind::Comment
+                    && (words_kept(u, cpp)
+                        || ctx
+                            .values
+                            .is_some_and(|v| v.in_cpp_comments(&u.features.comment)));
                 if added_doc && !expected {
                     if block_start {
-                        notes.push(Note::new(
-                        Severity::Note,
-                        Category::Comment,
-                            "doc comment only in Rust; the C++ function has none, so check that it describes the code",
-                        ));
+                        notes.push(if carried {
+                            Note::new(
+                                Severity::Note,
+                                Category::Comment,
+                                "doc comment only in Rust; its words are in a C++ comment elsewhere in the change",
+                            )
+                        } else {
+                            Note::new(
+                                Severity::Issue,
+                                Category::Comment,
+                                "doc comment added in Rust where the C++ function has none; a conversion adds no comments other than SAFETY",
+                            )
+                        });
                     }
+                } else if u.kind == UnitKind::Comment
+                    && !expected
+                    && !carried
+                    && ctx.values.is_some()
+                {
+                    notes.push(Note::new(
+                        Severity::Issue,
+                        Category::Comment,
+                        "comment added in Rust; a conversion adds no comments other than SAFETY",
+                    ));
                 } else if !expected && !ok_after_status {
                     let n = soften_if_called(only_in(u, "Rust", "C++", moved), u, cpp);
                     notes.push(soften_balanced(n, u, flow_balanced(u.kind)));

@@ -1,6 +1,7 @@
 //! Named constants the changed files define, so a value check can compare
 //! what `PIC1` and `PIC1_COMMAND` stand for rather than how they are
-//! spelled.
+//! spelled, and the words of the C++ comments in those files, so a Rust
+//! comment the conversion added can be told from one it carried over.
 
 use std::collections::{HashMap, HashSet};
 
@@ -11,6 +12,9 @@ pub struct Values {
     defs: HashMap<String, String>,
     /// Rust `static`s and C++ non-constant globals: state, not values.
     statics: HashSet<String>,
+    /// Words of the C++ comments, and runs of three of them.
+    comment_words: HashSet<String>,
+    comment_triples: HashSet<String>,
 }
 
 /// How a value check spells a constant: `kMaxSize` as `MAX_SIZE`, anything
@@ -55,6 +59,32 @@ impl Values {
         for c in ENUM.captures_iter(text) {
             self.def(&c[1], &c[2]);
         }
+        static COMMENT: std::sync::LazyLock<regex::Regex> =
+            std::sync::LazyLock::new(|| regex::Regex::new(r"//[^\n]*|/\*(?s:.*?)\*/").unwrap());
+        let words: Vec<String> = COMMENT
+            .find_iter(text)
+            .flat_map(|m| crate::normalize::comment_words(m.as_str()))
+            .collect();
+        for w in words.windows(3) {
+            self.comment_triples.insert(w.join(" "));
+        }
+        self.comment_words.extend(words);
+    }
+
+    /// Whether a comment's words come from the C++ comments: at least half
+    /// of its runs of three words, or every word of a shorter comment.
+    pub fn in_cpp_comments(&self, words: &[String]) -> bool {
+        if words.is_empty() {
+            return true;
+        }
+        if words.len() < 3 {
+            return words.iter().all(|w| self.comment_words.contains(w));
+        }
+        let hits = words
+            .windows(3)
+            .filter(|w| self.comment_triples.contains(&w.join(" ")))
+            .count();
+        2 * hits >= words.len() - 2
     }
 
     pub fn add_rust(&mut self, text: &str) {
