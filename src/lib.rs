@@ -37,6 +37,7 @@ pub mod git;
 pub mod html;
 pub mod input;
 pub mod json;
+pub mod layout;
 pub mod lint;
 pub mod model;
 pub mod normalize;

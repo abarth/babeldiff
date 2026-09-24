@@ -577,3 +577,23 @@ fn chain_lock_callback_lines_up_with_a_guard() {
     assert!(issues.is_empty(), "{issues:?}");
     assert_eq!(p.summary.cpp_locks, p.summary.rust_locks);
 }
+
+#[test]
+fn unchanged_cpp_comes_from_the_same_architecture() {
+    // Rust under arch/x86 with no removed C++ must not be paired with a
+    // same-named method under arch/riscv64.
+    let report = git_report("compass", "compass");
+    let names: Vec<(&str, &str)> = report
+        .pairs
+        .iter()
+        .map(|p| (p.cpp.path.as_str(), p.rust.base.as_str()))
+        .collect();
+    assert!(
+        names.contains(&("zircon/kernel/arch/x86/compass.cc", "heading")),
+        "{names:?}"
+    );
+    assert!(
+        !names.iter().any(|(c, _)| c.contains("riscv64")),
+        "{names:?}"
+    );
+}
