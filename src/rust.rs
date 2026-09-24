@@ -330,9 +330,41 @@ impl<'a> Ctx<'a> {
                     }
                 }
             }
+            "call_expression" if self.lock_callback(e).is_some() => {
+                // `with_chain_lock(t, |t| { ... })` holds the lock while the
+                // closure runs, the way a C++ guard holds it to the end of
+                // its scope: the call lines up with the guard, and the
+                // closure's statements with the statements after it, at
+                // the same depth.
+                let body = self.lock_callback(e).unwrap();
+                b.push(
+                    UnitKind::Stmt,
+                    line,
+                    ts::line(body),
+                    depth,
+                    self.features(e, &[body]),
+                );
+                self.block(body, depth, tail, fcx, b);
+            }
             _ if tail && fcx.returns_value => self.return_unit(Some(e), line, end, depth, b),
             _ => self.plain(stmt, depth, b),
         }
+    }
+
+    /// The block of the closure passed to a lock helper
+    /// (`with_chain_lock(t, |t| { ... })`), when the closure spans lines.
+    fn lock_callback<'t>(&self, call: Node<'t>) -> Option<Node<'t>> {
+        let f = call.child_by_field_name("function")?;
+        let name = self.text(f).rsplit("::").next()?.trim();
+        if !(name.starts_with("with_") && name.contains("lock")) {
+            return None;
+        }
+        let args = call.child_by_field_name("arguments")?;
+        let closure = ts::named_children(args)
+            .into_iter()
+            .rfind(|c| c.kind() == "closure_expression")?;
+        let body = closure.child_by_field_name("body")?;
+        (body.kind() == "block" && ts::end_line(body) > ts::line(body)).then_some(body)
     }
 
     fn return_unit(
@@ -673,12 +705,26 @@ fn is_pure_or_accessor(v: Node, src: &[u8]) -> bool {
         }
     }
     let mut v = v;
-    while let "parenthesized_expression"
-    | "unsafe_block"
-    | "block"
-    | "reference_expression"
-    | "unary_expression" = v.kind()
-    {
+    loop {
+        if v.kind() == "type_cast_expression" {
+            match v.child_by_field_name("value") {
+                Some(x) => {
+                    v = x;
+                    continue;
+                }
+                None => break,
+            }
+        }
+        if !matches!(
+            v.kind(),
+            "parenthesized_expression"
+                | "unsafe_block"
+                | "block"
+                | "reference_expression"
+                | "unary_expression"
+        ) {
+            break;
+        }
         let inner: Vec<Node> = ts::named_children(v)
             .into_iter()
             .filter(|c| !ts::is_comment(*c) && c.kind() != "mutable_specifier")
@@ -701,9 +747,19 @@ fn is_pure_or_accessor(v: Node, src: &[u8]) -> bool {
     match found.as_slice() {
         [] => true,
         [c] if c.id() == v.id() && c.kind() == "call_expression" => {
-            let no_args = c
-                .child_by_field_name("arguments")
-                .is_some_and(|a| ts::named_children(a).iter().all(|x| ts::is_comment(*x)));
+            // No arguments, or just the object it reads from
+            // (`thread::get_arch(thread)` for C++ `thread->arch()`).
+            let no_args = c.child_by_field_name("arguments").is_some_and(|a| {
+                let args: Vec<Node> = ts::named_children(a)
+                    .into_iter()
+                    .filter(|x| !ts::is_comment(*x))
+                    .collect();
+                match args.as_slice() {
+                    [] => true,
+                    [one] => one.kind() == "identifier" || one.kind() == "self",
+                    _ => false,
+                }
+            });
             let name = c
                 .child_by_field_name("function")
                 .map(|f| ts::text(f, src))
