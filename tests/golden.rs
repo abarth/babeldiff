@@ -5,7 +5,7 @@
 //! after an intentional change, and review the diff.
 
 use babeldiff::analyze::{CppOrigin, Link, NoFinder, Options, Report};
-use babeldiff::check::Severity;
+use babeldiff::check::{Category, Severity};
 use babeldiff::git::{Git, RepoFinder};
 use babeldiff::input::ChangeSet;
 use babeldiff::render::{render, Layout, RenderOptions};
@@ -123,7 +123,7 @@ fn beacon_follows_ffi_shims_without_false_positives() {
     assert!(fc
         .findings
         .iter()
-        .all(|f| f.severity == Severity::Note && f.message == "comment only in Rust"));
+        .all(|f| f.severity == Severity::Note && f.category == Category::Comment));
     assert_eq!(fc.summary.cpp_locks, fc.summary.rust_locks);
     // Shims are reported as shims, not as unpaired Rust.
     assert!(report
