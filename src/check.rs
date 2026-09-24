@@ -330,8 +330,10 @@ pub fn check_with(
                 let expected = claimed.contains(&j)
                     || u.kind == UnitKind::Comment && u.features.safety
                     || u.features.lock_plumbing
-                    || u.features.plumbing
-                    || (new_doc(rust, j) && !has_doc(cpp));
+                    || u.features.plumbing;
+                // A doc comment for a C++ function that had none is new
+                // text for a reviewer to read, not a lost translation.
+                let added_doc = new_doc(rust, j) && !has_doc(cpp);
                 // `return Foo();` in C++ is `foo()?; Ok(())` in Rust.
                 let ok_after_status = u.kind == UnitKind::Return
                     && u.features.ret == Some(Ret::Ok)
@@ -339,7 +341,18 @@ pub fn check_with(
                         r.cpp
                             .is_some_and(|i| cpp.units[i].features.ret == Some(Ret::Status))
                     });
-                if !expected && !ok_after_status {
+                // One note per doc block, though a blank `///` line splits
+                // it into several comment units.
+                let block_start = j == 0 || rust.units[j - 1].kind != UnitKind::Comment;
+                if added_doc && !expected {
+                    if block_start {
+                        notes.push(Note::new(
+                        Severity::Note,
+                        Category::Comment,
+                            "doc comment only in Rust; the C++ function has none, so check that it describes the code",
+                        ));
+                    }
+                } else if !expected && !ok_after_status {
                     let n = soften_if_called(only_in(u, "Rust", "C++", moved), u, cpp);
                     notes.push(soften_balanced(n, u, flow_balanced(u.kind)));
                 }
