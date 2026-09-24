@@ -184,6 +184,8 @@ pub fn check_with(
     ctx: &Context,
 ) -> (Vec<Row>, Vec<Finding>) {
     let claimed = ctx.claimed;
+    let rescued = rescue(pairs, cpp, rust);
+    let pairs = rescued.as_slice();
     // Control flow of a kind that both sides have as much of was most
     // likely rewritten (a `switch` as `matches!`, a clamp as `min`), not
     // dropped or added.
@@ -271,6 +273,18 @@ pub fn check_with(
                         Category::Comment,
                         "comment only in C++; it labels a section",
                     ));
+                } else if let Some(g) = (u.kind == UnitKind::Comment)
+                    .then(|| ctx.elsewhere.iter().find(|g| verbatim_in(u, g)))
+                    .flatten()
+                {
+                    notes.push(Note::new(
+                        Severity::Note,
+                        Category::Comment,
+                        format!(
+                            "comment only in C++; it is in {}, which the Rust calls",
+                            g.base
+                        ),
+                    ));
                 } else if u.kind == UnitKind::Comment && words_kept(u, rust) {
                     notes.push(Note::new(
                         Severity::Note,
@@ -281,6 +295,24 @@ pub fn check_with(
                     let n = soften_if_called(only_in(u, "C++", "Rust", moved), u, rust);
                     let n = soften_balanced(n, u, flow_balanced(u.kind));
                     notes.push(soften_moved(n, u, ctx.elsewhere));
+                }
+                // The Rust holds the same lock over a scope of its own.
+                if !u.features.locks.is_empty() {
+                    let same = rust.units.iter().find(|r| {
+                        u.features
+                            .locks
+                            .iter()
+                            .all(|l| r.features.locks.contains(l))
+                    });
+                    if let Some(r) = same {
+                        for n in notes.iter_mut().filter(|n| n.severity == Severity::Issue) {
+                            n.severity = Severity::Note;
+                            n.message = format!(
+                                "{}; the Rust takes the same lock at line {}",
+                                n.message, r.start_line
+                            );
+                        }
+                    }
                 }
                 one_sided_constant(&unit_text(cpp, u), u, "C++", &rust_names, &vc, &mut notes);
                 Marker::CppOnly
@@ -328,6 +360,7 @@ pub fn check_with(
     switch_as_if_chain(&mut rows, cpp, rust);
     merged_checks(&mut rows, cpp, rust);
     assert_semantics(&mut rows, cpp, rust);
+    exhaustive_match(&mut rows, cpp, rust);
     dedupe_values(&mut rows);
     group_runs(&mut rows, cpp, rust);
     let findings = refresh(&mut rows, cpp, rust);
@@ -368,6 +401,114 @@ fn lock_by_callback(a: &Unit, b: &Unit, cpp: &Function, rust: &Function, notes: 
             "same lock, but the Rust takes it by passing this closure to a callback instead of holding a guard like the C++; a guard type would keep the Rust shaped like the C++",
         ));
     }
+}
+
+/// A C++ `default:` that only panics, against a Rust `match` with no
+/// wildcard arm: the compiler checks that the match covers every value, so
+/// the Rust needs no default.
+fn exhaustive_match(rows: &mut [Row], cpp: &Function, rust: &Function) {
+    let has_match = rust.units.iter().any(|u| u.kind == UnitKind::Switch)
+        && rust.lines.iter().any(|l| l.contains("match "));
+    let wildcard = rust
+        .units
+        .iter()
+        .any(|u| u.kind == UnitKind::Case && u.features.idents.iter().any(|i| i == "default"));
+    if !has_match || wildcard {
+        return;
+    }
+    let mut k = 0;
+    while k < rows.len() {
+        let Some(u) = (rows[k].marker == Marker::CppOnly)
+            .then(|| row_unit(&rows[k], cpp, true))
+            .flatten()
+        else {
+            k += 1;
+            continue;
+        };
+        if u.kind != UnitKind::Case || !u.features.idents.iter().any(|i| i == "default") {
+            k += 1;
+            continue;
+        }
+        // The default's body: C++-only rows below it, up to the next case.
+        let depth = u.depth;
+        let mut end = k + 1;
+        while end < rows.len()
+            && rows[end].marker == Marker::CppOnly
+            && row_unit(&rows[end], cpp, true)
+                .is_some_and(|v| v.depth > depth || v.kind == UnitKind::Comment)
+        {
+            end += 1;
+        }
+        let panics = (k + 1..end).all(|m| {
+            row_unit(&rows[m], cpp, true).is_some_and(|v| {
+                v.kind == UnitKind::Comment
+                    || v.kind == UnitKind::Break
+                    || v.features
+                        .calls
+                        .iter()
+                        .any(|c| c == "panic" || c == "assert")
+            })
+        });
+        if panics {
+            for r in &mut rows[k..end] {
+                demote(
+                    r,
+                    "the Rust match covers every case, so it needs no default",
+                );
+            }
+        }
+        k = end;
+    }
+}
+
+/// Lines up a statement only in C++ with a statement only in Rust in the
+/// same gap between aligned rows when both make the same call: the
+/// alignment scored them apart (a declaration split from its check, a
+/// macro spelled as a method), but they are one statement, and comparing
+/// them says more than two one-sided findings. Statements with an aligned
+/// row between them stay apart, so a reordering is still reported.
+fn rescue(pairs: &[Pair], cpp: &Function, rust: &Function) -> Vec<Pair> {
+    let mut out: Vec<Pair> = pairs.to_vec();
+    let generic = |c: &str| matches!(c, "assert" | "trace" | "print" | "len" | "min" | "max");
+    let stmt = |u: &Unit| matches!(u.kind, UnitKind::Stmt | UnitKind::Return);
+    let shares = |a: &Unit, b: &Unit| {
+        stmt(a)
+            && stmt(b)
+            && a.features
+                .calls
+                .iter()
+                .any(|x| !generic(x) && b.features.calls.iter().any(|y| call_like(x, y)))
+    };
+    let aligned = |p: &Pair| {
+        p.cpp
+            .is_some_and(|i| cpp.units[i].kind != UnitKind::Comment)
+            && p.rust.is_some()
+    };
+    for i in 0..out.len() {
+        let (Some(c), None) = (out[i].cpp, out[i].rust) else {
+            continue;
+        };
+        // The gap of one-sided entries around `i`.
+        let mut lo = i;
+        while lo > 0 && !aligned(&out[lo - 1]) {
+            lo -= 1;
+        }
+        let mut hi = i;
+        while hi + 1 < out.len() && !aligned(&out[hi + 1]) {
+            hi += 1;
+        }
+        let found = (lo..=hi).find(|&j| {
+            out[j].cpp.is_none()
+                && out[j]
+                    .rust
+                    .is_some_and(|r| shares(&cpp.units[c], &rust.units[r]))
+        });
+        if let Some(j) = found {
+            out[i].rust = out[j].rust.take();
+        }
+    }
+    out.retain(|p| p.cpp.is_some() || p.rust.is_some());
+    out
 }
 
 /// Turns a one-sided issue on a row into a note with more to say.
@@ -1023,8 +1164,33 @@ fn is_banner(u: &Unit) -> bool {
 
 /// Whether most of a C++ comment's words appear in the Rust function's
 /// comments, as when several comments were merged into one Rust block.
+/// Whether a comment's words appear, in order, in a comment anywhere in
+/// `f`, including inside an expression or a pattern.
+fn verbatim_in(u: &Unit, f: &Function) -> bool {
+    static COMMENT: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"//[^\n]*|/\*(?s:.*?)\*/").unwrap());
+    let words = &u.features.comment;
+    if words.is_empty() {
+        return false;
+    }
+    // Consecutive `//` lines read as one comment.
+    let text = f.lines.join("\n");
+    let theirs: Vec<String> = COMMENT
+        .find_iter(&text)
+        .flat_map(|m| crate::normalize::comment_words(m.as_str()))
+        .collect();
+    theirs.windows(words.len()).any(|w| w == words.as_slice())
+}
+
 fn words_kept(u: &Unit, rust: &Function) -> bool {
     let words = &u.features.comment;
+    if words.is_empty() {
+        return false;
+    }
+    // A short comment (`/* Skylake H/S */`) kept word for word.
+    if verbatim_in(u, rust) {
+        return true;
+    }
     if words.len() < 4 {
         return false;
     }
@@ -1219,16 +1385,24 @@ fn compare(a: &Unit, b: &Unit, notes: &mut Vec<Note>) {
             // C++ mapping a failure to a specific code where Rust passes
             // the callee's status on changes what the caller sees.
             let remapped = error(ra) && *rb == Ret::Status;
-            let sev = if (error(ra) && success(rb)) || (success(ra) && error(rb)) || remapped {
+            // `return ZX_ERR_NEXT` with an out-parameter is a second kind of
+            // success, which Rust returns as a variant: `Ok(Action::Trap)`.
+            let next_as_variant = *ra == Ret::Error("NEXT".into())
+                && matches!(rb, Ret::Ok | Ret::Value)
+                && b.features.idents.len() + b.features.calls.len() > 1;
+            let sev = if next_as_variant {
+                Severity::Note
+            } else if (error(ra) && success(rb)) || (success(ra) && error(rb)) || remapped {
                 Severity::Issue
             } else {
                 Severity::Note
             };
-            notes.push(Note::new(
-                sev,
-                Category::ErrorPath,
-                format!("C++ returns {ra}, Rust returns {rb}"),
-            ));
+            let msg = if next_as_variant {
+                format!("C++ returns {ra} with an out-parameter, Rust returns a value in its place; check that callers treat it as NEXT")
+            } else {
+                format!("C++ returns {ra}, Rust returns {rb}")
+            };
+            notes.push(Note::new(sev, Category::ErrorPath, msg));
         }
         _ => {}
     }
@@ -1898,6 +2072,8 @@ impl ValueCtx<'_> {
     /// macros used as statements (`PANIC_UNIMPLEMENTED;`), and not in an
     /// assertion, which is compared as one.
     fn constants(&self, text: &str) -> Vec<Constant> {
+        // A match arm's pattern (`PML4_L => panic!()`) is compared as a case.
+        let text = text.split_once("=>").map_or(text, |(_, r)| r);
         let code = code_only(text);
         let t = code.trim_start();
         let assert = [

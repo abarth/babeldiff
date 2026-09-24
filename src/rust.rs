@@ -674,6 +674,16 @@ impl<'a> Ctx<'a> {
             }
             let header_end = value.map_or(ts::line(arm), |v| ts::line(v));
             b.push(UnitKind::Case, ts::line(arm), header_end, depth + 1, f);
+            // Comments between the alternatives of a merged arm
+            // (`0x4e /* Skylake */ | 0x5e /* Kaby Lake */ => ...`), which
+            // C++ writes one per `case`.
+            let mut notes = Vec::new();
+            if let Some(p) = pattern {
+                comments_within(p, &mut notes);
+            }
+            for c in notes {
+                b.comment(self.text(c), ts::line(c), ts::end_line(c), depth + 1);
+            }
             if let Some(v) = value {
                 match v.kind() {
                     "block" => self.block(v, depth + 2, tail, fcx, b),
@@ -817,6 +827,17 @@ fn relocate_closures(units: &mut [Unit], lines: &[String]) {
         if let Some(k) = user {
             let locks = std::mem::take(&mut units[k].features.locks);
             units[i].features.locks.extend(locks);
+        }
+    }
+}
+
+/// Every comment inside a node.
+fn comments_within<'t>(n: Node<'t>, out: &mut Vec<Node<'t>>) {
+    for c in ts::children(n) {
+        if ts::is_comment(c) {
+            out.push(c);
+        } else {
+            comments_within(c, out);
         }
     }
 }
