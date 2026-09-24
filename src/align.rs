@@ -21,6 +21,7 @@ fn kind_group(k: UnitKind) -> u8 {
         UnitKind::Continue => 10,
         UnitKind::Goto => 11,
         UnitKind::Label => 12,
+        UnitKind::Cfg => 13,
     }
 }
 
@@ -100,6 +101,36 @@ pub fn similarity(a: &Unit, b: &Unit) -> f64 {
             return 0.0;
         }
         return 0.2 + 0.8 * jaccard(&fa.calls, &fb.calls);
+    }
+    // Conditional compilation lines up with conditional compilation, and
+    // with a run-time `if` that tests the same names.
+    if a.kind == UnitKind::Cfg || b.kind == UnitKind::Cfg {
+        let words = |u: &Unit| -> Vec<String> {
+            if u.kind == UnitKind::Cfg {
+                u.features.idents.clone()
+            } else {
+                u.features
+                    .idents
+                    .iter()
+                    .map(|i| i.replace('_', ""))
+                    .collect()
+            }
+        };
+        let (wa, wb) = (words(a), words(b));
+        let overlap = if wa.is_empty() && wb.is_empty() {
+            1.0
+        } else {
+            jaccard(&wa, &wb)
+        };
+        return match (a.kind, b.kind) {
+            (UnitKind::Cfg, UnitKind::Cfg) => 0.6 + 0.4 * overlap,
+            (UnitKind::If | UnitKind::ElseIf, _) | (_, UnitKind::If | UnitKind::ElseIf)
+                if overlap > 0.0 =>
+            {
+                0.2 + 0.8 * overlap
+            }
+            _ => 0.0,
+        };
     }
     if kind_group(a.kind) != kind_group(b.kind)
         || a.features.lock_plumbing

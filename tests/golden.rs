@@ -597,3 +597,39 @@ fn unchanged_cpp_comes_from_the_same_architecture() {
         "{names:?}"
     );
 }
+
+fn only_issues(cpp: &str, rust: &str) -> Vec<String> {
+    let cs = ChangeSet::from_files(&[
+        ("lamp.cc".into(), cpp.into()),
+        ("lamp.rs".into(), rust.into()),
+    ]);
+    let report = babeldiff::run(&cs, &Options::default(), &mut NoFinder);
+    assert_eq!(report.pairs.len(), 1);
+    report.pairs[0]
+        .findings
+        .iter()
+        .filter(|f| f.severity == Severity::Issue)
+        .map(|f| f.message.clone())
+        .collect()
+}
+
+const LAMP_ON_CPP: &str = "void lamp_on(Lamp* lamp) {\n  lamp->power(true);\n#if __has_feature(safe_stack)\n  lamp->reset_shadow(lamp->shadow_top());\n#else\n  lamp->reset();\n#endif\n  lamp->glow();\n}\n";
+
+#[test]
+fn conditional_compilation_must_stay_conditional() {
+    // The `#if` became a run-time stub, so the guarded code always runs
+    // and the `#else` branch is gone.
+    let stub = "pub fn lamp_on(lamp: &mut Lamp) {\n    lamp.power(true);\n    let _ = has_feature(\"safe_stack\");\n    lamp.reset_shadow(lamp.shadow_top());\n    lamp.glow();\n}\n";
+    let issues = only_issues(LAMP_ON_CPP, stub);
+    assert!(
+        issues.iter().any(|m| m
+            .starts_with("C++ compiles line 4 only when `#if __has_feature(safe_stack)`")
+            && m.contains("Rust line 3")),
+        "{issues:?}"
+    );
+
+    // A `#[cfg]` on each branch keeps it conditional.
+    let cfg = "pub fn lamp_on(lamp: &mut Lamp) {\n    lamp.power(true);\n    #[cfg(sanitize = \"safestack\")]\n    lamp.reset_shadow(lamp.shadow_top());\n    #[cfg(not(sanitize = \"safestack\"))]\n    lamp.reset();\n    lamp.glow();\n}\n";
+    let issues = only_issues(LAMP_ON_CPP, cfg);
+    assert!(issues.is_empty(), "{issues:?}");
+}
