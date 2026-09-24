@@ -43,6 +43,8 @@ pub fn render_html(report: &Report, opts: &HtmlOptions) -> String {
          <div class=\"controls\">\
          <label><input type=\"checkbox\" id=\"opt-fold\"> Fold matching rows</label>\
          <label><input type=\"checkbox\" id=\"opt-issues\"> Only functions with issues</label>\
+         <button type=\"button\" id=\"opt-comments\" class=\"wide\" \
+         title=\"Your line comments, ready to copy\">Comments <span id=\"comment-count\">0</span></button>\
          <button type=\"button\" id=\"opt-keys\" title=\"Keyboard shortcuts\">?</button>\
          </div>\n</header>",
         esc(&opts.title),
@@ -69,6 +71,7 @@ pub fn render_html(report: &Report, opts: &HtmlOptions) -> String {
         },
     );
     out.push_str(KEYS_HELP);
+    out.push_str(COMMENTS_PANEL);
 
     out.push_str("<div class=\"layout\">\n");
     render_nav(&mut out, report);
@@ -483,13 +486,29 @@ impl<'a> Side<'a> {
     }
 
     fn line_html(&mut self, no: &str, text: &str, class: &str, title: &str) -> String {
+        self.line_in(None, no, text, class, title)
+    }
+
+    /// A line; `file` is set when it comes from another file than the
+    /// function's, so that a comment on it names the right place.
+    fn line_in(
+        &mut self,
+        file: Option<&str>,
+        no: &str,
+        text: &str,
+        class: &str,
+        title: &str,
+    ) -> String {
         let code = highlight(text, self.f.lang, &mut self.in_comment);
         let title = if title.is_empty() {
             String::new()
         } else {
             format!(" title=\"{}\"", esc(title))
         };
-        format!("<div class=\"ln{class}\"{title}><span class=\"no\">{no}</span><span class=\"tx\">{code}</span></div>")
+        let file = file
+            .map(|f| format!(" data-p=\"{}\"", esc(f)))
+            .unwrap_or_default();
+        format!("<div class=\"ln{class}\"{title}{file}><span class=\"no\">{no}</span><span class=\"tx\">{code}</span></div>")
     }
 
     fn unit(&mut self, u: &Unit) -> String {
@@ -500,7 +519,8 @@ impl<'a> Side<'a> {
             std::mem::swap(&mut in_comment, &mut self.in_comment);
             for (k, l) in u.ext_lines.iter().enumerate() {
                 let t = cut(l, ind);
-                s.push_str(&self.line_html(
+                s.push_str(&self.line_in(
+                    Some(file),
                     &format!("{}*", u.start_line + k),
                     &t,
                     " ext",
@@ -577,8 +597,16 @@ fn marker_html(m: Marker) -> &'static str {
 fn render_code(out: &mut String, id: &str, cpp: &Function, rust: &Function, rows: &[Row]) {
     let mut c = Side::new(cpp);
     let mut r = Side::new(rust);
+    let _ = write!(
+        out,
+        "<div class=\"code\" data-cp=\"{}\" data-rp=\"{}\" data-cf=\"{}\" data-rf=\"{}\">",
+        esc(&cpp.path),
+        esc(&rust.path),
+        esc(&cpp.name),
+        esc(&rust.name)
+    );
     out.push_str(
-        "<div class=\"code\">\n<div class=\"colhead\"><div><span class=\"lang c\">C++</span></div>\
+        "\n<div class=\"colhead\"><div><span class=\"lang c\">C++</span></div>\
          <div></div><div><span class=\"lang r\">Rust</span></div></div>\n",
     );
     // Consecutive matching rows are grouped so that they can be folded.
@@ -1176,7 +1204,20 @@ const KEYS_HELP: &str = "<div id=\"keys\" hidden><div class=\"box\"><h3>Keyboard
 <dt>x</dt><dd>Mark the current function reviewed</dd>\
 <dt>f</dt><dd>Fold or unfold matching rows</dd>\
 <dt>i</dt><dd>Show only functions with issues</dd>\
-<dt>?</dt><dd>Show or hide this help</dd></dl></div></div>\n";
+<dt>c</dt><dd>Show your line comments, ready to copy</dd>\
+<dt>?</dt><dd>Show or hide this help</dd></dl>\
+<p>Click a line number to comment on that line.</p></div></div>\n";
+
+/// The panel that gathers line comments for copying into a code review or
+/// a message to an agent.
+const COMMENTS_PANEL: &str = "<div id=\"comments\" hidden><div class=\"box\">\
+<h3>Line comments</h3>\
+<p class=\"hint\">Click a line number on either side to comment on it. Each comment \
+is listed with its file and line, ready to paste into a review or a message to an agent.</p>\
+<textarea id=\"comments-text\" readonly spellcheck=\"false\"></textarea>\
+<div class=\"buttons\"><button type=\"button\" id=\"comments-copy\" class=\"primary\">Copy all</button>\
+<button type=\"button\" id=\"comments-clear\">Delete all</button>\
+<button type=\"button\" id=\"comments-close\">Close</button></div></div></div>\n";
 
 const CSS: &str = r#"
 :root {
@@ -1342,6 +1383,28 @@ body.issues-only .pair:not(.bad), body.issues-only .side li:not(.bad) { display:
 #keys dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; margin: 0; }
 #keys dt { font-family: var(--mono); font-weight: 700; }
 #keys dd { margin: 0; }
+.controls button.wide { width: auto; border-radius: 13px; padding: 0 10px; font-weight: 600; }
+.controls button.has { color: var(--nu); border-color: var(--nu); }
+.code .no { cursor: pointer; }
+.code .no:hover { color: var(--nu); }
+.code .no:hover::before { content: "+"; float: left; padding-left: 6px; font-weight: 700; }
+.ln.commented .no { color: var(--nu); font-weight: 700; }
+.lc { margin: 3px 10px 5px 44px; padding: 6px 8px; border: 1px solid var(--line); border-left: 3px solid var(--nu);
+  border-radius: 6px; background: var(--panel); font: 13px/1.45 var(--sans); }
+.lc .text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.lc textarea { display: block; width: 100%; min-height: 4.5em; resize: vertical; font: inherit; color: var(--ink);
+  background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 4px 6px; }
+.lc .buttons, #comments .buttons { display: flex; gap: 6px; margin-top: 6px; }
+.lc button, #comments button { font: 12.5px var(--sans); padding: 2px 10px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--panel); color: var(--ink); }
+.lc button.primary, #comments button.primary { background: var(--nu); border-color: var(--nu); color: var(--panel); }
+#comments { position: fixed; inset: 0; z-index: 10; background: rgba(0,0,0,.35); display: grid; place-items: center; }
+#comments[hidden] { display: none; }
+#comments .box { background: var(--panel); border-radius: 10px; padding: 16px 20px; width: min(760px, calc(100vw - 32px)); }
+#comments h3 { margin: 0 0 6px; }
+#comments .hint, #keys p { color: var(--muted); margin: 8px 0; font-size: 13px; }
+#comments textarea { display: block; width: 100%; height: 50vh; resize: vertical; font: 12.5px/1.45 var(--mono);
+  color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px; }
 @media (max-width: 900px) {
   .layout { grid-template-columns: 1fr; }
   .side { position: static; height: auto; max-height: 40vh; border-right: 0; border-bottom: 1px solid var(--line); }
@@ -1428,6 +1491,180 @@ const JS: &str = r#"
     if (b) b.parentNode.classList.add("open");
   });
 
+  // Line comments on either side, remembered for this report in this
+  // browser and gathered with their file and line for pasting into a code
+  // review or a message to an agent.
+  var commentKey = prefix + "comments";
+  var comments = [];
+  try { comments = JSON.parse(store.get(commentKey) || "[]") || []; } catch (e) { comments = []; }
+  var nextId = comments.reduce(function (m, c) { return Math.max(m, c.id || 0); }, 0) + 1;
+  var panel = document.getElementById("comments");
+  var panelText = document.getElementById("comments-text");
+  var countEl = document.getElementById("comment-count");
+  var commentsButton = document.getElementById("opt-comments");
+  function lineInfo(ln) {
+    var code = ln.closest(".code"), pair = ln.closest("section.pair");
+    var rust = ln.closest(".cell").classList.contains("r");
+    return {
+      pair: pair ? pair.dataset.key : "",
+      side: rust ? "Rust" : "C++",
+      path: ln.dataset.p || (rust ? code.dataset.rp : code.dataset.cp),
+      fn: rust ? code.dataset.rf : code.dataset.cf,
+      line: parseInt(ln.querySelector(".no").textContent, 10),
+      code: ln.querySelector(".tx").textContent
+    };
+  }
+  function findLine(c) {
+    for (var i = 0; i < pairs.length; i++) {
+      if (pairs[i].dataset.key !== c.pair) continue;
+      var lines = pairs[i].querySelectorAll(".cell." + (c.side === "Rust" ? "r" : "c") + " .ln");
+      for (var j = 0; j < lines.length; j++) {
+        var info = lineInfo(lines[j]);
+        if (info.path === c.path && info.line === c.line) return lines[j];
+      }
+    }
+    return null;
+  }
+  function exportText() {
+    // Page order; comments whose line is no longer in the report go last.
+    var order = Array.prototype.map.call(document.querySelectorAll(".lc[data-id]"), function (b) { return +b.dataset.id; });
+    var pos = function (c) { var i = order.indexOf(c.id); return i < 0 ? order.length + c.id : i; };
+    return comments.slice().sort(function (a, b) { return pos(a) - pos(b); }).map(function (c) {
+      return c.path + ":" + c.line + " (" + c.side + (c.fn ? ", in " + c.fn : "") + ")\n> " +
+        c.code.trim() + "\n" + c.text;
+    }).join("\n\n");
+  }
+  function refreshComments() {
+    countEl.textContent = comments.length;
+    commentsButton.classList.toggle("has", comments.length > 0);
+    if (!panel.hidden) panelText.value = exportText();
+  }
+  function saveComments() {
+    store.set(commentKey, JSON.stringify(comments));
+    refreshComments();
+  }
+  function button(label, cls, f) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.textContent = label;
+    if (cls) b.className = cls;
+    b.addEventListener("click", f);
+    return b;
+  }
+  function afterComments(ln) {
+    var at = ln;
+    while (at.nextElementSibling && at.nextElementSibling.classList.contains("lc")) at = at.nextElementSibling;
+    return at;
+  }
+  function marked(ln) {
+    var n = ln.nextElementSibling;
+    ln.classList.toggle("commented", !!(n && n.classList.contains("lc")));
+  }
+  function view(ln, c) {
+    var box = document.createElement("div");
+    box.className = "lc";
+    box.dataset.id = c.id;
+    var text = document.createElement("div");
+    text.className = "text";
+    text.textContent = c.text;
+    var buttons = document.createElement("div");
+    buttons.className = "buttons";
+    buttons.appendChild(button("Edit", "", function () { editor(ln, c, box); }));
+    buttons.appendChild(button("Delete", "", function () {
+      comments = comments.filter(function (x) { return x !== c; });
+      box.remove();
+      marked(ln);
+      saveComments();
+    }));
+    box.appendChild(text);
+    box.appendChild(buttons);
+    return box;
+  }
+  function editor(ln, c, old) {
+    var info = c || lineInfo(ln);
+    var box = document.createElement("div");
+    box.className = "lc edit";
+    var ta = document.createElement("textarea");
+    ta.value = c ? c.text : "";
+    ta.placeholder = "Comment on " + info.path + ":" + info.line + " (Ctrl+Enter to save)";
+    function close() {
+      if (old) box.replaceWith(old); else box.remove();
+      marked(ln);
+    }
+    function save() {
+      var t = ta.value.trim();
+      if (!t) { close(); return; }
+      if (c) {
+        c.text = t;
+      } else {
+        c = info;
+        c.id = nextId++;
+        c.text = t;
+        comments.push(c);
+      }
+      box.replaceWith(view(ln, c));
+      marked(ln);
+      saveComments();
+    }
+    ta.addEventListener("keydown", function (e) {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); save(); }
+      if (e.key === "Escape") { e.preventDefault(); close(); }
+    });
+    var buttons = document.createElement("div");
+    buttons.className = "buttons";
+    buttons.appendChild(button("Save", "primary", save));
+    buttons.appendChild(button("Cancel", "", close));
+    box.appendChild(ta);
+    box.appendChild(buttons);
+    if (old) old.replaceWith(box); else afterComments(ln).after(box);
+    ln.classList.add("commented");
+    ta.focus();
+  }
+  comments.forEach(function (c) {
+    var ln = findLine(c);
+    if (!ln) return;
+    afterComments(ln).after(view(ln, c));
+    ln.classList.add("commented");
+    var run = ln.closest(".run");
+    if (run) run.classList.add("open");
+  });
+  refreshComments();
+  document.addEventListener("click", function (e) {
+    var no = e.target.closest ? e.target.closest(".code .ln > .no") : null;
+    if (!no) return;
+    var ln = no.parentNode, open = afterComments(ln);
+    if (open !== ln && open.classList.contains("edit")) open.querySelector("textarea").focus();
+    else editor(ln, null, null);
+  });
+  function togglePanel(show) {
+    panel.hidden = !show;
+    if (show) { panelText.value = exportText(); panelText.focus(); panelText.select(); }
+  }
+  commentsButton.addEventListener("click", function () { togglePanel(panel.hidden); });
+  panel.addEventListener("click", function (e) { if (e.target === panel) togglePanel(false); });
+  panel.addEventListener("keydown", function (e) { if (e.key === "Escape") togglePanel(false); });
+  document.getElementById("comments-close").addEventListener("click", function () { togglePanel(false); });
+  var copyButton = document.getElementById("comments-copy");
+  copyButton.addEventListener("click", function () {
+    var done = function () {
+      copyButton.textContent = "Copied";
+      setTimeout(function () { copyButton.textContent = "Copy all"; }, 1500);
+    };
+    var fallback = function () { panelText.select(); try { document.execCommand("copy"); done(); } catch (e) {} };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(panelText.value).then(done, fallback);
+    } else {
+      fallback();
+    }
+  });
+  document.getElementById("comments-clear").addEventListener("click", function () {
+    if (!comments.length || !window.confirm("Delete all " + comments.length + " line comments?")) return;
+    comments = [];
+    document.querySelectorAll(".lc").forEach(function (b) { b.remove(); });
+    document.querySelectorAll(".ln.commented").forEach(function (l) { l.classList.remove("commented"); });
+    saveComments();
+  });
+
   // Hovering an identifier highlights every spelling of it in the pair.
   var lit = [];
   document.addEventListener("mouseover", function (e) {
@@ -1504,8 +1741,9 @@ const JS: &str = r#"
         break;
       case "f": fold.click(); break;
       case "i": issuesOnly.click(); break;
+      case "c": togglePanel(panel.hidden); break;
       case "?": keys.hidden = !keys.hidden; break;
-      case "Escape": keys.hidden = true; break;
+      case "Escape": keys.hidden = true; togglePanel(false); break;
       default: return;
     }
     e.preventDefault();

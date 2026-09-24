@@ -311,6 +311,8 @@ impl<'a> Ctx<'a> {
                 }
             }
             "identifier" | "field_identifier" | "namespace_identifier" => acc.ident(self.text(n)),
+            // `static_assert(cond);` asserts like Rust `const { assert!(cond) }`.
+            "static_assert_declaration" => acc.call("static_assert"),
             "declaration" => {
                 // `Foo foo{args};` constructs a Foo, like Rust `Foo::new(args)`.
                 let ty = n.child_by_field_name("type");
