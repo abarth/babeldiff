@@ -325,6 +325,21 @@ fn body_similarity(a: &Function, b: &Function, pairs: &[Pair]) -> f64 {
 }
 
 /// Small bodies look alike by accident, so short functions need similar names.
+/// Whether one name asks about what the other returns:
+/// `supports_page_size` against `page_size`.
+fn asks_instead(a: &Function, b: &Function) -> bool {
+    let (wa, wb) = (
+        normalize::words(&normalize::ident(&a.base)),
+        normalize::words(&normalize::ident(&b.base)),
+    );
+    let predicate = |x: &[String], y: &[String]| {
+        x.len() == y.len() + 1
+            && matches!(x[0].as_str(), "supports" | "is" | "has" | "can" | "should")
+            && x[1..] == *y
+    };
+    predicate(&wa, &wb) || predicate(&wb, &wa)
+}
+
 fn plausible(a: &Function, b: &Function) -> bool {
     let body = |f: &Function| {
         f.units
@@ -332,6 +347,9 @@ fn plausible(a: &Function, b: &Function) -> bool {
             .filter(|u| !matches!(u.kind, UnitKind::Signature | UnitKind::Comment))
             .count()
     };
+    if asks_instead(a, b) {
+        return false;
+    }
     body(a).min(body(b)) >= 3 || name_similarity(a, b) >= 0.5
 }
 
@@ -543,16 +561,40 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
     // may have gone: `cpp_*` helpers the change added, and other Rust.
     let universe_ref = &universe;
     let helpers_ref = &cpp_helpers;
+    // Functions passed by name (`sync_exec(mask, invalidate_task, ..)`) run
+    // on the caller's behalf too.
+    let reached = |r: &Function| -> Vec<&Function> {
+        let named: HashSet<&str> = r
+            .lines
+            .iter()
+            .flat_map(|l| l.split(|c: char| !c.is_alphanumeric() && c != '_'))
+            .collect();
+        universe_ref
+            .iter()
+            .filter(|u| {
+                u.name != r.name
+                    && (!u.is_ffi && calls_function(r, u)
+                        // An `extern "C"` callback handed to C++ by name.
+                        || named.contains(u.base.as_str()) && !calls_function(r, u))
+            })
+            .collect()
+    };
+    // Two levels deep: a helper that hands its work to a callback.
     let elsewhere = |r: &Function| -> Vec<&Function> {
-        helpers_ref
+        let mut out: Vec<&Function> = helpers_ref
             .iter()
             .filter(|h| r.calls.contains(&normalize::ident(&h.base)))
-            .chain(
-                universe_ref
-                    .iter()
-                    .filter(|u| !u.is_ffi && u.name != r.name && calls_function(r, u)),
-            )
-            .collect()
+            .collect();
+        let first = reached(r);
+        for f in &first {
+            for g in reached(f) {
+                if g.name != r.name && !out.iter().chain(&first).any(|x| std::ptr::eq(*x, g)) {
+                    out.push(g);
+                }
+            }
+        }
+        out.extend(first);
+        out
     };
     let mut cpp_used = vec![false; cpp.len()];
     let mut rust_pool: Vec<Function> = rust;
@@ -861,7 +903,7 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
         let mut ranked: Vec<(bool, f64, Function)> = finder
             .find(r)
             .into_iter()
-            .filter(|c| !in_change(c))
+            .filter(|c| !in_change(c) && !asks_instead(c, r))
             .filter(|c| !found_used.contains(&(c.path.clone(), c.start_line)))
             .map(|c| {
                 let ok = unchanged_class_ok(&c, r, &hierarchy);
@@ -903,6 +945,30 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
             "found in the repository, not in the change (score {:.2})",
             pair.score
         );
+        // A C++ test the change left alone still runs; a Rust test that
+        // differs from it is new coverage, not a lost check.
+        let test = pair.cpp.path.contains("test")
+            || pair
+                .cpp
+                .lines
+                .iter()
+                .any(|l| l.contains("UNITTEST") || l.contains("BEGIN_TEST"));
+        if test {
+            for row in &mut pair.rows {
+                for n in &mut row.notes {
+                    n.severity = Severity::Note;
+                }
+            }
+            let kept: Vec<Finding> = pair
+                .findings
+                .iter()
+                .filter(|f| f.cpp_line.is_none() && f.rust_line.is_none())
+                .cloned()
+                .collect();
+            let refreshed = check::refresh(&mut pair.rows, &pair.cpp, &pair.rust);
+            pair.findings = kept.into_iter().chain(refreshed).collect();
+            pair.rationale.push_str("; the C++ test still runs");
+        }
         report.pairs.push(pair);
     }
 

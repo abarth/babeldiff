@@ -1,5 +1,5 @@
-babeldiff: 4 pairs, 7 issues, 1 note; 0 C++ and 0 Rust functions unpaired
-issues by kind: error-path 3, order 2, comment 1, control-flow 1
+babeldiff: 4 pairs, 6 issues, 2 notes; 0 C++ and 0 Rust functions unpaired
+issues by kind: error-path 3, comment 1, control-flow 1, order 1
 legend: = same  ~ note  ! issue  < only in C++  > only in Rust
 
 ==== FifoDispatcher::WriteFromUser  <->  FifoDispatcher::write_from_user
@@ -142,7 +142,7 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
   Rust  zircon/kernel/object/fifo_dispatcher.rs:89-153
   via   C++ now calls FFI shim rust_fifo_dispatcher_read_to_user  zircon/kernel/object/fifo_dispatcher_ffi.rs:32-51
   note  C++ lines marked * are the declaration's comment in zircon/kernel/object/include/object/fifo_dispatcher.h
-  similarity 0.93, 3 issues, 0 notes
+  similarity 0.93, 2 issues, 1 note
 
 = C    23*  // Reads up to |count| elements of |elem_size| bytes into |ptr|.
   R     89  /// Reads up to `count` elements of `elem_size` bytes into `ptr`.
@@ -167,7 +167,7 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
 = C     92      return ZX_ERR_OUT_OF_RANGE;
   R    104          return Err(Status::OUT_OF_RANGE);
 < C     95    Guard<CriticalMutex> guard{get_lock()};
-        ^ ! statement (acquires lock) only in C++; resembles Rust line 98, so the order may differ
+        ^ ~ statement (acquires lock) only in C++; resembles Rust line 98, so the order may differ; the Rust takes the same lock at line 98
 = C     97    // Total number of available entries to read from the fifo.
   R    107      // Total number of available entries to read from the fifo.
 = C     98    size_t avail = (head_ - tail_);
@@ -237,8 +237,8 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
   comments 5 C++ comments: 5 identical, 0 reworded, 0 missing in Rust
   findings
     ! - | fifo_dispatcher.rs:98  statement (acquires lock) only in Rust; resembles C++ line 95, so the order may differ
-    ! fifo_dispatcher.cc:95 | -  statement (acquires lock) only in C++; resembles Rust line 98, so the order may differ
     ! - | fifo_dispatcher.rs:146  if only in Rust
+    ~ fifo_dispatcher.cc:95 | -  statement (acquires lock) only in C++; resembles Rust line 98, so the order may differ; the Rust takes the same lock at line 98
 
 ==== FifoDispatcher::IsFullLocked  <->  FifoDispatcher::is_full_locked
   C++   zircon/kernel/object/fifo_dispatcher.cc:141-141  (not changed by this diff)

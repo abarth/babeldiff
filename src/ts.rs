@@ -141,6 +141,23 @@ impl FeatureAcc {
                 }
             }
         }
+        // An atomic static mirroring a C++ global (`XCR0_BITMAP_ATOMIC.store(v)`
+        // or `G_WIDTH.load()` for `xcr0_bitmap = v` or `g_width`) reads and
+        // writes the global.
+        if lang == Lang::Rust {
+            for c in ATOMIC_MIRROR.captures_iter(&self.text) {
+                let name = c[1].strip_suffix("_ATOMIC").unwrap_or(&c[1]);
+                let name = name.strip_prefix("G_").unwrap_or(name);
+                if let Some(i) = normalize::ident_feature(&name.to_ascii_lowercase()) {
+                    for n in [i.clone(), format!("g_{i}")] {
+                        if !idents.contains(&n) {
+                            idents.push(n);
+                        }
+                    }
+                }
+                calls.retain(|x| x != &c[2]);
+            }
+        }
         if !locks.is_empty() {
             // Acquisitions are compared as locks, not calls.
             const LOCK_CALLS: &[&str] = &[
@@ -231,6 +248,11 @@ static RUST_LOCK_CALL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"([A-Za-z_][\w]*(?:\s*(?:\.|::)\s*[A-Za-z_]\w*(?:\(\))?)*)\s*\.\s*(lock|lock_irqsave|lock_irq|try_lock|read_lock|write_lock|lock_read|lock_write|acquire|lock_[a-z]\w*)\s*\(")
         .unwrap()
 });
+static ATOMIC_MIRROR: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\b([A-Z][A-Z0-9_]*)\s*(?:\[[^\]]*\])?\s*\.\s*(load|store|swap|fetch_[a-z]+)\s*\(")
+        .unwrap()
+});
+
 static RUST_WITH_LOCK: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"\bwith_(?:chain_)?lock(?:_irqsave|_irq)?\s*\(\s*&?(?:mut\s+)?([A-Za-z_][\w.]*)\s*,",

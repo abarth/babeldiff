@@ -333,6 +333,8 @@ fn alias(n: &str) -> &str {
         // `ProcessDispatcher::GetCurrent()` and `with_current(|up| ...)`.
         "with_current" => "get_current",
         "pop_back" | "pop" => "pop",
+        "roundup" | "round_up" | "align_up" | "next_multiple_of" => "roundup",
+        "rounddown" | "round_down" | "align_down" => "rounddown",
         "push_front" => "push_front",
         "pop_front" => "pop_front",
         "reset" | "take" | "swap" => "take",
