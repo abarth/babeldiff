@@ -1918,7 +1918,10 @@ impl ValueCtx<'_> {
             .filter(|c| !self.values.is_some_and(|v| v.is_static(&c.name)))
             .filter(|c| {
                 let stmt = t.trim_end().trim_end_matches(';').trim_end();
-                !(stmt == c.name || stmt.ends_with(&format!("::{}", c.name)))
+                let path = stmt
+                    .chars()
+                    .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == ':');
+                !(stmt == c.name || path && stmt.ends_with(&format!("::{}", c.name)))
             })
             .collect()
     }
