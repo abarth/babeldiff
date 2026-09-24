@@ -45,6 +45,7 @@ pub mod placement;
 pub mod render;
 pub mod rust;
 mod ts;
+pub mod values;
 
 /// Default minimum fraction of a function's lines that a change must touch
 /// for the function to count as converted.

@@ -3,6 +3,9 @@
 
 use core::arch::asm;
 
+/// The control-register value that turns the lantern off.
+const LANTERN_OFF_MASK: u64 = 0x700;
+
 /// Reads the brightness register.
 pub fn read_brightness() -> u64 {
     let value: u64;

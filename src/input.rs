@@ -289,6 +289,12 @@ pub fn build_inputs(cs: &ChangeSet, min_changed: f64) -> Inputs {
     static DEFINE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"(?m)^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)\(").unwrap()
     });
+    for v in cs.cpp_old.iter().chain(&cs.cpp_new) {
+        inputs.values.add_cpp(&v.text);
+    }
+    for v in &cs.rust_new {
+        inputs.values.add_rust(&v.text);
+    }
     for v in &cs.cpp_old {
         for c in DEFINE.captures_iter(&v.text) {
             let name = c[1].to_string();

@@ -26,20 +26,20 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
 
 ==== read_brightness  <->  read_brightness
   C++   zircon/kernel/arch/toy/lantern.cc:13-17
-  Rust  zircon/kernel/arch/toy/src/glow.rs:6-14
+  Rust  zircon/kernel/arch/toy/src/glow.rs:9-17
   why   a second Rust definition of read_brightness; the first is at zircon/kernel/arch/toy/src/lantern.rs:8 (score 0.68)
   similarity 0.68, 2 issues, 0 notes
 
-> R      6  /// Reads the brightness register.
+> R      9  /// Reads the brightness register.
 = C     13  static uint64_t read_brightness(void) {
-  R      7  pub fn read_brightness() -> u64 {
+  R     10  pub fn read_brightness() -> u64 {
 = C     14    uint64_t value;
-  R      8      let value: u64;
-> R      9      // SAFETY: Reading the brightness register has no side effects.
+  R     11      let value: u64;
+> R     12      // SAFETY: Reading the brightness register has no side effects.
 = C     15    __asm__ volatile("mov %%dr6, %0" : "=r"(value));
-  R     11          asm!("mov {}, dr6", out(reg) value, options(nomem, nostack));
+  R     14          asm!("mov {}, dr6", out(reg) value, options(nomem, nostack));
 ! C     16    return value | LANTERN_BRIGHT_MASK;
-  R     13      value
+  R     16      value
         ^ ! C++ sets LANTERN_BRIGHT_MASK here, and the Rust doesn't
 
   errors   same
@@ -47,32 +47,32 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
   flow     return 1
   comments 0 C++ comments: 0 identical, 0 reworded, 0 missing in Rust
   findings
-    ! - | glow.rs:6  the change defines read_brightness twice, here and at zircon/kernel/arch/toy/src/lantern.rs:8, and the copies differ; both are compared with the C++, and callers may reach either
-    ! lantern.cc:16 | glow.rs:13  C++ sets LANTERN_BRIGHT_MASK here, and the Rust doesn't
+    ! - | glow.rs:9  the change defines read_brightness twice, here and at zircon/kernel/arch/toy/src/lantern.rs:8, and the copies differ; both are compared with the C++, and callers may reach either
+    ! lantern.cc:16 | glow.rs:16  C++ sets LANTERN_BRIGHT_MASK here, and the Rust doesn't
 
 ==== lantern_disable  <->  lantern_disable
   C++   zircon/kernel/arch/toy/lantern.cc:19-23
-  Rust  zircon/kernel/arch/toy/src/glow.rs:16-23
+  Rust  zircon/kernel/arch/toy/src/glow.rs:19-26
   why   same class and method name
   similarity 0.69, 1 issue, 0 notes
 
 = C     19  void lantern_disable(void) {
-  R     16  pub fn lantern_disable() {
+  R     19  pub fn lantern_disable() {
 = C     20    // Clearing the control register turns the lantern off.
-  R     17      // Clearing the control register turns the lantern off.
+  R     20      // Clearing the control register turns the lantern off.
 < C     21    uint64_t zero_val = 0;
-> R     18      let value = LANTERN_OFF_MASK;
-        ^ ! only Rust uses LANTERN_OFF_MASK; the C++ function never mentions it
-> R     19      // SAFETY: Writing the control register only affects the lantern.
+> R     21      let value = LANTERN_OFF_MASK;
+        ^ ! only Rust uses LANTERN_OFF_MASK (0x700); the C++ function never mentions it
+> R     22      // SAFETY: Writing the control register only affects the lantern.
 = C     22    __asm__ volatile("mov %0, %%dr7" ::"r"(zero_val));
-  R     21          asm!("mov dr7, {}", in(reg) value, options(nomem, nostack));
+  R     24          asm!("mov dr7, {}", in(reg) value, options(nomem, nostack));
 
   errors   same
   locks    same
   flow     none
   comments 1 C++ comment: 1 identical, 0 reworded, 0 missing in Rust
   findings
-    ! - | glow.rs:18  only Rust uses LANTERN_OFF_MASK; the C++ function never mentions it
+    ! - | glow.rs:21  only Rust uses LANTERN_OFF_MASK (0x700); the C++ function never mentions it
 
 ==== lantern_save  <->  lantern_save
   C++   zircon/kernel/arch/toy/lantern.cc:25-28
@@ -273,14 +273,14 @@ legend: = same  ~ note  ! issue  < only in C++  > only in Rust
     ~ - | lantern.rs:44  Rust adds 6 unsafe blocks where the C++ needs none; a safe facade for what they reach into would keep it closer to the C++
 
 ==== Unpaired functions
-  > Rust glow_level  zircon/kernel/arch/toy/src/glow.rs:25-30
+  > Rust glow_level  zircon/kernel/arch/toy/src/glow.rs:28-33
 
 ==== File placement
-  lantern.cc -> lantern.rs (6), glow.rs (1, unexpected)
+  lantern.cc -> lantern.rs (5), glow.rs (1, unexpected)
 
 ==== Rubric lints
-  ! zircon/kernel/arch/toy/lantern.cc:1  [file-placement] lantern.cc was split across 2 Rust files: lantern.rs (6), glow.rs (1, not named after it); convert each C++ file into one Rust file
-  ! zircon/kernel/arch/toy/src/glow.rs:28  [invented-lifetime] a reference is made from `buf_ptr`, a raw pointer into `lantern.buffer` (line 26), so its lifetime is invented rather than borrowed from `lantern.buffer`; borrow `lantern.buffer` instead
+  ! zircon/kernel/arch/toy/lantern.cc:1  [file-placement] lantern.cc was split across 2 Rust files: lantern.rs (5), glow.rs (1, not named after it); convert each C++ file into one Rust file
+  ! zircon/kernel/arch/toy/src/glow.rs:31  [invented-lifetime] a reference is made from `buf_ptr`, a raw pointer into `lantern.buffer` (line 29), so its lifetime is invented rather than borrowed from `lantern.buffer`; borrow `lantern.buffer` instead
   ! zircon/kernel/arch/toy/src/lantern.rs:4  [provenance-comment] 2 comments say where the code was ported from (lines 4, 44), such as "Ported from `zircon/kernel/arch/toy/lantern.cc`."; drop them, since they stop being relevant once the change lands
 
 ==== FFI shims
