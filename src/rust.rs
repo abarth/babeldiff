@@ -17,6 +17,12 @@ pub fn extract(path: &str, src: &str) -> Vec<Function> {
     };
     let mut out = Vec::new();
     ctx.walk_scope(tree.root_node(), None, &mut out);
+    let tests = ctx.test_ranges(tree.root_node());
+    for f in &mut out {
+        f.test_only = tests
+            .iter()
+            .any(|(a, b)| *a <= f.start_line && f.end_line <= *b);
+    }
     out
 }
 
@@ -35,6 +41,33 @@ struct FnCtx {
 impl<'a> Ctx<'a> {
     fn text(&self, n: Node) -> &'a str {
         ts::text(n, self.src)
+    }
+
+    /// Line ranges of test modules: `#[cfg(test)]`, `#[cfg(ktest)]`, or a
+    /// module named `tests`.
+    fn test_ranges(&self, scope: Node) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for child in ts::named_children(scope) {
+            if child.kind() != "mod_item" {
+                continue;
+            }
+            let named_tests = child
+                .child_by_field_name("name")
+                .is_some_and(|n| matches!(self.text(n), "tests" | "test"));
+            let mut cfg_test = false;
+            let mut cur = child.prev_sibling();
+            while let Some(p) = cur.filter(|p| p.kind() == "attribute_item" || ts::is_comment(*p)) {
+                let t: String = self.text(p).split_whitespace().collect();
+                cfg_test |= t.starts_with("#[cfg(") && (t.contains("test") || t.contains("ktest"));
+                cur = p.prev_sibling();
+            }
+            if named_tests || cfg_test {
+                out.push((ts::line(child), ts::end_line(child)));
+            } else if let Some(body) = child.child_by_field_name("body") {
+                out.extend(self.test_ranges(body));
+            }
+        }
+        out
     }
 
     fn walk_scope(&self, scope: Node, class: Option<&str>, out: &mut Vec<Function>) {
@@ -143,7 +176,7 @@ impl<'a> Ctx<'a> {
             text.starts_with("Ok(())") || text.starts_with("returnOk(())")
         });
         if ends_ok_unit {
-            fold_status_tail(&mut b.units);
+            fold_status_tail(&mut b.units, self.lines);
         }
         for u in &mut b.units {
             if u.kind == UnitKind::Stmt && u.file.is_none() {
@@ -188,6 +221,7 @@ impl<'a> Ctx<'a> {
             calls,
             qcalls,
             is_ffi,
+            test_only: false,
         })
     }
 
@@ -526,11 +560,27 @@ impl<'a> Ctx<'a> {
         let alt = n.child_by_field_name("alternative");
         let d = if is_else_if { depth - 1 } else { depth };
 
-        // `if let Err(e) = foo() { return Err(e); }` is `foo()?`.
+        // `if let Err(e) = foo() { return Err(e); }` is `foo()?`, and so is
+        // `let r = foo(); if r.is_err() { return r; }`, which folds into the
+        // statement that sets `r`, as the C++ `if (r.is_error()) return r;`
+        // does.
         if let (Some(c), Some(t), None) = (cond, cons, alt) {
             if self.is_propagation(c, t) {
                 if is_else_if {
                     b.push(UnitKind::Else, line, line, d, Features::default());
+                } else if let Some(var) = is_err_var(self.text(c)) {
+                    if let Some(prev) = b.units.last_mut() {
+                        if prev.kind == UnitKind::Stmt
+                            && prev.depth == d
+                            && prev.file.is_none()
+                            && !prev.features.propagates
+                            && ts::mentions(self.lines, prev, var)
+                        {
+                            prev.features.propagates = true;
+                            prev.end_line = ts::end_line(n);
+                            return;
+                        }
+                    }
                 }
                 let mut f = self.features(c, &[]);
                 f.propagates = true;
@@ -664,7 +714,8 @@ impl<'a> Ctx<'a> {
 
     fn is_propagation(&self, cond: Node, cons: Node) -> bool {
         static ERR_PAT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^let\s+Err\s*\(").unwrap());
-        if cond.kind() != "let_condition" || !ERR_PAT.is_match(self.text(cond).trim()) {
+        let err_let = cond.kind() == "let_condition" && ERR_PAT.is_match(self.text(cond).trim());
+        if !err_let && is_err_var(self.text(cond)).is_none() {
             return false;
         }
         let stmts: Vec<Node> = ts::named_children(cons)
@@ -835,6 +886,15 @@ fn is_pure_or_accessor(v: Node, src: &[u8]) -> bool {
 /// its body under that lock, where the C++ has a guard on the stack and
 /// the same statements in place. The lock is credited to the closure's
 /// `let`, so the guard lines up there and the body follows it.
+/// The variable an `x.is_err()` condition tests.
+fn is_err_var(cond: &str) -> Option<&str> {
+    static IS_ERR: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"^\(?\s*(\w+)\.is_err\(\)\s*\)?$").unwrap());
+    IS_ERR
+        .captures(cond.trim())
+        .map(|c| c.get(1).unwrap().as_str())
+}
+
 fn relocate_closures(units: &mut [Unit], lines: &[String]) {
     static LET_CLOSURE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"\blet\s+(?:mut\s+)?([A-Za-z_]\w*)\s*(?::[^=]*)?=\s*(?:move\s+)?\|").unwrap()
@@ -933,8 +993,9 @@ fn is_lock_plumbing(stmt: &str) -> bool {
 
 /// `foo()?; Ok(())` at the end of a function passes on foo's status, which
 /// C++ writes `return Foo();`. The caller checks that the last unit is
-/// `Ok(())`.
-fn fold_status_tail(units: &mut Vec<Unit>) {
+/// `Ok(())`. An explicit `if r.is_err() { return r; }` before the `Ok(())`
+/// stays as it is, since C++ spells it the same way.
+fn fold_status_tail(units: &mut Vec<Unit>, lines: &[String]) {
     let n = units.len();
     if n < 2 {
         return;
@@ -948,7 +1009,12 @@ fn fold_status_tail(units: &mut Vec<Unit>) {
         && prev.features.propagates
         && prev.features.errors.is_empty()
         && prev.depth == last.depth
-        && prev.depth == 1)
+        && prev.depth == 1
+        && !(prev.start_line..=prev.end_line).any(|l| {
+            lines.get(l - 1).is_some_and(|t| {
+                is_err_var(t.trim_end_matches('{').trim().trim_start_matches("if ")).is_some()
+            })
+        }))
     {
         return;
     }

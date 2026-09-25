@@ -234,6 +234,9 @@ pub struct Function {
     pub qcalls: Vec<String>,
     /// Rust `extern "C"` or `#[no_mangle]` function.
     pub is_ffi: bool,
+    /// Rust inside a `#[cfg(test)]` (or `ktest`) or `tests` module: test
+    /// code, never the port of production C++.
+    pub test_only: bool,
 }
 
 impl Function {

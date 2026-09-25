@@ -353,6 +353,140 @@ fn expected_place(c: &Function, r: &Function) -> bool {
         || (class_key(c) == class_key(r) && name_words(c) == name_words(r))
 }
 
+/// The code between a function's outermost braces, without comments.
+fn body_text(f: &Function) -> String {
+    let code: String = f
+        .lines
+        .iter()
+        .map(|l| l.split("//").next().unwrap_or(""))
+        .filter(|l| !l.trim_start().starts_with("#["))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let start = code.find("fn ").or_else(|| code.find('(')).unwrap_or(0);
+    let open = code[start..].find('{').map(|i| start + i + 1);
+    let close = code.rfind('}');
+    match (open, close) {
+        (Some(o), Some(c)) if o <= c => code[o..c].trim().to_string(),
+        _ => String::new(),
+    }
+}
+
+/// A body that does nothing but return a constant (or nothing at all):
+/// `{ 0 }`, `{ false }`, `{ return nullptr; }`, `{ todo!() }`.
+fn constant_body(f: &Function) -> bool {
+    static CONST: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"^(?:return\s*)?(?:-?(?:0[xX][0-9a-fA-F_]+|\d[\d_]*)(?:u8|u16|u32|u64|usize|i32|i64|U|UL|ULL|u)?|true|false|None|nullptr|NULL|\(\)|Ok\(\(\)\)|Default::default\(\)|(?:core::)?(?:ptr::)?null(?:_mut)?\(\)|"[^"]*"|(?:unimplemented|todo|unreachable)!\([^)]*\))?\s*;?$"#,
+        )
+        .unwrap()
+    });
+    CONST.is_match(&body_text(f))
+}
+
+/// A Rust placeholder standing in for C++ with real logic: its body is a
+/// constant, or hands a parameter back unchanged (`fn pt_phys(p) -> u64 { p }`).
+/// Such a stub is never the port of the C++.
+fn stub_of(c: &Function, r: &Function) -> bool {
+    if r.lang != crate::model::Lang::Rust || body_len(r) > 1 || constant_body(c) {
+        return false;
+    }
+    if constant_body(r) {
+        return true;
+    }
+    let body = body_text(r);
+    let body = body.trim_end_matches(';').trim();
+    let sig = r
+        .lines
+        .iter()
+        .find(|l| l.contains("fn "))
+        .map_or("", |l| l.as_str());
+    !body.is_empty()
+        && body.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
+        && sig.contains(&format!("{body}:"))
+}
+
+/// A Rust function that only passes its arguments on to one other function
+/// named like it (`fn x86_xsetbv(r, v) { unsafe { xsetbv(r, v) } }`), not
+/// to a shared utility (`arch_dcache_line_size` calling
+/// `cpuid_cache_line_size_bytes`).
+fn passes_through(r: &Function, t: &Function) -> bool {
+    let (own, theirs) = (
+        normalize::words(&normalize::ident(&r.base)),
+        normalize::words(&normalize::ident(&t.base)),
+    );
+    body_len(r) <= 1
+        && r.calls.len() == 1
+        && calls_function(r, t)
+        && (theirs.iter().all(|w| own.contains(w)) || own.iter().all(|w| theirs.contains(w)))
+}
+
+/// Whether a Rust method with the C++ method's class and name, or its name
+/// plus a suffix (`AutoVmcs::read_16` for `AutoVmcs::Read`), exists. Then
+/// the port is on that type, not a same-named method elsewhere.
+fn has_twin(c: &Function, rust: &[Function]) -> bool {
+    let (Some(ck), words) = (class_key(c), name_words(c)) else {
+        return false;
+    };
+    rust.iter().any(|r| {
+        !r.is_ffi
+            && !r.test_only
+            && class_key(r).as_ref() == Some(&ck)
+            && name_words(r).starts_with(&words)
+    })
+}
+
+/// For overloads ported as suffixed functions (`Read(VmcsField16)` as
+/// `read_16`): +1 when the Rust name's extra words all appear in the C++
+/// signature, -1 when one doesn't, 0 when the names are the same.
+fn suffix_fit(c: &Function, r: &Function) -> f64 {
+    let (cw, rw) = (name_words(c), name_words(r));
+    if !rw.starts_with(&cw) || rw.len() == cw.len() {
+        return 0.0;
+    }
+    let sig = c
+        .lines
+        .iter()
+        .find(|l| l.contains('('))
+        .map_or(String::new(), |l| l.to_lowercase());
+    if rw[cw.len()..].iter().all(|w| sig.contains(w.as_str())) {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
+/// Words a name shares with another, beyond architecture prefixes.
+/// Whether a Rust function other than `r` has `c`'s class and name
+/// (or its name plus a suffix, for a method).
+fn twin_elsewhere(c: &Function, r: &Function, rust: &[Function]) -> bool {
+    let words = name_words(c);
+    let twin = |u: &Function| {
+        !u.is_ffi
+            && !u.test_only
+            && class_key(u) == class_key(c)
+            && if c.class.is_some() {
+                name_words(u).starts_with(&words)
+            } else {
+                name_words(u) == words
+            }
+    };
+    !twin(r)
+        && rust
+            .iter()
+            .any(|u| (u.path != r.path || u.start_line != r.start_line) && twin(u))
+}
+
+fn shares_name_word(c: &Function, r: &Function) -> bool {
+    let generic = |w: &String| {
+        matches!(
+            w.as_str(),
+            "x86" | "x64" | "arch" | "cpp" | "rust" | "get" | "set" | "is"
+        )
+    };
+    let cw = name_words(c);
+    name_words(r).iter().any(|w| !generic(w) && cw.contains(w))
+}
+
 fn plausible(a: &Function, b: &Function) -> bool {
     let body = |f: &Function| {
         f.units
@@ -360,10 +494,19 @@ fn plausible(a: &Function, b: &Function) -> bool {
             .filter(|u| !matches!(u.kind, UnitKind::Signature | UnitKind::Comment))
             .count()
     };
-    if asks_instead(a, b) || layout::arch_conflict(&a.path, &b.path) {
+    if asks_instead(a, b) || layout::arch_conflict(&a.path, &b.path) || stub_of(a, b) {
+        return false;
+    }
+    // `RealCpuId::new` constructs; only a C++ constructor ports to it.
+    let ctor = |f: &Function| matches!(f.base.as_str(), "new" | "drop" | "default");
+    if ctor(b) && !matches!(name_words(a).as_slice(), [w] if ctor_word(w)) {
         return false;
     }
     body(a).min(body(b)) >= 3 || name_similarity(a, b) >= 0.5
+}
+
+fn ctor_word(w: &str) -> bool {
+    matches!(w, "new" | "drop" | "default" | "init" | "create")
 }
 
 fn score(a: &Function, b: &Function) -> (f64, Vec<Pair>) {
@@ -433,7 +576,7 @@ fn shim_target(shim: &Function, rust: &[Function]) -> Target {
     let key = |r: &Function| normalize::call(&r.name).unwrap_or_else(|| normalize::ident(&r.base));
     let scored: Vec<(usize, &Function)> = rust
         .iter()
-        .filter(|r| !r.is_ffi && r.name != shim.name)
+        .filter(|r| !r.is_ffi && !r.test_only && r.name != shim.name)
         .filter(|r| shim.calls.contains(&key(r)))
         .map(|r| {
             let k = key(r);
@@ -442,9 +585,13 @@ fn shim_target(shim: &Function, rust: &[Function]) -> Target {
             let by_path = q.as_ref().is_some_and(|q| shim.qcalls.contains(q));
             let exact = q.as_ref().is_some_and(|q| q.replace("::", "_") == und);
             let same_file = file_stem(&r.path) == file_stem(&shim.path);
-            let score = (by_path as usize) * 4000
-                + (exact as usize) * 2000
-                + (und.ends_with(&b) as usize) * 1000
+            // `rust_cpuid_processor_stepping` calling
+            // `ProcessorId::new(r).stepping()` forwards to `stepping`, the
+            // end of the chain the shim is named for, not to the receiver's
+            // constructor; the type path only settles same-named methods.
+            let score = (exact as usize) * 8000
+                + (und.ends_with(&b) as usize) * 4000
+                + (by_path as usize) * 2000
                 + (und.contains(&k) as usize) * 500
                 + (same_file as usize) * 100
                 + k.len();
@@ -685,10 +832,32 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
             if !(by_call || by_name) {
                 continue;
             }
+            // A Rust method with the C++ method's own class and name is its
+            // port, rather than whatever part the new C++ still hands to
+            // Rust (`VmxPage::alloc` over `validate_vmx_info`).
+            if by_call {
+                let twin = rust_pool.iter().enumerate().any(|(k, r)| {
+                    !rust_used[k]
+                        && !r.is_ffi
+                        && !r.test_only
+                        && class_key(r).is_some()
+                        && class_key(r) == class_key(c)
+                        && name_words(r) == name_words(c)
+                });
+                let target_is_twin = matches!(target, Target::One(t)
+                    if class_key(t) == class_key(c) && name_words(t) == name_words(c));
+                if twin && !target_is_twin {
+                    continue;
+                }
+            }
             // An exported Rust function that does the work itself, rather
-            // than forwarding, is the port.
+            // than forwarding, is the port. One that only passes its
+            // arguments on stands in for the function it calls.
             let target = match target {
-                Target::One(t) if score(c, shim).0 > score(c, t).0 => shim,
+                Target::One(t) if !passes_through(shim, t) && score(c, shim).0 > score(c, t).0 => {
+                    shim
+                }
+                Target::One(t) if stub_of(c, t) => shim,
                 Target::One(t) => t,
                 Target::None => shim,
                 Target::Ambiguous(_) if body_len(shim) > 3 => shim,
@@ -761,11 +930,33 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
         }
         let c = &cpp[ci];
         let exact = |r: &Function| {
-            !r.is_ffi && class_key(r) == class_key(c) && name_words(r) == name_words(c)
+            !r.is_ffi
+                && (!r.test_only || cpp_is_test(c))
+                && !stub_of(c, r)
+                && class_key(r) == class_key(c)
+                && name_words(r) == name_words(c)
         };
-        let hits: Vec<usize> = (0..rust_pool.len())
+        let mut hits: Vec<usize> = (0..rust_pool.len())
             .filter(|&ri| !rust_used[ri] && exact(&rust_pool[ri]))
             .collect();
+        // A trait impl's `fn read(&self) { Self::read(self) }` forwards to
+        // the inherent method that holds the body.
+        if hits.len() > 1 {
+            let forwarding: Vec<usize> = hits
+                .iter()
+                .copied()
+                .filter(|&a| {
+                    hits.iter().any(|&b| {
+                        a != b
+                            && body_len(&rust_pool[a]) <= 1
+                            && calls_function(&rust_pool[a], &rust_pool[b])
+                    })
+                })
+                .collect();
+            if forwarding.len() < hits.len() {
+                hits.retain(|h| !forwarding.contains(h));
+            }
+        }
         let rivals = cpp
             .iter()
             .enumerate()
@@ -791,13 +982,27 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
     }
 
     // 4. Similarity, greedily from the best score down.
+    // C++ that is still there after the change, and doesn't call into
+    // Rust, was moved or edited within C++ (say from mmu.cc into a header),
+    // not ported. Only Rust named for it and close in body (a copy that
+    // duplicates it, `aspace_unmap` for `Unmap`) can claim it.
+    let stays = |f: &Function| {
+        cpp_new_calls
+            .get(&f.name)
+            .is_some_and(|calls| !calls.iter().any(|c| c.starts_with("rust_")))
+    };
     let mut cands: Vec<(f64, usize, usize)> = Vec::new();
     for (ci, c) in cpp.iter().enumerate() {
         if cpp_used[ci] {
             continue;
         }
+        let kept = stays(c);
+        let twin = has_twin(c, &universe);
         for (ri, r) in rust_pool.iter().enumerate() {
-            if rust_used[ri] || r.is_ffi {
+            if rust_used[ri] || r.is_ffi || (r.test_only && !cpp_is_test(c)) {
+                continue;
+            }
+            if twin && class_key(r) != class_key(c) {
                 continue;
             }
             if !class_compatible(c, r, &cpp_classes, &rust_classes, &hierarchy) {
@@ -812,10 +1017,21 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
                 continue;
             }
             let (s, _) = score(c, r);
+            if kept && !(s >= 0.65 && name_words(c).iter().all(|w| name_words(r).contains(w))) {
+                continue;
+            }
+            // Bodies alike by accident: nothing in the names in common, and
+            // not alike enough to say otherwise.
+            if s < 0.6 && !shares_name_word(c, r) {
+                continue;
+            }
             if s >= opts.min_score && plausible(c, r) {
                 // Among equals, prefer the C++ from the same directory
-                // (`arch/riscv64` over `arch/arm64`).
-                cands.push((s + 0.01 * path_affinity(&c.path, &r.path), ci, ri));
+                // (`arch/riscv64` over `arch/arm64`), and the overload whose
+                // parameter type the Rust name spells (`read_16` for
+                // `Read(VmcsField16)`).
+                let s = s + 0.01 * path_affinity(&c.path, &r.path) + 0.1 * suffix_fit(c, r);
+                cands.push((s, ci, ri));
             }
         }
     }
@@ -903,7 +1119,10 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
 
     // 6. Rust with no C++ in the change: look for C++ the change left alone.
     let in_change = |c: &Function| cpp.iter().any(|x| x.path == c.path && x.name == c.name);
-    let mut found_used: Vec<(String, usize)> = Vec::new();
+    // The best C++ for each Rust function, then assigned from the best
+    // score down, so that `encoded_addr` doesn't take `Item::addr` from
+    // `PendingTlbItem::addr` just by coming first.
+    let mut cands6: Vec<(bool, f64, usize, Function)> = Vec::new();
     for (ri, r) in rust_pool.iter().enumerate() {
         if rust_used[ri] || r.is_ffi {
             continue;
@@ -917,13 +1136,21 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
             .find(r)
             .into_iter()
             .filter(|c| !in_change(c) && !asks_instead(c, r))
-            .filter(|c| !found_used.contains(&(c.path.clone(), c.start_line)))
+            // A C++ `cpp_*` FFI helper is ported only by a Rust `cpp_*`
+            // function of the same name.
+            .filter(|c| !is_cpp_shim(c) || c.base == r.base)
+            .filter(|c| !stub_of(c, r) && (!r.test_only || cpp_is_test(c)))
             .filter(|c| expected_place(c, r))
+            // A Rust function with the C++ function's own class and name
+            // exists elsewhere: that one is its port.
+            .filter(|c| !twin_elsewhere(c, r, &universe))
             .map(|c| {
                 let ok = unchanged_class_ok(&c, r, &hierarchy);
                 (ok, score(&c, r).0, c)
             })
-            .filter(|(_, s, _)| *s >= opts.min_unchanged_score)
+            .filter(|(_, s, c)| {
+                *s >= opts.min_unchanged_score && (*s >= 0.6 || shares_name_word(c, r))
+            })
             .collect();
         ranked.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.total_cmp(&a.1)));
         let Some((ok, s, c)) = ranked.first().cloned() else {
@@ -936,8 +1163,22 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
         if tie {
             continue;
         }
+        cands6.extend(ranked.into_iter().map(|(ok, s, c)| (ok, s, ri, c)));
+    }
+    cands6.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.total_cmp(&a.1)));
+    let mut found_used: Vec<(String, usize)> = Vec::new();
+    let mut assigned: Vec<(usize, Function)> = Vec::new();
+    for (_, _, ri, c) in cands6 {
+        if rust_used[ri] || found_used.contains(&(c.path.clone(), c.start_line)) {
+            continue;
+        }
         rust_used[ri] = true;
         found_used.push((c.path.clone(), c.start_line));
+        assigned.push((ri, c));
+    }
+    assigned.sort_by_key(|(ri, _)| *ri);
+    for (ri, c) in assigned {
+        let r = &rust_pool[ri];
         // The change left this C++ alone, so its comments are all still
         // there.
         let mut c = c;
@@ -1631,6 +1872,14 @@ fn is_rust_test(f: &Function) -> bool {
         || file == "tests.rs"
 }
 
+/// C++ test code.
+fn cpp_is_test(c: &Function) -> bool {
+    c.path.contains("test")
+        || c.lines
+            .iter()
+            .any(|l| l.contains("UNITTEST") || l.contains("BEGIN_TEST"))
+}
+
 /// A C++ function that exists for Rust to call through FFI.
 fn is_cpp_shim(f: &Function) -> bool {
     f.base.starts_with("cpp_") && (f.path.ends_with("_ffi.cc") || f.path.ends_with("_ffi.cpp"))
@@ -1666,8 +1915,9 @@ fn forwardee(c: &Function, r: &Function, pool: &[Function], used: &[bool]) -> Op
                     theirs.iter().all(|w| own.contains(w)) || own.iter().all(|w| theirs.contains(w))
                 }
         })
-        .map(|(j, t)| (j, score(c, t).0))
-        .filter(|(_, s)| *s > current)
+        .map(|(j, t)| (j, score(c, t).0, passes_through(r, t)))
+        .filter(|(_, s, through)| *through || *s > current)
+        .map(|(j, s, _)| (j, s))
         .max_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(j, _)| j)
 }
