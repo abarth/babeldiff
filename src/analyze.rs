@@ -455,7 +455,6 @@ fn suffix_fit(c: &Function, r: &Function) -> f64 {
     }
 }
 
-/// Words a name shares with another, beyond architecture prefixes.
 /// Whether a Rust function other than `r` has `c`'s class and name
 /// (or its name plus a suffix, for a method).
 fn twin_elsewhere(c: &Function, r: &Function, rust: &[Function]) -> bool {
@@ -476,6 +475,9 @@ fn twin_elsewhere(c: &Function, r: &Function, rust: &[Function]) -> bool {
             .any(|u| (u.path != r.path || u.start_line != r.start_line) && twin(u))
 }
 
+/// Whether two functions' names, with their classes, share a word beyond
+/// architecture prefixes (`ResourceDispatcher::ResourceDispatcher` and
+/// `ResourceDispatcherState::init` share `resource`).
 fn shares_name_word(c: &Function, r: &Function) -> bool {
     let generic = |w: &String| {
         matches!(
@@ -483,8 +485,17 @@ fn shares_name_word(c: &Function, r: &Function) -> bool {
             "x86" | "x64" | "arch" | "cpp" | "rust" | "get" | "set" | "is"
         )
     };
-    let cw = name_words(c);
-    name_words(r).iter().any(|w| !generic(w) && cw.contains(w))
+    let words = |f: &Function| {
+        let mut w = name_words(f);
+        if let Some(k) = f.class.as_deref() {
+            w.extend(normalize::words(&normalize::ident(
+                k.rsplit("::").next().unwrap_or(k),
+            )));
+        }
+        w
+    };
+    let cw = words(c);
+    words(r).iter().any(|w| !generic(w) && cw.contains(w))
 }
 
 fn plausible(a: &Function, b: &Function) -> bool {
@@ -1017,7 +1028,7 @@ pub fn analyze(inputs: Inputs, opts: &Options, finder: &mut dyn CppFinder) -> Re
                 continue;
             }
             let (s, _) = score(c, r);
-            if kept && !(s >= 0.65 && name_words(c).iter().all(|w| name_words(r).contains(w))) {
+            if kept && !(s >= 0.6 && name_words(c).iter().all(|w| name_words(r).contains(w))) {
                 continue;
             }
             // Bodies alike by accident: nothing in the names in common, and
