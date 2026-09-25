@@ -288,6 +288,7 @@ impl<'a> Ctx<'a> {
             calls,
             qcalls,
             is_ffi: false,
+            test_only: false,
         })
     }
 
@@ -858,16 +859,7 @@ impl<'a> Ctx<'a> {
 
     /// Whether a unit's source mentions `name` as a whole word.
     fn mentions(&self, u: &crate::model::Unit, name: &str) -> bool {
-        (u.start_line..=u.end_line).any(|l| {
-            self.lines.get(l - 1).is_some_and(|t| {
-                t.match_indices(name).any(|(i, _)| {
-                    let before = t[..i].chars().next_back();
-                    let after = t[i + name.len()..].chars().next();
-                    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
-                    !word(before) && !word(after)
-                })
-            })
-        })
+        ts::mentions(self.lines, u, name)
     }
 
     /// For `if (!x) return ZX_ERR_X;` (or `x == nullptr`, or an

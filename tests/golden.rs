@@ -670,3 +670,160 @@ fn static_assert_matches_a_const_assert() {
     let found = all_findings(cpp, dropped);
     assert!(found.iter().any(|m| m.contains("assert")), "{found:?}");
 }
+
+#[test]
+fn is_err_early_return_matches_cpp_is_error_check() {
+    let cpp = "zx::result<> lamp_init(Lamp& lamp) {\n  auto result = lamp.SetPower(kOn, 0);\n  if (result.is_error()) {\n    return result;\n  }\n  result = lamp.SetColor(kWhite);\n  if (result.is_error()) {\n    return result;\n  }\n  return zx::ok();\n}\n";
+    let rust = "pub fn lamp_init(lamp: &mut Lamp) -> Result<(), Status> {\n    let mut result = lamp.set_power(ON, 0);\n    if result.is_err() {\n        return result;\n    }\n    result = lamp.set_color(WHITE);\n    if result.is_err() {\n        return result;\n    }\n    Ok(())\n}\n";
+    let found = all_findings(cpp, rust);
+    assert!(found.is_empty(), "{found:?}");
+}
+
+fn version(path: &str, text: &str) -> babeldiff::input::Version {
+    babeldiff::input::Version {
+        path: path.into(),
+        text: text.into(),
+        changed: None,
+    }
+}
+
+const LAMP_OLD_CC: &str = r#"
+uint16_t Panel::Read(Field16 field) {
+  uint64_t value = vmread(field.value);
+  return static_cast<uint16_t>(value);
+}
+
+uint32_t Panel::Read(Field32 field) {
+  uint64_t value = vmread(field.value);
+  return static_cast<uint32_t>(value);
+}
+
+uint32_t Lamp::Traps() {
+  uint32_t count = traps_.count();
+  return count + pending_;
+}
+
+void lamp_xsetbv(uint32_t reg, uint64_t val) {
+  uint32_t lo = static_cast<uint32_t>(val);
+  uint32_t hi = static_cast<uint32_t>(val >> 32);
+  __asm__ volatile("xsetbv" ::"c"(reg), "a"(lo), "d"(hi));
+}
+
+void Lamp::Init(uint32_t level) {
+  level_ = level;
+  pending_ = 0;
+  Configure(level);
+}
+
+uint8_t LampId::stepping() const {
+  uint32_t eax = regs_.eax;
+  return static_cast<uint8_t>(eax & 0xf);
+}
+"#;
+
+const LAMP_NEW_H: &str = r#"
+void Lamp::Init(uint32_t level) {
+  level_ = level;
+  pending_ = 0;
+  Configure(level);
+}
+
+uint8_t LampId::stepping() const { return rust_lamp_id_stepping(&regs_); }
+"#;
+
+const LAMP_RS: &str = r#"
+impl Panel {
+    pub fn read_16(&self, field: Field16) -> u16 {
+        let value = vmread(field.value);
+        value as u16
+    }
+
+    pub fn read_32(&self, field: Field32) -> u32 {
+        let value = vmread(field.value);
+        value as u32
+    }
+}
+
+fn traps() -> u32 {
+    0
+}
+
+pub fn lamp_xsetbv(reg: u32, val: u64) {
+    unsafe { xsetbv(reg, val) }
+}
+
+unsafe fn xsetbv(reg: u32, val: u64) {
+    let lo = val as u32;
+    let hi = (val >> 32) as u32;
+    unsafe { core::arch::asm!("xsetbv", in("ecx") reg, in("eax") lo, in("edx") hi) };
+}
+
+impl LampId {
+    pub fn new(regs: Regs) -> Self {
+        LampId { regs }
+    }
+
+    pub fn stepping(&self) -> u8 {
+        let eax = self.regs.eax;
+        (eax & 0xf) as u8
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_lamp_id_stepping(regs: &Regs) -> u8 {
+    LampId::new(*regs).stepping()
+}
+
+#[cfg(test)]
+mod tests {
+    struct TestLamp {
+        level: u32,
+        pending: u32,
+    }
+
+    impl TestLamp {
+        fn init(&mut self, level: u32) {
+            self.level = level;
+            self.pending = 0;
+            configure(level);
+        }
+    }
+}
+"#;
+
+#[test]
+fn pairs_follow_names_types_and_real_bodies() {
+    let cs = ChangeSet {
+        cpp_old: vec![version("lamp/lamp.cc", LAMP_OLD_CC)],
+        cpp_new: vec![version("lamp/lamp.h", LAMP_NEW_H)],
+        rust_new: vec![version("lamp/lamp.rs", LAMP_RS)],
+    };
+    let report = babeldiff::run(&cs, &Options::default(), &mut NoFinder);
+    let pairs: Vec<(String, usize, String)> = report
+        .pairs
+        .iter()
+        .map(|p| (p.cpp.name.clone(), p.cpp.start_line, p.rust.name.clone()))
+        .collect();
+    let has = |c: &str, r: &str| pairs.iter().any(|(pc, _, pr)| pc == c && pr == r);
+    // Overloads go to the Rust function named for their parameter type.
+    let read: Vec<&str> = pairs
+        .iter()
+        .filter(|(c, _, _)| c == "Panel::Read")
+        .map(|(_, _, r)| r.as_str())
+        .collect();
+    assert_eq!(read, ["Panel::read_16", "Panel::read_32"], "{pairs:?}");
+    // A placeholder returning a constant is not the port.
+    assert!(
+        !pairs.iter().any(|(c, _, _)| c == "Lamp::Traps"),
+        "{pairs:?}"
+    );
+    // A wrapper that only passes its arguments on stands in for its callee.
+    assert!(has("lamp_xsetbv", "xsetbv"), "{pairs:?}");
+    // C++ that moved into a header is not ported by a test double.
+    assert!(
+        !pairs.iter().any(|(c, _, _)| c == "Lamp::Init"),
+        "{pairs:?}"
+    );
+    // The shim calls `LampId::new(..).stepping()`: its target is `stepping`.
+    assert!(has("LampId::stepping", "LampId::stepping"), "{pairs:?}");
+}

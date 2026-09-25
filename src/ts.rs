@@ -369,6 +369,20 @@ pub fn classify_return(expr: &str) -> Ret {
     }
 }
 
+/// Whether the source lines of `u` mention `name` as a whole word.
+pub fn mentions(lines: &[String], u: &Unit, name: &str) -> bool {
+    (u.start_line..=u.end_line).any(|l| {
+        lines.get(l - 1).is_some_and(|t| {
+            t.match_indices(name).any(|(i, _)| {
+                let before = t[..i].chars().next_back();
+                let after = t[i + name.len()..].chars().next();
+                let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+                !word(before) && !word(after)
+            })
+        })
+    })
+}
+
 /// Builds the flat list of units for a function body.
 pub struct UnitBuilder {
     pub units: Vec<Unit>,
