@@ -41,8 +41,12 @@ pub fn render_html(report: &Report, opts: &HtmlOptions) -> String {
         "<header class=\"top\">\n<div class=\"brand\">babeldiff</div>\
          <div class=\"what\">{}</div>\n<div class=\"totals\">{}{}{}{}</div>\n\
          <div class=\"controls\">\
-         <label><input type=\"checkbox\" id=\"opt-fold\"> Fold matching rows</label>\
-         <label><input type=\"checkbox\" id=\"opt-issues\"> Only functions with issues</label>\
+         <label title=\"Collapse runs of equivalent lines and expected Rust additions, \
+         leaving the rows that differ\"><input type=\"checkbox\" id=\"opt-fold\"> Hide equivalent rows</label>\
+         <label>Show <select id=\"opt-show\">\
+         <option value=\"all\">all functions</option>\
+         <option value=\"findings\">functions with issues or notes</option>\
+         <option value=\"issues\">functions with issues</option></select></label>\
          <button type=\"button\" id=\"opt-comments\" class=\"wide\" \
          title=\"Your line comments, ready to copy\">Comments <span id=\"comment-count\">0</span></button>\
          <button type=\"button\" id=\"opt-keys\" title=\"Keyboard shortcuts\">?</button>\
@@ -609,21 +613,29 @@ fn render_code(out: &mut String, id: &str, cpp: &Function, rust: &Function, rows
         "\n<div class=\"colhead\"><div><span class=\"lang c\">C++</span></div>\
          <div></div><div><span class=\"lang r\">Rust</span></div></div>\n",
     );
-    // Consecutive matching rows are grouped so that they can be folded.
-    let mut run: Vec<String> = Vec::new();
-    let flush = |out: &mut String, run: &mut Vec<String>| {
-        if run.len() >= 4 {
+    // Consecutive rows with nothing to review, equivalent lines and
+    // expected Rust additions, are grouped so that they can be folded away.
+    // Each row is kept with whether it is an expected addition.
+    let mut run: Vec<(String, bool)> = Vec::new();
+    let flush = |out: &mut String, run: &mut Vec<(String, bool)>| {
+        if run.len() >= 2 {
+            let what = if run.iter().any(|(_, expected)| *expected) {
+                "equivalent or expected rows"
+            } else {
+                "equivalent rows"
+            };
             let _ = write!(
                 out,
-                "<div class=\"run\"><button type=\"button\" class=\"fold\">{} matching rows</button>",
+                "<div class=\"run\"><button type=\"button\" class=\"fold\" \
+                 title=\"Show these rows\">{} {what}</button>",
                 run.len()
             );
-            for r in run.drain(..) {
+            for (r, _) in run.drain(..) {
                 out.push_str(&r);
             }
             out.push_str("</div>\n");
         } else {
-            for r in run.drain(..) {
+            for (r, _) in run.drain(..) {
                 out.push_str(&r);
             }
         }
@@ -703,8 +715,8 @@ fn render_code(out: &mut String, id: &str, cpp: &Function, rust: &Function, rows
             html.push_str("</div>");
         }
         html.push_str("</div>\n");
-        if row.marker == Marker::Same && row.notes.is_empty() {
-            run.push(html);
+        if expected || (row.marker == Marker::Same && row.notes.is_empty()) {
+            run.push((html, expected));
         } else {
             flush(out, &mut run);
             out.push_str(&html);
@@ -1202,8 +1214,8 @@ const KEYS_HELP: &str = "<div id=\"keys\" hidden><div class=\"box\"><h3>Keyboard
 <dl><dt>j / k</dt><dd>Next / previous difference</dd>\
 <dt>n / p</dt><dd>Next / previous function</dd>\
 <dt>x</dt><dd>Mark the current function reviewed</dd>\
-<dt>f</dt><dd>Fold or unfold matching rows</dd>\
-<dt>i</dt><dd>Show only functions with issues</dd>\
+<dt>f</dt><dd>Hide or show equivalent rows</dd>\
+<dt>i</dt><dd>Show all functions, those with issues or notes, or those with issues</dd>\
 <dt>c</dt><dd>Show your line comments, ready to copy</dd>\
 <dt>?</dt><dd>Show or hide this help</dd></dl>\
 <p>Click a line number to comment on that line.</p></div></div>\n";
@@ -1365,8 +1377,14 @@ h3.override code { color: var(--ink); }
 .run > .fold { display: none; }
 body.fold .run:not(.open) > .row { display: none; }
 body.fold .run:not(.open) > .fold { display: block; width: 100%; border: 0; border-bottom: 1px solid var(--line);
-  background: var(--hover); color: var(--muted); font: 12px var(--sans); padding: 4px; cursor: pointer; }
-body.issues-only .pair:not(.bad), body.issues-only .side li:not(.bad) { display: none; }
+  background: var(--hover); color: var(--faint); font: 11px/1 var(--sans); padding: 2px 4px 2px 54px;
+  text-align: left; cursor: pointer; }
+body.fold .run:not(.open) > .fold::before { content: "⋯ "; }
+body.fold .run:not(.open) > .fold:hover { color: var(--muted); }
+body.show-issues .pair:not(.bad), body.show-issues .side li:not(.bad),
+body.show-findings .pair.good, body.show-findings .side li.good { display: none; }
+.controls select { font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 6px; padding: 1px 4px; }
 .kw { color: var(--kw); } .st { color: var(--st); } .nu { color: var(--nu); } .mc { color: var(--mc); }
 .cm { color: var(--cm); font-style: italic; }
 .er, .ok { color: var(--er); font-weight: 600; } .ok { color: var(--good); }
@@ -1485,7 +1503,22 @@ const JS: &str = r#"
     return box;
   }
   var fold = option("opt-fold", "fold");
-  var issuesOnly = option("opt-issues", "issues-only");
+  // Which functions to show: all, those with issues or notes, or those
+  // with issues.
+  var show = document.getElementById("opt-show");
+  function setShow(v) {
+    if (!show.querySelector('option[value="' + v + '"]')) v = "all";
+    show.value = v;
+    body.classList.toggle("show-findings", v === "findings");
+    body.classList.toggle("show-issues", v === "issues");
+    store.set("babeldiff:opt-show", v);
+  }
+  setShow(store.get("babeldiff:opt-show") || (store.get("babeldiff:opt-issues") === "1" ? "issues" : "all"));
+  show.addEventListener("change", function () {
+    setShow(show.value);
+    // Leave the keys to the page, not the menu.
+    show.blur();
+  });
   document.addEventListener("click", function (e) {
     var b = e.target.closest ? e.target.closest("button.fold") : null;
     if (b) b.parentNode.classList.add("open");
@@ -1698,30 +1731,55 @@ const JS: &str = r#"
     pairs.forEach(function (p) { obs.observe(p); });
   }
 
+  // j/k and n/p step from the last place they went while it is still on
+  // screen, so a row that cannot be scrolled to the middle is never picked
+  // again. Otherwise they start from the top of the visible code.
+  var last = null;
   function visible(el) { return el.offsetParent !== null; }
+  function onScreen(el) {
+    var r = el.getBoundingClientRect();
+    return visible(el) && r.bottom > 0 && r.top < window.innerHeight;
+  }
+  function readingLine() {
+    return parseFloat(getComputedStyle(document.documentElement).scrollPaddingTop) || 0;
+  }
   function go(el) {
     if (!el) return;
+    last = el;
     document.querySelectorAll(".row.cur").forEach(function (r) { r.classList.remove("cur"); });
     if (el.classList.contains("row")) {
       var run = el.closest(".run");
       if (run) run.classList.add("open");
       el.classList.add("cur");
     }
+    var pair = el.closest("section.pair");
+    if (pair) setCurrent(+pair.dataset.pair);
     el.scrollIntoView({ block: el.classList.contains("row") ? "center" : "start" });
   }
+  // Following a link to a row or function makes it the place to step from.
+  window.addEventListener("hashchange", function () {
+    var t = location.hash && document.getElementById(location.hash.slice(1));
+    if (t && (t.classList.contains("row") || t.classList.contains("pair"))) last = t;
+  });
   function step(list, dir) {
-    var mid = window.innerHeight / 2, best = null;
     list = list.filter(visible);
+    var from = last && onScreen(last) ? last : null;
+    if (from && list.indexOf(from) < 0) {
+      // Stepping between functions from a row: start from its function.
+      from = from.closest("section.pair");
+      if (from && list.indexOf(from) < 0) from = null;
+    }
+    if (from) { go(list[list.indexOf(from) + dir]); return; }
+    var line = readingLine() + 1;
     if (dir > 0) {
       for (var i = 0; i < list.length; i++) {
-        if (list[i].getBoundingClientRect().top > mid + 4) { best = list[i]; break; }
+        if (list[i].getBoundingClientRect().top >= line) { go(list[i]); return; }
       }
     } else {
       for (var j = list.length - 1; j >= 0; j--) {
-        if (list[j].getBoundingClientRect().top < mid - 4) { best = list[j]; break; }
+        if (list[j].getBoundingClientRect().top < line - 2) { go(list[j]); return; }
       }
     }
-    go(best);
   }
   var keys = document.getElementById("keys");
   document.getElementById("opt-keys").addEventListener("click", function () { keys.hidden = !keys.hidden; });
@@ -1740,7 +1798,10 @@ const JS: &str = r#"
         if (box) { box.checked = !box.checked; box.dispatchEvent(new Event("change")); }
         break;
       case "f": fold.click(); break;
-      case "i": issuesOnly.click(); break;
+      case "i":
+        var opts = ["all", "findings", "issues"];
+        setShow(opts[(opts.indexOf(show.value) + 1) % opts.length]);
+        break;
       case "c": togglePanel(panel.hidden); break;
       case "?": keys.hidden = !keys.hidden; break;
       case "Escape": keys.hidden = true; togglePanel(false); break;
