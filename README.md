@@ -251,10 +251,13 @@ The page is laid out so that a reviewer's attention goes to what differs:
   (`subscriber_count_`, `subscriber_count`, `kMaxSubscribers` and
   `MAX_SUBSCRIBERS`), and error codes (`ZX_ERR_NO_MEMORY` and
   `Status::NO_MEMORY`) highlight together.
-- "Fold matching rows" collapses long runs of equivalent rows, and "Only
-  functions with issues" hides the rest.
+- "Hide equivalent rows" collapses every run of two or more rows with nothing
+  to review (equivalent lines and expected Rust additions such as `SAFETY:`
+  comments) into a thin bar you can click to open. The "Show" menu picks all
+  functions, those with issues or notes, or those with issues.
 - Keyboard: `j`/`k` next and previous difference, `n`/`p` next and previous
-  function, `x` mark reviewed, `f` fold, `i` issues only, `?` help.
+  function, `x` mark reviewed, `f` hide equivalent rows, `i` cycle which
+  functions are shown, `?` help.
 
 The page follows the system's light or dark setting, stacks the two languages
 on narrow screens, and prints cleanly.

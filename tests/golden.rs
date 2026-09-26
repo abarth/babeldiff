@@ -304,6 +304,10 @@ fn html_report_is_self_contained() {
     assert!(html.contains("error code differs: C++ returns PEER_CLOSED, Rust returns BAD_STATE"));
     assert!(html.contains("data-k=\"e:PEER_CLOSED\""));
     assert!(html.contains("data-k=\"e:BAD_STATE\""));
+    // Runs of equivalent rows fold, and functions can be filtered by what
+    // they carry.
+    assert!(html.contains("class=\"fold\" title=\"Show these rows\">"));
+    assert!(html.contains("<option value=\"findings\">functions with issues or notes</option>"));
     // Source text is escaped.
     assert!(!html.contains("<const"));
     assert!(html.contains("&lt;<span class=\"kw\">const</span>"));
